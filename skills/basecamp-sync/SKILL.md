@@ -19,7 +19,9 @@ python3 $SYNC/sync.py init <project URL> --login firstmate --home <this home> --
 
 Read the printed config, then run it again without `--dry-run`. It refuses rather than
 guesses; fix what it names (usually `--repo-map <table>=<repo>` when a card table's title
-is not a registered project's name). Never pass `--force` or `--create-missing-columns`
+is not a registered project's name). A card table matching no registered project is
+skipped and printed, not refused; check the skipped list and pass `--repo-map` for any
+board that is really a repo's. Never pass `--force` or `--create-missing-columns`
 without the main firstmate's go-ahead.
 
 ## The backlog is the source of truth

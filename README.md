@@ -95,8 +95,11 @@ tables in the project's dock, each matched to a backlog repo by its title
 (`/my/profile.json`); the captain; and the chats in the dock. `--captain <person id or
 email>` names the captain; by default it is the project's one account owner other than the
 login. `--repo-map <table>=<repo>` (repeatable) maps a table whose title is not a
-registered project's name. Any missing or ambiguous table, column, repo or identity is
-refused with a message, and nothing is guessed or written. `--create-missing-columns`
+registered project's name. A table whose title matches no registered project and that
+`--repo-map` does not name (a general "Ideas" board, say) is skipped: `init` prints a line
+for it, leaves it out of the config, never reads its columns, and the sync never touches
+it. At least one table must be included. Any other missing or ambiguous table, column,
+repo or identity is refused with a message, and nothing is guessed or written. `--create-missing-columns`
 creates a missing Figuring it out, In progress or Ready for QA column (the only Basecamp
 write `init` makes); Triage, Not now and Done are built in and never created.
 
