@@ -171,3 +171,7 @@ before `kind` existed have none; treat a missing `kind` as `"comment"`.
 - `comment`: `task`, `repo`, `card`, `comment` (id), `at`, `text`.
 - `approval`: `task`, `repo`, `card`, `url` (card URL), `boost` (id), `at`. The captain
   gave the card a 👍: approve every recommendation on it as recommended.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

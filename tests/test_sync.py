@@ -7,7 +7,7 @@ sys.path.insert(0, ROOT)
 import sync  # noqa: E402
 
 CAPTAIN = 33333333
-ACTING = 53286738  # the dedicated firstmate user the CLI profile signs in as
+ACTING = 44444444  # the dedicated firstmate user the CLI profile signs in as
 
 
 class Stub:
