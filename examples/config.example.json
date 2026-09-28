@@ -1,0 +1,12 @@
+{
+ "account": "1111111",
+ "project": "22222222",
+ "captain": 33333333,
+ "repos": {"my-server-repo": "server", "my-engine-repo": "engine"},
+ "tables": {
+  "server": {"table": "100", "Triage": "101", "Not now": "102", "Figuring it out": "103",
+             "In progress": "104", "Ready for QA": "105", "Done": "106"},
+  "engine": {"table": "200", "Triage": "201", "Not now": "202", "Figuring it out": "203",
+             "In progress": "204", "Ready for QA": "205", "Done": "206"}
+ }
+}

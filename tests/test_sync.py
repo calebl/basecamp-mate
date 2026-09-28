@@ -1,0 +1,246 @@
+"""Unit tests for sync.py. The basecamp and tasks-axi CLIs are stubbed; nothing touches the network."""
+import json, os, shutil, sys, tempfile, unittest
+from types import SimpleNamespace
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+import sync  # noqa: E402
+
+CAPTAIN = 33333333
+
+
+class Stub:
+    """Records every CLI call and answers like the basecamp CLI would."""
+
+    def __init__(self, comments=None):
+        self.calls, self.next_id, self.comments = [], 500, comments or {}
+
+    def __call__(self, cmd, **kw):
+        if cmd[0] != "basecamp":
+            raise AssertionError(f"unexpected command {cmd}")
+        args = cmd[3:-3]
+        self.calls.append(args)
+        data = None
+        if args[:2] == ["cards", "create"]:
+            self.next_id += 1
+            data = {"id": self.next_id}
+        elif args[:2] == ["comments", "list"]:
+            data = self.comments.get(args[2], [])
+        return SimpleNamespace(stdout=json.dumps({"ok": True, "data": data}), stderr="", returncode=0)
+
+    def verbs(self):
+        return [a[1] if a[0] == "cards" else a[0] for a in self.calls if a[:2] != ["comments", "list"]]
+
+
+def item(id, section="Queued", repo="srv", hold=None, hold_kind=None, until=None, title="A task"):
+    return {"id": id, "section": section, "title": title, "links": [], "repo": repo, "kind": "ship",
+            "hold": hold, "hold_kind": hold_kind, "until": until, "blocked_by": []}
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home = os.path.join(self.tmp, "home")
+        os.makedirs(os.path.join(self.home, "state"))
+        self.cfgdir = os.path.join(self.tmp, "cfg")
+        os.makedirs(self.cfgdir)
+        shutil.copy(os.path.join(ROOT, "examples", "config.example.json"), os.path.join(self.cfgdir, "config.json"))
+        cfg = json.load(open(os.path.join(self.cfgdir, "config.json")))
+        cfg["repos"] = {"srv": "server", "eng": "engine"}
+        json.dump(cfg, open(os.path.join(self.cfgdir, "config.json"), "w"))
+        self.stub = Stub()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def sync(self, dry=False):
+        return sync.Sync(self.home, os.path.join(self.cfgdir, "config.json"), dry=dry, runner=self.stub)
+
+    def side(self, name, value):
+        json.dump(value, open(os.path.join(self.cfgdir, name), "w"))
+
+    def cards(self):
+        return json.load(open(os.path.join(self.cfgdir, "map.json")))
+
+    def pr(self, task):
+        open(os.path.join(self.home, "state", f"{task}.meta"), "w").write("pr=https://github.com/o/r/pull/1\n")
+
+
+class ColumnRules(Base):
+    def col(self, it, notnow=None):
+        return self.sync().column_for(it, notnow or {})
+
+    def test_queued_is_triage(self):
+        self.assertEqual(self.col(item("a")), ("Triage", False))
+
+    def test_in_flight_without_pr_is_in_progress(self):
+        self.assertEqual(self.col(item("a", "In flight")), ("In progress", False))
+
+    def test_in_flight_with_pr_is_ready_for_qa(self):
+        self.pr("a")
+        self.assertEqual(self.col(item("a", "In flight")), ("Ready for QA", False))
+
+    def test_done(self):
+        self.assertEqual(self.col(item("a", "Done")), ("Done", False))
+        self.assertEqual(self.col(item("a", "Done"), {"a": "x"}), ("Done", False))
+
+    def test_captain_hold_is_figuring_and_assigned(self):
+        self.assertEqual(self.col(item("a", hold="pick", hold_kind="captain")), ("Figuring it out", True))
+
+    def test_captain_hold_with_until_is_not_now(self):
+        self.assertEqual(self.col(item("a", hold="pick", hold_kind="captain", until="2026-10-01")), ("Not now", False))
+
+    def test_parked_is_not_now(self):
+        self.assertEqual(self.col(item("a", hold="x", hold_kind="parked")), ("Not now", False))
+        self.assertEqual(self.col(item("a", hold="parked by ruling")), ("Not now", False))
+
+    def test_not_now_file_unless_captain_hold(self):
+        self.assertEqual(self.col(item("a"), {"a": "later"}), ("Not now", False))
+        self.assertEqual(self.col(item("a", hold="q", hold_kind="captain"), {"a": "later"}), ("Figuring it out", True))
+
+    def test_figuring_file_moves_triage(self):
+        self.side("figuring.json", {"a": "needs a plan"})
+        self.sync().main([item("a")])
+        self.assertEqual(self.cards()["a|server"]["column"], "Figuring it out")
+        self.assertIn("needs a plan", self.stub.calls[0][3])
+
+
+class Assignment(Base):
+    def test_create_assigns_captain_when_waiting(self):
+        self.sync().main([item("a", hold="pick", hold_kind="captain")])
+        create = self.stub.calls[0]
+        self.assertEqual(create[:2], ["cards", "create"])
+        self.assertEqual(create[create.index("--assignee") + 1], str(CAPTAIN))
+        self.assertTrue(self.cards()["a|server"]["assigned"])
+
+    def test_unassign_after_decision(self):
+        self.sync().main([item("a", hold="pick", hold_kind="captain")])
+        self.stub.calls.clear()
+        self.sync().main([item("a")])
+        self.assertIn(["unassign", "501", "--card", "--from", str(CAPTAIN)], self.stub.calls)
+        rec = self.cards()["a|server"]
+        self.assertFalse(rec["assigned"])
+        self.assertEqual(rec["column"], "Triage")
+
+    def test_assign_existing_card(self):
+        self.sync().main([item("a")])
+        self.stub.calls.clear()
+        self.sync().main([item("a", hold="pick", hold_kind="captain")])
+        assign = [c for c in self.stub.calls if "--assignee" in c]
+        self.assertEqual(len(assign), 1)
+        self.assertEqual(assign[0][:3], ["cards", "update", "501"])
+
+
+class IdMap(Base):
+    def test_create_then_rerun_is_noop(self):
+        self.sync().main([item("a"), item("b", repo="eng")])
+        self.assertEqual(self.stub.verbs(), ["create", "create"])
+        self.assertEqual(set(self.cards()), {"a|server", "b|engine"})
+        self.stub.calls.clear()
+        self.sync().main([item("a"), item("b", repo="eng")])
+        self.assertEqual(self.stub.verbs(), [])
+
+    def test_changed_title_updates_same_card(self):
+        self.sync().main([item("a")])
+        self.stub.calls.clear()
+        self.sync().main([item("a", title="Renamed")])
+        self.assertEqual(self.stub.verbs(), ["update"])
+        self.assertEqual(self.stub.calls[0][2], "501")
+        self.assertEqual(len(self.cards()), 1)
+
+    def test_column_change_moves_card(self):
+        self.sync().main([item("a")])
+        self.stub.calls.clear()
+        self.sync().main([item("a", "Done")])
+        self.assertIn(["cards", "move", "501", "--card-table", "100", "--to", "106"], self.stub.calls)
+
+    def test_extra_repos_make_one_card_per_board(self):
+        self.side("extra-repos.json", {"a": ["engine"]})
+        self.sync().main([item("a")])
+        self.assertEqual(set(self.cards()), {"a|server", "a|engine"})
+
+    def test_skip_and_unplaced(self):
+        self.side("skip.json", ["a"])
+        self.sync().main([item("a"), item("b", repo="elsewhere")])
+        self.assertEqual(self.stub.calls, [])
+
+    def test_dry_run_makes_no_calls_and_keeps_map(self):
+        plan = self.sync(dry=True).main([item("a")])
+        self.assertEqual(plan["create"], 1)
+        self.assertEqual(self.stub.calls, [])
+        self.assertFalse(os.path.exists(os.path.join(self.cfgdir, "map.json")))
+        self.sync().main([item("a")])
+        self.stub.calls.clear()
+        plan = self.sync(dry=True).main([item("a", "Done")])
+        self.assertEqual((plan["create"], plan["move"]), (0, 1))
+        self.assertEqual(self.stub.calls, [])
+
+    def test_never_destructive_or_posting(self):
+        self.sync().main([item("a", hold="q", hold_kind="captain")])
+        self.sync().main([item("a", "Done")])
+        for c in self.stub.calls:
+            self.assertNotIn(c[0], ("chat", "messages", "trash", "archive"))
+            self.assertFalse(c[0] == "comments" and c[1] != "list", c)
+            self.assertFalse(c[0] == "cards" and c[1] not in ("create", "update", "move"), c)
+
+
+class Comments(Base):
+    def test_captain_comments_go_to_pending_once(self):
+        self.stub.comments = {"501": [{"id": 9, "creator": {"id": CAPTAIN}, "content": "<p>yes</p>", "created_at": "t"},
+                                      {"id": 10, "creator": {"id": 1}, "content": "other"}]}
+        self.sync().main([item("a")])
+        self.sync().main([item("a")])
+        lines = open(os.path.join(self.cfgdir, "pending-comments.jsonl")).read().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["text"], "yes")
+        self.assertEqual(self.cards()["a|server"]["comments"], [9, 10])
+
+
+class NoteHtml(Base):
+    def test_blocks_have_no_raw_newlines(self):
+        self.pr("a")
+        it = dict(item("a", "In flight", hold="line one\nline two"), blocked_by=["b"], links=["https://github.com/o/r/pull/2"])
+        body = self.sync().body_for(it, "Ready for QA", False, {})
+        self.assertNotIn("\n", body.replace("line one\nline two", ""))
+        self.assertTrue(body.startswith("<div>") and body.endswith("</div>"))
+        self.assertIn("<ul><li><a href=\"https://github.com/o/r/pull/2\">", body)
+        self.assertIn("<li><a href=\"https://github.com/o/r/pull/1\">", body)
+
+    def test_decision_renders_numbered_list(self):
+        self.side("decisions.json", {"a": {"question": "Pick <one>", "items": ["first", "second & more"], "note": "rec first"}})
+        self.sync().main([item("a", hold="raw hold", hold_kind="captain")])
+        body = self.stub.calls[0][3]
+        self.assertIn("<div><strong>Waiting on you</strong>: Pick &lt;one&gt;</div>"
+                      "<ol><li>first</li><li>second &amp; more</li></ol><div>rec first</div>", body)
+        self.assertNotIn("raw hold", body)
+        self.assertNotIn("\n", body)
+
+    def test_decision_ignored_when_not_waiting(self):
+        body = self.sync().body_for(item("a"), "Triage", False, {}, {"a": {"question": "Q", "items": ["x"]}})
+        self.assertNotIn("<ol>", body)
+
+
+class TasksAxi(unittest.TestCase):
+    def test_show_parsing_and_mapping(self):
+        text = '''task:
+  id: ta-x
+  title: "Fix it https://github.com/o/r/pull/7 (repo: srv) (kind: chore)"
+  state: in_flight
+  hold_reason: "Pick one"
+  hold_kind: captain
+  hold_until: "-"
+  kind: ship
+  repo: srv
+  deps: "blocked-by:ta-a,blocked-by:ta-b"
+  links: "pr:https://github.com/o/r/pull/7,pr:https://github.com/o/r/pull/8"
+'''
+        it = sync.task_item(sync.parse_show(text))
+        self.assertEqual(it["title"], "Fix it")
+        self.assertEqual(it["section"], "In flight")
+        self.assertEqual(it["links"], ["https://github.com/o/r/pull/7", "https://github.com/o/r/pull/8"])
+        self.assertEqual(it["blocked_by"], ["ta-a", "ta-b"])
+        self.assertEqual((it["hold"], it["hold_kind"], it["until"]), ("Pick one", "captain", None))
+
+
+if __name__ == "__main__":
+    unittest.main()

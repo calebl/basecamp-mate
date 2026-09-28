@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Mirror a firstmate home's backlog onto Basecamp card tables.
+
+Deterministic, no model calls. The backlog is the source of truth; Basecamp is a
+view of it. Safety bounds, enforced here:
+  - only the configured account, project and card tables are touched;
+  - cards are created, updated, moved, assigned and unassigned, never deleted,
+    trashed or archived, and nothing is posted to chat or as a comment;
+  - the id map (map.json) makes re-runs update the same card instead of
+    duplicating it.
+New comments the captain writes on cards are appended to pending-comments.jsonl
+for firstmate to relay; they are never acted on here.
+
+All runtime state (map.json, sync.log, pending-comments.jsonl and the hand-kept
+extra-repos.json, figuring.json, not-now.json, skip.json, decisions.json) lives in the directory
+that holds the config file.
+
+Usage: sync.py --home <firstmate home> --config <config.json> [--dry-run]
+"""
+import argparse, hashlib, html, json, os, re, subprocess, sys, time, tomllib
+from datetime import datetime, timezone
+
+COLUMNS = ("Triage", "Not now", "Figuring it out", "In progress", "Ready for QA", "Done")
+SECTIONS = {"in_flight": "In flight", "queued": "Queued", "held": "Queued", "done": "Done"}
+PR_RE = r"https://github\.com/\S+?/pull/\d+"
+
+
+class Sync:
+    def __init__(self, home, config_path, dry=False, runner=subprocess.run):
+        self.home = os.path.abspath(home)
+        self.dir = os.path.dirname(os.path.abspath(config_path))
+        cfg = json.load(open(config_path))
+        self.account, self.project = str(cfg["account"]), str(cfg["project"])
+        self.captain = int(cfg["captain"])
+        self.tables = cfg["tables"]
+        self.repo_map = cfg["repos"]
+        for board, t in self.tables.items():
+            missing = [c for c in ("table", *COLUMNS) if c not in t]
+            if missing:
+                raise ValueError(f"config table {board} lacks {missing}")
+        for repo, board in self.repo_map.items():
+            if board not in self.tables:
+                raise ValueError(f"config repo {repo} names unknown board {board}")
+        self.dry, self.run = dry, runner
+        self.data = os.path.join(self.home, "data")
+        self.state = os.path.join(self.home, "state")
+
+    def path(self, name):
+        return os.path.join(self.dir, name)
+
+    def load(self, name, default):
+        p = self.path(name)
+        return json.load(open(p)) if os.path.exists(p) else default
+
+    def log(self, msg):
+        line = f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {msg}"
+        print(line)
+        with open(self.path("sync.log"), "a") as f:
+            f.write(line + "\n")
+
+    def bc(self, *args):
+        cmd = ["basecamp", "-a", self.account, *args, "-p", self.project, "--json"]
+        for attempt in range(3):
+            r = self.run(cmd, capture_output=True, text=True, timeout=120)
+            try:
+                out = json.loads(r.stdout)
+            except ValueError:
+                out = {"ok": False, "error": (r.stdout + r.stderr)[:300]}
+            if out.get("ok"):
+                return out.get("data")
+            if not out.get("retryable") or attempt == 2:
+                raise RuntimeError(f"basecamp {' '.join(args[:3])}: {out.get('error')}")
+            time.sleep(3)
+
+    # --- backlog through tasks-axi, addressed the way bin/fm-tasks-axi.sh does ---
+
+    def tasks_axi(self, *args):
+        root = os.path.dirname(self.data)
+        env = dict(os.environ)
+        backend = "markdown"
+        toml = os.path.join(root, ".tasks.toml")
+        if os.path.exists(toml):
+            with open(toml, "rb") as f:
+                backend = tomllib.load(f).get("backend", "markdown")
+        if backend == "markdown":
+            env["TASKS_AXI_FILE"] = os.path.join(self.data, "backlog.md")
+        else:
+            env.pop("TASKS_AXI_FILE", None)
+        r = self.run(["tasks-axi", *args], capture_output=True, text=True, timeout=120, cwd=root, env=env)
+        if r.returncode != 0:
+            raise RuntimeError(f"tasks-axi {' '.join(args)}: {(r.stdout + r.stderr)[:300]}")
+        return r.stdout
+
+    def parse_backlog(self):
+        rows = self.tasks_axi("list", "--limit", "100000").splitlines()
+        ids = [ln.strip().split(",", 1)[0] for ln in rows if ln.startswith("  ") and "," in ln]
+        return [task_item(parse_show(self.tasks_axi("show", i, "--full"))) for i in ids]
+
+    def meta_pr(self, task):
+        path = os.path.join(self.state, f"{task}.meta")
+        if not os.path.exists(path):
+            return None
+        for line in open(path):
+            if line.startswith("pr="):
+                return line[3:].strip()
+        return None
+
+    def column_for(self, it, notnow):
+        if it["section"] != "Done" and it["id"] in notnow and not (it["hold"] and it["hold_kind"] == "captain"):
+            return "Not now", False
+        parked = it["hold_kind"] == "parked" or (it["hold"] or "").startswith("parked")
+        if it["section"] == "Done":
+            return "Done", False
+        if it["hold"] and it["hold_kind"] == "captain":
+            return ("Not now", False) if it["until"] else ("Figuring it out", True)
+        if parked or it["until"]:
+            return "Not now", False
+        if it["section"] == "In flight":
+            return ("Ready for QA", False) if self.meta_pr(it["id"]) else ("In progress", False)
+        return "Triage", False
+
+    def body_for(self, it, col, waiting, notnow, decisions=None):
+        decisions = decisions or {}
+        parts = [f"<div><strong>Task</strong>: {html.escape(it['id'])} &middot; <strong>Status</strong>: {col}</div>"]
+        if waiting and it["id"] in decisions:
+            parts.append(render_decision(decisions[it["id"]]))
+        elif waiting:
+            parts.append(f"<div><strong>Waiting on you</strong>: {html.escape(it['hold'])}</div>")
+        elif it["id"] in notnow:
+            parts.append(f"<div><strong>Not now</strong>: {html.escape(notnow[it['id']])}</div>")
+        elif it["hold"]:
+            parts.append(f"<div><strong>On hold</strong>: {html.escape(it['hold'])}</div>")
+        if it["blocked_by"]:
+            parts.append(f"<div><strong>After</strong>: {html.escape(', '.join(it['blocked_by']))}</div>")
+        pr = self.meta_pr(it["id"])
+        prs = list(dict.fromkeys(it["links"] + ([pr] if pr else [])))
+        if prs:
+            parts.append("<div><strong>PRs</strong>:</div><ul>" + "".join(f'<li><a href="{html.escape(u)}">{html.escape(u)}</a></li>' for u in prs) + "</ul>")
+        parts.append("<div><em>Kept in sync from the backlog; edits to this text are overwritten. Comments are read and relayed.</em></div>")
+        return "".join(parts)
+
+    def save(self, cards):
+        tmp = self.path("map.json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(cards, f, indent=1, sort_keys=True)
+        os.replace(tmp, self.path("map.json"))
+
+    def main(self, items=None):
+        cards = self.load("map.json", {})
+        extra = self.load("extra-repos.json", {})
+        notnow = self.load("not-now.json", {})
+        figuring = self.load("figuring.json", {})
+        skip = set(self.load("skip.json", []))
+        decisions = self.load("decisions.json", {})
+        counts, unplaced, wanted = {}, [], set()
+        plan = {"create": 0, "update": 0, "move": 0, "assign": 0, "unassign": 0}
+        for it in (self.parse_backlog() if items is None else items):
+            if it["id"] in skip:
+                continue
+            repos = []
+            if it["repo"] in self.repo_map:
+                repos.append(self.repo_map[it["repo"]])
+            repos += [r for r in extra.get(it["id"], []) if r not in repos]
+            if not repos:
+                unplaced.append(f"{it['id']} (repo {it['repo'] or 'none'})")
+                continue
+            col, waiting = self.column_for(it, notnow)
+            if col == "Triage" and it["id"] in figuring:
+                col = "Figuring it out"
+                it = dict(it, hold=it["hold"] or figuring[it["id"]])
+            body = self.body_for(it, col, waiting, notnow, decisions)
+            for repo in repos:
+                key = f"{it['id']}|{repo}"
+                wanted.add(key)
+                t = self.tables[repo]
+                title = it["title"][:240]
+                digest = hashlib.sha256((title + body).encode()).hexdigest()
+                rec = cards.get(key)
+                if self.dry:
+                    if rec is None:
+                        plan["create"] += 1
+                        self.log(f"dry {key}: create -> {col}{' (assign)' if waiting else ''}")
+                    else:
+                        acts = []
+                        if rec.get("digest") != digest:
+                            acts.append("update")
+                        if rec.get("column") != col:
+                            acts.append(f"move {rec.get('column')} -> {col}")
+                        if bool(rec.get("assigned")) != waiting:
+                            acts.append("assign" if waiting else "unassign")
+                        for a in acts:
+                            plan[a.split()[0]] += 1
+                        self.log(f"dry {key}: {', '.join(acts) or 'unchanged'} [{col}]")
+                    counts[repo] = counts.get(repo, 0) + 1
+                    continue
+                if rec is None:
+                    args = ["cards", "create", title, body, "--card-table", t["table"], "--column", t[col]]
+                    if waiting:
+                        args += ["--assignee", str(self.captain)]
+                    data = self.bc(*args)
+                    rec = {"card": data["id"], "column": col, "assigned": waiting, "digest": digest, "comments": []}
+                    cards[key] = rec
+                    self.log(f"created {key} card {data['id']} in {col}")
+                else:
+                    if rec.get("digest") != digest:
+                        self.bc("cards", "update", str(rec["card"]), "--card-table", t["table"], "--title", title, "--body", body)
+                        rec["digest"] = digest
+                        self.log(f"updated {key}")
+                    if rec.get("column") != col:
+                        self.bc("cards", "move", str(rec["card"]), "--card-table", t["table"], "--to", t[col])
+                        self.log(f"moved {key} {rec.get('column')} -> {col}")
+                        rec["column"] = col
+                    if bool(rec.get("assigned")) != waiting:
+                        if waiting:
+                            self.bc("cards", "update", str(rec["card"]), "--card-table", t["table"], "--assignee", str(self.captain))
+                        else:
+                            self.bc("unassign", str(rec["card"]), "--card", "--from", str(self.captain))
+                        rec["assigned"] = waiting
+                        self.log(f"{'assigned' if waiting else 'unassigned'} {key}")
+                self.relay_comments(it["id"], repo, key, rec)
+                counts[repo] = counts.get(repo, 0) + 1
+                self.save(cards)
+        stale = sorted(k for k in cards if k not in wanted)
+        self.log(("dry plan " + json.dumps(plan, sort_keys=True) + " " if self.dry else "")
+                 + "counts " + json.dumps(counts, sort_keys=True) + (f" unplaced {unplaced}" if unplaced else "")
+                 + (f" left-as-is {len(stale)} cards no longer in the backlog" if stale else ""))
+        return plan
+
+    def relay_comments(self, task, repo, key, rec):
+        try:
+            comments = self.bc("comments", "list", str(rec["card"])) or []
+        except RuntimeError as e:
+            self.log(f"comments {key}: {e}")
+            comments = []
+        for c in comments:
+            cid = c.get("id")
+            if cid in rec.setdefault("comments", []):
+                continue
+            rec["comments"].append(cid)
+            if (c.get("creator") or {}).get("id") == self.captain:
+                with open(self.path("pending-comments.jsonl"), "a") as f:
+                    f.write(json.dumps({"task": task, "repo": repo, "card": rec["card"], "comment": cid,
+                                        "at": c.get("created_at"), "text": re.sub(r"<[^>]+>", "", c.get("content", ""))}) + "\n")
+                self.log(f"new captain comment on {key}: {cid}")
+
+
+def render_decision(d):
+    """A decision card body from decisions.json: a plain question, then a numbered list."""
+    out = f"<div><strong>Waiting on you</strong>: {html.escape(d['question'])}</div>"
+    if d.get("items"):
+        out += "<ol>" + "".join(f"<li>{html.escape(i)}</li>" for i in d["items"]) + "</ol>"
+    if d.get("note"):
+        out += f"<div>{html.escape(d['note'])}</div>"
+    return out
+
+
+def parse_show(text):
+    """Parse `tasks-axi show --full` output: `  key: value`, strings JSON-quoted."""
+    out = {}
+    for line in text.splitlines():
+        m = re.match(r"  (\w+): (.*)$", line)
+        if m:
+            v = m.group(2)
+            out[m.group(1)] = json.loads(v) if v.startswith('"') else v
+    return out
+
+
+def none(v):
+    return None if v in (None, "", "-", "none") else v
+
+
+def task_item(t):
+    """Map tasks-axi fields to the item shape the column rules use.
+
+    The one parsing fallback is the title: tasks-axi keeps PR URLs inside it, and
+    on a row with repeated `(field: ...)` groups it keeps the leading ones too,
+    so both are cut out here the way the original markdown parser did.
+    """
+    title = re.split(r" \((?:repo|kind|priority|since|merged|hold|closed)[:)]", t.get("title", ""))[0]
+    links = re.findall(PR_RE, t.get("title", ""))
+    for link in (none(t.get("links")) or "").split(","):
+        links += re.findall(PR_RE, link)
+    deps = none(t.get("deps")) or ""
+    return {"id": t["id"], "section": SECTIONS.get(t.get("state"), "Queued"),
+            "title": re.sub(r"\s*https://\S+", "", title).strip(),
+            "links": list(dict.fromkeys(links)), "repo": none(t.get("repo")) or "",
+            "kind": none(t.get("kind")) or "", "hold": none(t.get("hold_reason")),
+            "hold_kind": none(t.get("hold_kind")), "until": none(t.get("hold_until")),
+            "blocked_by": [d[len("blocked-by:"):] for d in deps.split(",") if d.startswith("blocked-by:")]}
+
+
+def cli(argv=None):
+    ap = argparse.ArgumentParser(description="Mirror a firstmate backlog onto Basecamp card tables.")
+    ap.add_argument("--home", required=True, help="firstmate home (holds data/backlog.md and state/)")
+    ap.add_argument("--config", required=True, help="config.json; its directory holds all runtime state")
+    ap.add_argument("--dry-run", action="store_true", help="plan only: no Basecamp calls, map.json untouched")
+    a = ap.parse_args(argv)
+    s = Sync(a.home, a.config, dry=a.dry_run)
+    try:
+        s.main()
+    except Exception as e:
+        s.log(f"FAILED {type(e).__name__}: {e}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(cli())
