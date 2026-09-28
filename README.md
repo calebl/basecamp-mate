@@ -29,9 +29,17 @@ Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between
 - Nothing is posted to chat or as a comment.
 - New comments by the captain are appended to `pending-comments.jsonl` for firstmate to
   relay; they are never acted on.
+- On cards assigned to the captain (and only those), the run reads the card's boosts. A 👍
+  (any skin tone) by the captain is appended to `pending-comments.jsonl` as an approval
+  record. It means **approve every recommendation on the card as recommended**; a comment
+  is how to change one. The script never releases, answers, unassigns or moves anything
+  because of a boost: firstmate records the decision in the backlog, and the next normal
+  run unassigns the card. Other emoji, other people's boosts and boosts on unassigned
+  cards are ignored; each boost id is recorded in `map.json` so it is emitted once.
 - `map.json` maps `task|board` to a card id, so re-runs update the same card instead of
   creating a duplicate.
-- `--dry-run` makes no Basecamp calls and leaves `map.json` alone; it logs, per card,
+- `--dry-run` makes no Basecamp writes (it only reads boosts on assigned cards, and logs
+  any new captain approval) and leaves `map.json` and the pending file alone; it logs, per card,
   whether it would be created, updated, moved, assigned or unassigned, and a total.
 
 ## Config and state
@@ -49,9 +57,9 @@ Everything else lives beside the config, never in this repo:
 
 | File | Kept by | Purpose |
 | --- | --- | --- |
-| `map.json` | the script | task/board -> card id, column, assignment, content digest, seen comments |
+| `map.json` | the script | task/board -> card id, column, assignment, content digest, seen comments and boosts |
 | `sync.log` | the script | one line per action, plus a counts line per run |
-| `pending-comments.jsonl` | the script | captain comments waiting to be relayed |
+| `pending-comments.jsonl` | the script | captain comments and approvals waiting to be relayed, one JSON record per line (see below) |
 | `extra-repos.json` | hand | `{"task": ["board", ...]}`: extra boards for a task |
 | `figuring.json` | hand | `{"task": "why"}`: queued tasks that need a plan approved |
 | `not-now.json` | hand | `{"task": "why"}`: tasks deferred |
@@ -126,3 +134,12 @@ python3 -m unittest discover -s tests -v
 ```
 
 The `basecamp` CLI is stubbed; tests make no network calls.
+
+## Pending records
+
+Each line of `pending-comments.jsonl` is one JSON object with a `kind`. Records written
+before `kind` existed have none; treat a missing `kind` as `"comment"`.
+
+- `comment`: `task`, `repo`, `card`, `comment` (id), `at`, `text`.
+- `approval`: `task`, `repo`, `card`, `url` (card URL), `boost` (id), `at`. The captain
+  gave the card a 👍: approve every recommendation on it as recommended.

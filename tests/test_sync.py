@@ -12,8 +12,8 @@ CAPTAIN = 33333333
 class Stub:
     """Records every CLI call and answers like the basecamp CLI would."""
 
-    def __init__(self, comments=None):
-        self.calls, self.next_id, self.comments = [], 500, comments or {}
+    def __init__(self, comments=None, boosts=None):
+        self.calls, self.next_id, self.comments, self.boosts = [], 500, comments or {}, boosts or {}
 
     def __call__(self, cmd, **kw):
         if cmd[0] != "basecamp":
@@ -26,10 +26,12 @@ class Stub:
             data = {"id": self.next_id}
         elif args[:2] == ["comments", "list"]:
             data = self.comments.get(args[2], [])
+        elif args[:2] == ["api", "get"]:
+            data = self.boosts.get(args[2].split("/")[4], [])
         return SimpleNamespace(stdout=json.dumps({"ok": True, "data": data}), stderr="", returncode=0)
 
     def verbs(self):
-        return [a[1] if a[0] == "cards" else a[0] for a in self.calls if a[:2] != ["comments", "list"]]
+        return [a[1] if a[0] == "cards" else a[0] for a in self.calls if a[:2] not in (["comments", "list"], ["api", "get"])]
 
 
 def item(id, section="Queued", repo="srv", hold=None, hold_kind=None, until=None, title="A task"):
@@ -194,6 +196,55 @@ class Comments(Base):
         self.assertEqual(len(lines), 1)
         self.assertEqual(json.loads(lines[0])["text"], "yes")
         self.assertEqual(self.cards()["a|server"]["comments"], [9, 10])
+        self.assertEqual(json.loads(lines[0])["kind"], "comment")
+
+
+def boost(id, who=CAPTAIN, content="👍"):
+    return {"id": id, "booster": {"id": who}, "content": content, "created_at": "t"}
+
+
+class Boosts(Base):
+    WAIT = dict(hold="pick", hold_kind="captain")
+
+    def pending(self):
+        p = os.path.join(self.cfgdir, "pending-comments.jsonl")
+        return [json.loads(l) for l in open(p)] if os.path.exists(p) else []
+
+    def boost_calls(self):
+        return [c for c in self.stub.calls if c[:2] == ["api", "get"]]
+
+    def test_captain_thumbs_up_emitted_once(self):
+        self.stub.boosts = {"501": [boost(7), boost(8, content="👍🏽")]}
+        self.sync().main([item("a", **self.WAIT)])
+        self.sync().main([item("a", **self.WAIT)])
+        recs = self.pending()
+        self.assertEqual([r["boost"] for r in recs], [7, 8])
+        self.assertEqual(recs[0]["kind"], "approval")
+        self.assertEqual((recs[0]["task"], recs[0]["repo"], recs[0]["card"], recs[0]["at"]), ("a", "server", 501, "t"))
+        self.assertTrue(recs[0]["url"].endswith("/card_tables/cards/501"))
+        self.assertNotIn("unassign", self.stub.verbs())
+        self.assertTrue(self.cards()["a|server"]["assigned"])
+
+    def test_others_and_other_emoji_ignored(self):
+        self.stub.boosts = {"501": [boost(7, who=1), boost(8, content="🎉"), boost(9, content="👍👍")]}
+        self.sync().main([item("a", **self.WAIT)])
+        self.assertEqual(self.pending(), [])
+
+    def test_unassigned_card_never_queried(self):
+        self.stub.boosts = {"501": [boost(7)]}
+        self.sync().main([item("a")])
+        self.sync().main([item("a")])
+        self.sync(dry=True).main([item("a")])
+        self.assertEqual(self.boost_calls(), [])
+        self.assertEqual(self.pending(), [])
+
+    def test_dry_run_reads_but_records_nothing(self):
+        self.sync().main([item("a", **self.WAIT)])
+        self.stub.boosts = {"501": [boost(7)]}
+        self.sync(dry=True).main([item("a", **self.WAIT)])
+        self.assertEqual(len(self.boost_calls()), 2)
+        self.assertEqual(self.pending(), [])
+        self.assertNotIn("boosts", self.cards()["a|server"])
 
 
 class NoteHtml(Base):
