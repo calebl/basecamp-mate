@@ -44,6 +44,11 @@ class Stub:
             data = {"id": self.me}
         elif args[:2] == ["api", "get"]:
             data = self.boosts.get(args[2].split("/")[4], [])
+        elif args[:2] == ["api", "post"] and args[2].endswith("/comments.json"):
+            if self.fail_post:
+                return SimpleNamespace(stdout=json.dumps({"ok": False, "error": "boom"}), stderr="", returncode=1)
+            data = {"id": 800 + len(self.calls), "creator": {"id": self.me}, "content": json.loads(args[4])["content"]}
+            self.comments.setdefault(args[2].split("/")[4], []).append(data)
         elif args[:2] == ["api", "post"]:
             if self.fail_post:
                 return SimpleNamespace(stdout=json.dumps({"ok": False, "error": "boom"}), stderr="", returncode=1)
@@ -63,7 +68,12 @@ class Stub:
         return [a[2] for a in self.calls if a[:2] == ["api", "post"]]
 
     def posted(self):
-        return [(a[2].split("/")[4], json.loads(a[4])["content"]) for a in self.calls if a[:2] == ["api", "post"]]
+        return [(a[2].split("/")[4], json.loads(a[4])["content"]) for a in self.calls
+                if a[:2] == ["api", "post"] and a[2].endswith("/boosts.json")]
+
+    def replies(self):
+        return [(a[2].split("/")[4], json.loads(a[4])["content"]) for a in self.calls
+                if a[:2] == ["api", "post"] and a[2].endswith("/comments.json")]
 
     def deletes(self):
         return [a[2] for a in self.calls if a[:2] == ["api", "delete"]]
@@ -526,8 +536,8 @@ class Acknowledge(Base):
     def question(self):
         self.stub.comments = {"501": [{"id": 9, "creator": {"id": CAPTAIN}, "content": "<p>why &amp; how?</p>", "created_at": "t"}]}
 
-    def ack(self, dry=False):
-        self.sync(dry=dry).ack(9)
+    def reply(self, text="Because.\n\nSee <here> & there", **kw):
+        return self.sync(dry=kw.pop("dry", False)).reply(9, text, **kw)
 
     def test_question_gets_eyes_not_thumbs(self):
         self.question()
@@ -542,39 +552,69 @@ class Acknowledge(Base):
         self.assertEqual(self.stub.posted(), [("9", "👍")])
         self.assertEqual(self.pending()[0]["kind"], "comment")
 
-    def test_ack_swaps_eyes_for_thumbs_once(self):
+    def test_reply_posts_once_then_removes_eyes(self):
         self.question()
         self.sync().main([item("a")])
         eyes = self.stub.boosts["9"][0]["id"]
-        self.ack()
+        self.assertTrue(self.reply())
+        self.assertEqual(self.stub.replies(), [("501", "<div>Because.</div><div>See &lt;here&gt; &amp; there</div>")])
         self.assertEqual(self.stub.deletes(), [f"/buckets/22222222/boosts/{eyes}.json"])
-        self.assertEqual([b["content"] for b in self.stub.boosts["9"]], ["👍"])
-        self.assertEqual([a[:2] for a in self.cards()["a|server"]["acked"]], [[9, "👍"]])
-        self.sync().main([item("a")])
-        self.assertEqual(self.stub.posted(), [("9", "👀"), ("9", "👍")])
+        self.assertEqual(self.stub.boosts["9"], [])
+        self.assertEqual(self.stub.posted(), [("9", "👀")])
+        self.assertEqual(self.cards()["a|server"]["replied"], [9])
+        call_order = [c[1] for c in self.stub.calls if c[:1] == ["api"] and c[1] in ("post", "delete")]
+        self.assertEqual(call_order[-2:], ["post", "delete"])
 
-    def test_ack_is_idempotent(self):
+    def test_second_reply_refused_without_again(self):
         self.question()
         self.sync().main([item("a")])
-        self.ack()
-        self.ack()
-        self.assertEqual(len(self.stub.deletes()), 1)
-        self.assertEqual(self.stub.posted(), [("9", "👀"), ("9", "👍")])
+        self.reply()
+        self.assertFalse(self.reply())
+        self.assertEqual(len(self.stub.replies()), 1)
+        self.assertTrue(self.reply(again=True))
+        self.assertEqual(len(self.stub.replies()), 2)
 
-    def test_ack_without_eyes_still_thumbs(self):
-        self.ack()
+    def test_reply_failure_keeps_eyes_and_records_nothing(self):
+        self.question()
+        self.sync().main([item("a")])
+        self.stub.fail_post = True
+        with self.assertRaises(RuntimeError):
+            self.reply()
+        self.assertEqual([b["content"] for b in self.stub.boosts["9"]], ["👀"])
         self.assertEqual(self.stub.deletes(), [])
-        self.assertEqual(self.stub.posted(), [("9", "👍")])
+        self.assertNotIn("replied", self.cards()["a|server"])
 
-    def test_ack_dry_run_changes_nothing(self):
+    def test_no_reply_without_profile(self):
         self.question()
         self.sync().main([item("a")])
-        self.ack(dry=True)
-        self.assertEqual((self.stub.deletes(), self.stub.posted()), ([], [("9", "👀")]))
+        self.set_profile(None)
+        self.assertFalse(self.reply())
+        self.assertEqual(self.stub.replies(), [])
+
+    def test_reply_dry_run_posts_nothing(self):
+        self.question()
+        self.sync().main([item("a")])
+        self.reply(dry=True)
+        self.assertEqual((self.stub.replies(), self.stub.deletes()), ([], []))
+
+    def test_own_reply_never_captured(self):
+        self.question()
+        self.sync().main([item("a")])
+        self.reply()
+        self.sync().main([item("a")])
+        self.assertEqual([r["comment"] for r in self.pending()], [9])
+        self.assertEqual(len(self.cards()["a|server"]["comments"]), 2)
+
+    def test_sync_never_posts_comments(self):
+        self.question()
+        self.stub.boosts = {"501": [boost(7)]}
+        for _ in range(2):
+            self.sync().main([item("a", **self.WAIT)])
+        self.assertEqual(self.stub.replies(), [])
 
     def test_acting_captain_gets_no_boosts_at_all(self):
         self.question()
         self.stub.me = CAPTAIN
         self.sync().main([item("a")])
-        self.ack()
-        self.assertEqual((self.stub.deletes(), self.stub.posted()), ([], []))
+        self.assertFalse(self.reply())
+        self.assertEqual((self.stub.deletes(), self.stub.posted(), self.stub.replies()), ([], [], []))

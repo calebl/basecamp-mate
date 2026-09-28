@@ -5,9 +5,10 @@ Deterministic, no model calls. The backlog is the source of truth; Basecamp is a
 view of it. Safety bounds, enforced here:
   - only the configured account, project and card tables are touched;
   - cards are created, updated, moved, assigned and unassigned, never deleted,
-    trashed or archived, and nothing is posted to chat or as a comment; the one
+    trashed or archived, and the sync posts nothing to chat or as a comment; its one
     other write is a 👀 or 👍 boost acknowledging a captured captain comment or
-    approval, and only `sync.py ack` removes one (the acting user's own 👀);
+    approval. Only the explicit `sync.py reply` command posts a comment (an answer
+    to a captain question) and removes the acting user's own 👀;
   - the id map (map.json) makes re-runs update the same card instead of
     duplicating it.
 New comments the captain writes on cards, and his 👍 boost on a card assigned to
@@ -16,8 +17,8 @@ pending-comments.jsonl for firstmate to relay; they are never acted on here.
 When the profile signs in as someone other than the captain, that user boosts
 each captured comment (or, for an approval, the card) once, as a visible
 acknowledgement: 👀 on a question (a comment containing "?"), 👍 otherwise; a
-failed boost is retried on the next run. `sync.py ack` swaps 👀 for 👍 once the
-question is answered.
+failed boost is retried on the next run. `sync.py reply`, run by the relaying
+agent, posts the answer on the card and then removes the 👀.
 
 All runtime state (map.json, sync.log, pending-comments.jsonl and the hand-kept
 extra-repos.json, figuring.json, not-now.json, skip.json, decisions.json, boards.json) lives in the directory
@@ -28,7 +29,7 @@ Open Lavish review boards (read once per run from `lavish-axi`) whose file sits 
 missing or fails, each card keeps the board links it last had.
 
 Usage: sync.py --home <firstmate home> --config <config.json> [--dry-run]
-       sync.py ack --home <home> --config <config.json> --recording <question comment id> [--dry-run]
+       sync.py reply --home <home> --config <config.json> --recording <question comment id> --body-file <file> [--again] [--dry-run]
 """
 import argparse, csv, hashlib, html, json, os, re, subprocess, sys, time, tomllib
 from datetime import datetime, timezone
@@ -345,7 +346,7 @@ class Sync:
         👍 otherwise. Each moves to rec["acked"] as [recording, emoji, boost id] once
         boosted, so a failure is retried next run and a re-run never boosts twice.
         Nothing is boosted when no profile is set or it signs in as the captain
-        himself; the queue is dropped. 👀 is only ever removed by the `ack` command.
+        himself; the queue is dropped. 👀 is only ever removed by the `reply` command.
         """
         done = [a[:2] for a in rec.get("acked", [])]
         queue = [q for q in rec.get("ack", []) if q not in done]
@@ -383,35 +384,46 @@ class Sync:
         path = f"/buckets/{self.project}/recordings/{rid}/boosts.json"
         return (self.bc("api", "post", path, "-d", json.dumps({"content": emoji})) or {}).get("id")
 
-    def ack(self, rid):
-        """Mark an answered question: swap the acting user's 👀 on `rid` for 👍. Idempotent."""
+    def reply(self, rid, text, again=False):
+        """Post an answer to the captain's question `rid` on its card, then take the acting user's 👀 off it.
+
+        Run only by the relaying agent; the sync itself never posts comments. A reply
+        is recorded in the card's "replied" list and a second one is refused unless
+        `again`. A failed post removes nothing, so the 👀 stays.
+        """
+        cards = self.load("map.json", {})
+        rec = next((r for r in cards.values() if rid in r.get("comments", [])), None)
+        if rec is None:
+            raise RuntimeError(f"no card in map.json has comment {rid}")
+        if rid in rec.get("replied", []) and not again:
+            self.log(f"reply {rid}: already replied, pass --again to post another")
+            return False
         me = self.acting_id()
         if me == "retry":
             raise RuntimeError("acting identity unknown")
         if me is None or me == self.captain:
-            self.log(f"ack {rid}: acting user is the captain or unset, nothing to boost")
-            return
-        for b in self.boosts_by(me, rid, EYES):
-            if self.dry:
-                self.log(f"dry ack {rid}: remove {EYES} boost {b.get('id')}")
-            else:
-                self.bc("api", "delete", f"/buckets/{self.project}/boosts/{b.get('id')}.json")
-                self.log(f"ack {rid}: removed {EYES} boost {b.get('id')}")
+            self.log(f"reply {rid}: acting user is the captain or unset, not posting")
+            return False
+        body = render_reply(text)
         if self.dry:
-            self.log(f"dry ack {rid}: ensure {THUMBS}")
-            return
-        bid = self.boost(me, rid, THUMBS)
-        self.log(f"ack {rid}: {THUMBS} boost {bid}")
-        cards = self.load("map.json", {})
-        for rec in cards.values():
-            if rid in rec.get("comments", []) or rid == rec.get("card"):
-                rec["acked"] = [a for a in rec.get("acked", []) if a[:2] != [rid, EYES]]
-                rec["ack"] = [q for q in rec.get("ack", []) if q != [rid, EYES]]
-                if [rid, THUMBS] not in [a[:2] for a in rec["acked"]]:
-                    rec["acked"].append([rid, THUMBS, bid])
+            self.log(f"dry reply {rid}: post on card {rec['card']}, then remove {EYES}")
+            return False
+        self.bc("api", "post", f"/buckets/{self.project}/recordings/{rec['card']}/comments.json", "-d", json.dumps({"content": body}))
+        rec.setdefault("replied", []).append(rid)
         self.save(cards)
+        self.log(f"reply {rid}: posted on card {rec['card']}")
+        for b in self.boosts_by(me, rid, EYES):
+            self.bc("api", "delete", f"/buckets/{self.project}/boosts/{b.get('id')}.json")
+            self.log(f"reply {rid}: removed {EYES} boost {b.get('id')}")
+        return True
 
 THUMBS, EYES = "\U0001F44D", "\U0001F440"
+
+
+def render_reply(text):
+    """Plain text to comment HTML: escaped, one <div> per paragraph, no raw newlines."""
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
+    return "".join("<div>" + "<br>".join(html.escape(l) for l in p.splitlines()) + "</div>" for p in paras)
 
 
 def is_emoji(content, emoji):
@@ -493,18 +505,21 @@ def task_item(t):
 
 def cli(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if argv[:1] == ["ack"]:
-        ap = argparse.ArgumentParser(prog="sync.py ack", description="Swap the acting user's 👀 on an answered question for 👍.")
+    if argv[:1] == ["reply"]:
+        ap = argparse.ArgumentParser(prog="sync.py reply", description="Answer a captain question on its card, then remove the 👀.")
         ap.add_argument("--home", required=True)
         ap.add_argument("--config", required=True)
         ap.add_argument("--recording", required=True, type=int, help="the question comment's id")
+        ap.add_argument("--body-file", required=True, help="plain-text answer")
+        ap.add_argument("--again", action="store_true", help="post even though this question was already answered")
         ap.add_argument("--dry-run", action="store_true")
         a = ap.parse_args(argv[1:])
         s = Sync(a.home, a.config, dry=a.dry_run)
         try:
-            s.ack(a.recording)
+            with open(a.body_file) as f:
+                s.reply(a.recording, f.read(), again=a.again)
         except Exception as e:
-            s.log(f"FAILED ack {a.recording} {type(e).__name__}: {e}")
+            s.log(f"FAILED reply {a.recording} {type(e).__name__}: {e}")
             return 1
         return 0
     ap = argparse.ArgumentParser(description="Mirror a firstmate backlog onto Basecamp card tables.")

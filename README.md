@@ -35,15 +35,22 @@ Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between
 - Only the configured account, project and card tables are touched.
 - Cards are never deleted, trashed or archived. Cards whose task left the backlog are
   left as they are (the run logs how many).
-- Nothing is posted to chat or as a comment.
+- The sync never posts to chat or as a comment. The only thing that posts a comment is the
+  explicit `sync.py reply` command below, run by the relaying agent to answer a captain
+  question on its card.
 - Acknowledgement boost: when the run records a new captain comment or approval, the
   acting user boosts it once (the comment itself, or the card for an approval). A comment
   whose text contains `?` is recorded with `"kind": "question"` and gets 👀 ("looking into
-  it"); other comments and approvals get 👍 ("got it"). The sync never removes a 👀. Once
-  the relaying agent has answered a question it runs
-  `sync.py ack --home <home> --config <config.json> --recording <comment id>`, which deletes
-  the acting user's 👀 on that comment and adds 👍; running it again is a no-op, and it adds
-  the 👍 even when no 👀 is there (`--dry-run` logs the swap only). Boosts are posted via `POST /buckets/<project>/recordings/<id>/boosts.json`. The
+  it"); other comments and approvals get 👍 ("got it"). The sync never removes a 👀. Once the relaying agent
+  has the answer it runs
+  `sync.py reply --home <home> --config <config.json> --recording <question comment id> --body-file <file>`,
+  which posts the file's plain text (HTML-escaped, one `<div>` per paragraph) as a comment
+  on that card as the acting user, then removes the acting user's 👀 from the question; no
+  👍 is added. The question id is recorded in the card's `replied` list in `map.json` and a
+  second reply is refused unless `--again` is passed. A failed post removes nothing, so the
+  👀 stays. With no profile, or a profile signed in as the captain, it posts nothing;
+  `--dry-run` logs the plan only. The acting user's own replies are never relayed, since
+  only the captain's comments are. Boosts are posted via `POST /buckets/<project>/recordings/<id>/boosts.json`. The
   acting identity is read from `/my/profile.json` once per run; with no `profile`, or a
   profile that signs in as the captain, nothing is boosted, so the captain never appears
   to boost his own items. A recording that already has the acting user's 👍 is not
@@ -86,7 +93,7 @@ Everything else lives beside the config, never in this repo:
 
 | File | Kept by | Purpose |
 | --- | --- | --- |
-| `map.json` | the script | task/board -> card id, column, assignment, content digest, linked boards, seen comments and boosts, acknowledgement boosts queued and done |
+| `map.json` | the script | task/board -> card id, column, assignment, content digest, linked boards, seen comments and boosts, acknowledgement boosts queued and done, questions replied to |
 | `sync.log` | the script | one line per action, plus a counts line per run |
 | `pending-comments.jsonl` | the script | captain comments and approvals waiting to be relayed, one JSON record per line (see below) |
 | `extra-repos.json` | hand | `{"task": ["board", ...]}`: extra boards for a task |
