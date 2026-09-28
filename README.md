@@ -159,7 +159,7 @@ or by hand from
 - `releases` (optional): `{"board": "<message board id>", "repos": {"owner/name": "<name>"
   or {"name": "<name>", "note": "<text>"}}, "prereleases": false}`. The name is the
   subject's first word (capitalized; `init` uses the mapped board name) and the note is
-  appended to the body, e.g. `"note": "Run \`ta upgrade\` to install."`.
+  appended to the body, e.g. `` "note": "Run `ta upgrade` to install." ``.
 - `repos`: backlog repo name -> board name.
 - `tables`: per board, the card table id (`table`) and a column id for each of
   `Triage`, `Not now`, `Figuring it out`, `In progress`, `Ready for QA`, `Done`.
