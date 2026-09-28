@@ -713,3 +713,93 @@ class Chats(Base):
         for _ in range(2):
             self.sync().main([])
         self.assertEqual(self.stub.chat_posts(), [])
+
+
+class Releases(Base):
+    """GitHub release announcements on the Message Board; gh and basecamp are stubbed."""
+
+    def setUp(self):
+        super().setUp()
+        cfg = json.load(open(os.path.join(self.cfgdir, "config.json")))
+        cfg["releases"] = {"board": "77", "repos": {"acme/terminal": {"name": "terminal", "note": "Run `ta upgrade` to install."}}}
+        json.dump(cfg, open(os.path.join(self.cfgdir, "config.json"), "w"))
+        self.rels = [self.rel("v0.1.0", "2026-01-01T00:00:00Z")]
+        self.messages, self.fail_message = [], False
+
+    def rel(self, tag, at, draft=False, pre=False):
+        return {"tagName": tag, "publishedAt": at, "isDraft": draft, "isPrerelease": pre}
+
+    def runner(self, cmd, **kw):
+        if cmd[0] == "gh":
+            if cmd[2] == "list":
+                return SimpleNamespace(stdout=json.dumps(self.rels), stderr="", returncode=0)
+            tag = cmd[3]
+            return SimpleNamespace(stdout=json.dumps({"tagName": tag, "url": f"https://github.com/acme/terminal/releases/tag/{tag}",
+                                                      "body": "## What's Changed\n* Faster **maps** in https://github.com/acme/terminal/pull/9 <b>"}),
+                                   stderr="", returncode=0)
+        if cmd[0] != "basecamp":
+            return self.stub(cmd, **kw)
+        args = cmd[5:-3] if cmd[3] == "-P" else cmd[3:-3]
+        if args[:2] == ["api", "post"] and args[2].endswith("/messages.json"):
+            self.stub.calls.append(args)
+            if self.fail_message:
+                return SimpleNamespace(stdout=json.dumps({"ok": False, "error": "boom"}), stderr="", returncode=1)
+            self.messages.append((args[2], json.loads(args[4])))
+            return SimpleNamespace(stdout=json.dumps({"ok": True, "data": {"id": 1000 + len(self.messages)}}), stderr="", returncode=0)
+        return self.stub(cmd, **kw)
+
+    def run_sync(self, dry=False, pre=False):
+        sync.Sync(self.home, os.path.join(self.cfgdir, "config.json"), dry=dry, runner=self.runner, prereleases=pre).main([])
+
+    def test_seeding_announces_nothing(self):
+        self.run_sync()
+        self.assertEqual(self.messages, [])
+        state = json.load(open(os.path.join(self.cfgdir, "releases.json")))
+        self.assertEqual(state["acme/terminal"]["seeded"], ["v0.1.0"])
+
+    def test_new_release_posts_once(self):
+        self.run_sync()
+        self.rels.insert(0, self.rel("v0.2.0", "2999-01-01T00:00:00Z"))
+        self.run_sync()
+        (path, msg), = self.messages
+        self.assertEqual(path, f"/buckets/{json.load(open(os.path.join(self.cfgdir, 'config.json')))['project']}/message_boards/77/messages.json")
+        self.assertEqual(msg["subject"], "Terminal v0.2.0 released")
+        self.assertIn("<div><strong>What&#x27;s Changed</strong></div><ul><li>Faster <strong>maps</strong> in "
+                      '<a href="https://github.com/acme/terminal/pull/9">', msg["content"])
+        self.assertIn("&lt;b&gt;", msg["content"])
+        self.assertIn('<a href="https://github.com/acme/terminal/releases/tag/v0.2.0">', msg["content"])
+        self.assertIn("Run ta upgrade to install.", msg["content"])
+        self.assertNotIn("\n", msg["content"])
+        self.run_sync()
+        self.assertEqual(len(self.messages), 1)
+        self.assertEqual(json.load(open(os.path.join(self.cfgdir, "releases.json")))["acme/terminal"]["announced"], {"v0.2.0": 1001})
+
+    def test_drafts_and_prereleases_skipped(self):
+        self.run_sync()
+        self.rels += [self.rel("v0.3.0", None, draft=True), self.rel("v0.3.0-rc1", "2999-01-01T00:00:00Z", pre=True)]
+        self.run_sync()
+        self.assertEqual(self.messages, [])
+        self.run_sync(pre=True)
+        self.assertEqual([m["subject"] for _, m in self.messages], ["Terminal v0.3.0-rc1 released"])
+
+    def test_post_failure_retried(self):
+        self.run_sync()
+        self.rels.insert(0, self.rel("v0.2.0", "2999-01-01T00:00:00Z"))
+        self.fail_message = True
+        self.run_sync()
+        self.assertEqual(self.messages, [])
+        self.assertIn("retrying next run", open(os.path.join(self.cfgdir, "sync.log")).read())
+        self.fail_message = False
+        self.run_sync()
+        self.assertEqual(len(self.messages), 1)
+
+    def test_posts_even_as_captain_and_dry_run_posts_nothing(self):
+        self.stub.me = CAPTAIN
+        self.run_sync(dry=True)
+        self.assertFalse(os.path.exists(os.path.join(self.cfgdir, "releases.json")))
+        self.run_sync()
+        self.rels.insert(0, self.rel("v0.2.0", "2999-01-01T00:00:00Z"))
+        self.run_sync(dry=True)
+        self.assertEqual(self.messages, [])
+        self.run_sync()
+        self.assertEqual(len(self.messages), 1)

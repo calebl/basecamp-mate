@@ -31,8 +31,15 @@ class Stub:
         self.people = [{"id": CAPTAIN, "name": "Captain", "owner": True, "email_address": "cap@example.com"},
                        {"id": ACTING, "name": "Firstmate", "owner": False, "email_address": "fm@example.com"}]
         self.calls = []
+        self.origins, self.renames = {}, {}  # projects/<repo> -> origin URL; owner/name -> gh nameWithOwner
 
     def __call__(self, cmd, **kw):
+        if cmd[0] == "git":
+            url = self.origins.get(os.path.basename(cmd[2]))
+            return SimpleNamespace(stdout=(url or "") + "\n", stderr="", returncode=0 if url else 2)
+        if cmd[0] == "gh":
+            full = cmd[3]
+            return SimpleNamespace(stdout=json.dumps({"nameWithOwner": self.renames.get(full, full)}), stderr="", returncode=0)
         assert cmd[:5] == ["basecamp", "-a", "1111111", "-P", "firstmate"], cmd
         args = cmd[5:-1]
         self.calls.append(args)
@@ -125,6 +132,14 @@ class InitTest(unittest.TestCase):
         cfg, create = self.init().discover()
         self.assertEqual(cfg, EXPECTED)
         self.assertEqual(create, [])
+
+    def test_releases_from_github_origins(self):
+        self.stub.origins = {"Engine": "https://github.com/acme/engine.git", "my-server": "git@github.com:old/srv.git"}
+        self.stub.renames = {"old/srv": "acme/server"}
+        cfg, _ = self.init().discover()
+        self.assertEqual(cfg["releases"], {"board": "9", "repos": {"acme/engine": "engine", "acme/server": "server"}})
+        self.stub.project["dock"] = [d for d in self.stub.project["dock"] if d["name"] != "message_board"]
+        self.assertNotIn("releases", self.init().discover()[0])
 
     def test_writes_config_side_files_and_installs(self):
         self.init().main()

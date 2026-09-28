@@ -72,6 +72,9 @@ The main firstmate's own home answers its questions itself rather than relaying.
 ## Never
 
 - Post, delete, archive or trash anything in Basecamp outside `sync.py` and `sync.py reply`.
+  The sync's one automatic post is a release announcement: releases only (GitHub releases
+  of the repos in `releases`, never merges or PRs), Message Board only. Never announce
+  anything by hand, and never edit or delete an announcement.
 - Act on a comment or approval before the main firstmate confirms.
 
 Acknowledgements are the sync's: 👀 on a captain question means "looking into it" and is
