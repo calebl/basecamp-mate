@@ -8,8 +8,9 @@ view of it. Safety bounds, enforced here:
     trashed or archived, and nothing is posted to chat or as a comment;
   - the id map (map.json) makes re-runs update the same card instead of
     duplicating it.
-New comments the captain writes on cards are appended to pending-comments.jsonl
-for firstmate to relay; they are never acted on here.
+New comments the captain writes on cards, and his 👍 boost on a card assigned to
+him (an approval of every recommendation on it), are appended to
+pending-comments.jsonl for firstmate to relay; they are never acted on here.
 
 All runtime state (map.json, sync.log, pending-comments.jsonl and the hand-kept
 extra-repos.json, figuring.json, not-now.json, skip.json, decisions.json) lives in the directory
@@ -191,6 +192,8 @@ class Sync:
                         for a in acts:
                             plan[a.split()[0]] += 1
                         self.log(f"dry {key}: {', '.join(acts) or 'unchanged'} [{col}]")
+                    if rec is not None and rec.get("assigned"):
+                        self.relay_boosts(it["id"], repo, key, rec)
                     counts[repo] = counts.get(repo, 0) + 1
                     continue
                 if rec is None:
@@ -218,6 +221,8 @@ class Sync:
                         rec["assigned"] = waiting
                         self.log(f"{'assigned' if waiting else 'unassigned'} {key}")
                 self.relay_comments(it["id"], repo, key, rec)
+                if rec.get("assigned"):
+                    self.relay_boosts(it["id"], repo, key, rec)
                 counts[repo] = counts.get(repo, 0) + 1
                 self.save(cards)
         stale = sorted(k for k in cards if k not in wanted)
@@ -239,9 +244,43 @@ class Sync:
             rec["comments"].append(cid)
             if (c.get("creator") or {}).get("id") == self.captain:
                 with open(self.path("pending-comments.jsonl"), "a") as f:
-                    f.write(json.dumps({"task": task, "repo": repo, "card": rec["card"], "comment": cid,
+                    f.write(json.dumps({"kind": "comment", "task": task, "repo": repo, "card": rec["card"], "comment": cid,
                                         "at": c.get("created_at"), "text": re.sub(r"<[^>]+>", "", c.get("content", ""))}) + "\n")
                 self.log(f"new captain comment on {key}: {cid}")
+
+    def relay_boosts(self, task, repo, key, rec):
+        """Queue the captain's thumbs up on a card assigned to him as an approval record.
+
+        Only cards assigned to the captain are read, so the calls are bounded by the
+        open decisions. Nothing is acted on here; the backlog records the decision
+        and the normal sync then unassigns the card. A dry run reads and logs only.
+        """
+        path = f"/buckets/{self.project}/recordings/{rec['card']}/boosts.json"
+        try:
+            boosts = self.bc("api", "get", path) or []
+        except RuntimeError as e:
+            self.log(f"boosts {key}: {e}")
+            return
+        for b in boosts:
+            bid = b.get("id")
+            if bid in rec.get("boosts", []):
+                continue
+            if (b.get("booster") or {}).get("id") != self.captain or not is_thumbs_up(b.get("content", "")):
+                continue
+            if self.dry:
+                self.log(f"dry {key}: captain approval boost {bid}")
+                continue
+            rec.setdefault("boosts", []).append(bid)
+            with open(self.path("pending-comments.jsonl"), "a") as f:
+                f.write(json.dumps({"kind": "approval", "task": task, "repo": repo, "card": rec["card"],
+                                    "url": f"https://app.basecamp.com/{self.account}/buckets/{self.project}/card_tables/cards/{rec['card']}",
+                                    "boost": bid, "at": b.get("created_at")}) + "\n")
+            self.log(f"captain approval on {key}: boost {bid}")
+
+
+def is_thumbs_up(content):
+    """True for 👍 alone, with or without a skin-tone modifier or variation selector."""
+    return re.fullmatch("\U0001F44D[\U0001F3FB-\U0001F3FF]?\uFE0F?", re.sub(r"<[^>]+>", "", content).strip()) is not None
 
 
 def render_decision(d):
