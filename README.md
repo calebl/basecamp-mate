@@ -36,6 +36,21 @@ Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between
 - Cards are never deleted, trashed or archived. Cards whose task left the backlog are
   left as they are (the run logs how many).
 - Nothing is posted to chat or as a comment.
+- Acknowledgement boost: when the run records a new captain comment or approval, the
+  acting user boosts it once (the comment itself, or the card for an approval). A comment
+  whose text contains `?` is recorded with `"kind": "question"` and gets 👀 ("looking into
+  it"); other comments and approvals get 👍 ("got it"). The sync never removes a 👀. Once
+  the relaying agent has answered a question it runs
+  `sync.py ack --home <home> --config <config.json> --recording <comment id>`, which deletes
+  the acting user's 👀 on that comment and adds 👍; running it again is a no-op, and it adds
+  the 👍 even when no 👀 is there (`--dry-run` logs the swap only). Boosts are posted via `POST /buckets/<project>/recordings/<id>/boosts.json`. The
+  acting identity is read from `/my/profile.json` once per run; with no `profile`, or a
+  profile that signs in as the captain, nothing is boosted, so the captain never appears
+  to boost his own items. A recording that already has the acting user's 👍 is not
+  boosted again, and boosted ids are kept in `map.json` (`ack` queued, `acked` done). A
+  failed boost is logged and retried next run; it never blocks the pending record or
+  fails the run. The acting user's boost is never read as an approval, since only the
+  captain's boosts are.
 - New comments by the captain are appended to `pending-comments.jsonl` for firstmate to
   relay; they are never acted on.
 - On cards assigned to the captain (and only those), the run reads the card's boosts. A 👍
@@ -47,8 +62,9 @@ Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between
   cards are ignored; each boost id is recorded in `map.json` so it is emitted once.
 - `map.json` maps `task|board` to a card id, so re-runs update the same card instead of
   creating a duplicate.
-- `--dry-run` makes no Basecamp writes (it only reads boosts on assigned cards, and logs
-  any new captain approval) and leaves `map.json` and the pending file alone; it logs, per card,
+- `--dry-run` makes no Basecamp writes (it only reads boosts on assigned cards and the
+  acting identity, and logs any new captain approval and the acknowledgement boosts it
+  would add) and leaves `map.json` and the pending file alone; it logs, per card,
   whether it would be created, updated, moved, assigned or unassigned, and a total.
 
 ## Config and state
@@ -70,7 +86,7 @@ Everything else lives beside the config, never in this repo:
 
 | File | Kept by | Purpose |
 | --- | --- | --- |
-| `map.json` | the script | task/board -> card id, column, assignment, content digest, linked boards, seen comments and boosts |
+| `map.json` | the script | task/board -> card id, column, assignment, content digest, linked boards, seen comments and boosts, acknowledgement boosts queued and done |
 | `sync.log` | the script | one line per action, plus a counts line per run |
 | `pending-comments.jsonl` | the script | captain comments and approvals waiting to be relayed, one JSON record per line (see below) |
 | `extra-repos.json` | hand | `{"task": ["board", ...]}`: extra boards for a task |
@@ -169,6 +185,7 @@ Each line of `pending-comments.jsonl` is one JSON object with a `kind`. Records 
 before `kind` existed have none; treat a missing `kind` as `"comment"`.
 
 - `comment`: `task`, `repo`, `card`, `comment` (id), `at`, `text`.
+- `question`: the same fields as `comment`, for a comment containing `?`.
 - `approval`: `task`, `repo`, `card`, `url` (card URL), `boost` (id), `at`. The captain
   gave the card a 👍: approve every recommendation on it as recommended.
 

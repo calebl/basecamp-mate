@@ -16,6 +16,7 @@ class Stub:
     def __init__(self, comments=None, boosts=None):
         self.profiles = []
         self.calls, self.next_id, self.comments, self.boosts = [], 500, comments or {}, boosts or {}
+        self.me, self.fail_post = ACTING, False  # /my/profile.json id; make boost posts fail
         self.lavish, self.lavish_calls = "", 0  # stdout of plain `lavish-axi`, or an exception to raise
 
     def __call__(self, cmd, **kw):
@@ -39,12 +40,33 @@ class Stub:
             data = {"id": self.next_id}
         elif args[:2] == ["comments", "list"]:
             data = self.comments.get(args[2], [])
+        elif args[:3] == ["api", "get", "/my/profile.json"]:
+            data = {"id": self.me}
         elif args[:2] == ["api", "get"]:
             data = self.boosts.get(args[2].split("/")[4], [])
+        elif args[:2] == ["api", "post"]:
+            if self.fail_post:
+                return SimpleNamespace(stdout=json.dumps({"ok": False, "error": "boom"}), stderr="", returncode=1)
+            rid = args[2].split("/")[4]
+            data = {"id": 900 + len(self.calls), "booster": {"id": self.me}, "content": json.loads(args[4])["content"]}
+            self.boosts.setdefault(rid, []).append(data)
+        elif args[:2] == ["api", "delete"]:
+            bid = int(args[2].split("/")[4].split(".")[0])
+            for bs in self.boosts.values():
+                bs[:] = [b for b in bs if b["id"] != bid]
         return SimpleNamespace(stdout=json.dumps({"ok": True, "data": data}), stderr="", returncode=0)
 
     def verbs(self):
-        return [a[1] if a[0] == "cards" else a[0] for a in self.calls if a[:2] not in (["comments", "list"], ["api", "get"])]
+        return [a[1] if a[0] == "cards" else a[0] for a in self.calls if a[:2] not in (["comments", "list"], ["api", "get"], ["api", "post"])]
+
+    def posts(self):
+        return [a[2] for a in self.calls if a[:2] == ["api", "post"]]
+
+    def posted(self):
+        return [(a[2].split("/")[4], json.loads(a[4])["content"]) for a in self.calls if a[:2] == ["api", "post"]]
+
+    def deletes(self):
+        return [a[2] for a in self.calls if a[:2] == ["api", "delete"]]
 
 
 def item(id, section="Queued", repo="srv", hold=None, hold_kind=None, until=None, title="A task"):
@@ -224,7 +246,7 @@ class Boosts(Base):
         return [json.loads(l) for l in open(p)] if os.path.exists(p) else []
 
     def boost_calls(self):
-        return [c for c in self.stub.calls if c[:2] == ["api", "get"]]
+        return [c for c in self.stub.calls if c[:2] == ["api", "get"] and c[2] != "/my/profile.json"]
 
     def test_captain_thumbs_up_emitted_once(self):
         self.stub.boosts = {"501": [boost(7), boost(8, content="👍🏽")]}
@@ -404,3 +426,155 @@ class TasksAxi(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Acknowledge(Base):
+    WAIT = dict(hold="pick", hold_kind="captain")
+    CARD = "/buckets/22222222/recordings/501/boosts.json"
+    COMMENT = "/buckets/22222222/recordings/9/boosts.json"
+
+    def setUp(self):
+        super().setUp()
+        self.set_profile("firstmate")
+
+    def set_profile(self, name):
+        p = os.path.join(self.cfgdir, "config.json")
+        cfg = json.load(open(p))
+        cfg["profile"] = name
+        json.dump(cfg, open(p, "w"))
+
+    def comment(self):
+        self.stub.comments = {"501": [{"id": 9, "creator": {"id": CAPTAIN}, "content": "yes", "created_at": "t"}]}
+
+    def pending(self):
+        p = os.path.join(self.cfgdir, "pending-comments.jsonl")
+        return [json.loads(l) for l in open(p)] if os.path.exists(p) else []
+
+    def test_comment_boosted_once(self):
+        self.comment()
+        self.sync().main([item("a")])
+        self.assertEqual(self.stub.posts(), [self.COMMENT])
+        post = next(c for c in self.stub.calls if c[:2] == ["api", "post"])
+        self.assertEqual(json.loads(post[4]), {"content": "👍"})
+        self.assertEqual([a[:2] for a in self.cards()["a|server"]["acked"]], [[9, "👍"]])
+
+    def test_approval_boosts_card(self):
+        self.stub.boosts = {"501": [boost(7)]}
+        self.sync().main([item("a", **self.WAIT)])
+        self.assertEqual(self.stub.posts(), [self.CARD])
+
+    def test_rerun_never_boosts_twice(self):
+        self.comment()
+        self.stub.boosts = {"501": [boost(7)]}
+        for _ in range(3):
+            self.sync().main([item("a", **self.WAIT)])
+        self.assertEqual(sorted(self.stub.posts()), sorted([self.CARD, self.COMMENT]))
+
+    def test_existing_acting_thumbs_up_skips_post(self):
+        self.comment()
+        self.stub.boosts = {"9": [boost(3, who=ACTING)]}
+        self.sync().main([item("a")])
+        self.assertEqual(self.stub.posts(), [])
+        self.assertEqual(self.cards()["a|server"]["acked"], [[9, "👍", 3]])
+
+    def test_acting_is_captain_or_no_profile_never_boosts(self):
+        self.comment()
+        self.stub.me = CAPTAIN
+        self.sync().main([item("a")])
+        self.set_profile(None)
+        self.stub.comments["501"].append({"id": 10, "creator": {"id": CAPTAIN}, "content": "more"})
+        self.sync().main([item("a")])
+        self.assertEqual(self.stub.posts(), [])
+        self.assertEqual(len(self.pending()), 2)
+        self.assertNotIn("/my/profile.json", [c[2] for c in self.stub.calls if c[:2] == ["api", "get"]][1:])
+
+    def test_failure_keeps_record_and_retries(self):
+        self.comment()
+        self.stub.fail_post = True
+        self.sync().main([item("a")])
+        self.assertEqual(len(self.pending()), 1)
+        self.assertNotIn("acked", self.cards()["a|server"])
+        self.stub.fail_post = False
+        self.sync().main([item("a")])
+        self.assertEqual(self.stub.posts(), [self.COMMENT, self.COMMENT])
+        self.assertEqual([a[:2] for a in self.cards()["a|server"]["acked"]], [[9, "👍"]])
+        self.assertEqual(len(self.pending()), 1)
+
+    def test_identity_looked_up_once_per_run(self):
+        self.comment()
+        self.stub.comments["502"] = [{"id": 11, "creator": {"id": CAPTAIN}, "content": "x"}]
+        self.sync().main([item("a"), item("b")])
+        self.assertEqual(sum(c[:3] == ["api", "get", "/my/profile.json"] for c in self.stub.calls), 1)
+        self.assertEqual(len(self.stub.posts()), 2)
+
+    def test_dry_run_plans_without_posting(self):
+        self.sync().main([item("a", **self.WAIT)])
+        self.stub.boosts = {"501": [boost(7)]}
+        self.sync(dry=True).main([item("a", **self.WAIT)])
+        self.assertEqual(self.stub.posts(), [])
+        log = open(os.path.join(self.cfgdir, "sync.log")).read()
+        self.assertIn("dry a|server: acknowledge 501 with 👍", log)
+        self.assertNotIn("ack", self.cards()["a|server"])
+
+    def test_own_boost_never_read_as_approval(self):
+        self.stub.boosts = {"501": [boost(7)]}
+        self.sync().main([item("a", **self.WAIT)])
+        self.sync().main([item("a", **self.WAIT)])
+        self.assertTrue(any(b["booster"]["id"] == ACTING for b in self.stub.boosts["501"]))
+        self.assertEqual([r["boost"] for r in self.pending()], [7])
+
+    def question(self):
+        self.stub.comments = {"501": [{"id": 9, "creator": {"id": CAPTAIN}, "content": "<p>why &amp; how?</p>", "created_at": "t"}]}
+
+    def ack(self, dry=False):
+        self.sync(dry=dry).ack(9)
+
+    def test_question_gets_eyes_not_thumbs(self):
+        self.question()
+        self.sync().main([item("a")])
+        self.sync().main([item("a")])
+        self.assertEqual(self.stub.posted(), [("9", "👀")])
+        self.assertEqual(self.pending()[0]["kind"], "question")
+
+    def test_non_question_gets_thumbs(self):
+        self.comment()
+        self.sync().main([item("a")])
+        self.assertEqual(self.stub.posted(), [("9", "👍")])
+        self.assertEqual(self.pending()[0]["kind"], "comment")
+
+    def test_ack_swaps_eyes_for_thumbs_once(self):
+        self.question()
+        self.sync().main([item("a")])
+        eyes = self.stub.boosts["9"][0]["id"]
+        self.ack()
+        self.assertEqual(self.stub.deletes(), [f"/buckets/22222222/boosts/{eyes}.json"])
+        self.assertEqual([b["content"] for b in self.stub.boosts["9"]], ["👍"])
+        self.assertEqual([a[:2] for a in self.cards()["a|server"]["acked"]], [[9, "👍"]])
+        self.sync().main([item("a")])
+        self.assertEqual(self.stub.posted(), [("9", "👀"), ("9", "👍")])
+
+    def test_ack_is_idempotent(self):
+        self.question()
+        self.sync().main([item("a")])
+        self.ack()
+        self.ack()
+        self.assertEqual(len(self.stub.deletes()), 1)
+        self.assertEqual(self.stub.posted(), [("9", "👀"), ("9", "👍")])
+
+    def test_ack_without_eyes_still_thumbs(self):
+        self.ack()
+        self.assertEqual(self.stub.deletes(), [])
+        self.assertEqual(self.stub.posted(), [("9", "👍")])
+
+    def test_ack_dry_run_changes_nothing(self):
+        self.question()
+        self.sync().main([item("a")])
+        self.ack(dry=True)
+        self.assertEqual((self.stub.deletes(), self.stub.posted()), ([], [("9", "👀")]))
+
+    def test_acting_captain_gets_no_boosts_at_all(self):
+        self.question()
+        self.stub.me = CAPTAIN
+        self.sync().main([item("a")])
+        self.ack()
+        self.assertEqual((self.stub.deletes(), self.stub.posted()), ([], []))
