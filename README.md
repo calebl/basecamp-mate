@@ -110,6 +110,7 @@ basecamp api get /my/profile.json -P firstmate
 ```
 
 Its token is short-lived; `run.sh` renews it with `basecamp auth refresh -P <profile>`.
+Full setup steps, and what changes for the captain: [docs/firstmate-account.md](docs/firstmate-account.md).
 
 ## Hourly with systemd
 
