@@ -6,8 +6,12 @@
 home=$1 config=$2; shift 2
 here=$(cd "$(dirname "$0")" && pwd)
 log="$(dirname "$config")/sync.log"
-left=$(basecamp auth status --json 2>/dev/null | python3 -c 'import json,sys,re; e=json.load(sys.stdin)["data"].get("expires_in","0h"); m=re.match(r"(\d+)h",e); print(m.group(1) if m else 0)' 2>/dev/null)
+start=$(date +%s)
+# The token calls and the sync share one 240s budget; each auth call is capped at 30s.
+profile=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("profile") or "")' "$config" 2>/dev/null)
+bc_auth() { timeout 30 basecamp auth "$@" ${profile:+-P "$profile"} --json </dev/null; }
+left=$(bc_auth status 2>/dev/null | python3 -c 'import json,sys,re; e=json.load(sys.stdin)["data"].get("expires_in","0h"); m=re.match(r"(\d+)h",e); print(m.group(1) if m else 0)' 2>/dev/null)
 if [ "${left:-0}" -lt 72 ]; then
-  basecamp auth refresh --json </dev/null >/dev/null 2>&1 || echo "$(date -u +%FT%TZ) FAILED token refresh; the captain must run basecamp auth login" >> "$log"
+  bc_auth refresh >/dev/null 2>&1 || echo "$(date -u +%FT%TZ) FAILED token refresh; run basecamp auth login${profile:+ -P $profile}" >> "$log"
 fi
-exec timeout 240 python3 "$here/sync.py" --home "$home" --config "$config" "$@"
+exec timeout $((240 - ($(date +%s) - start))) python3 "$here/sync.py" --home "$home" --config "$config" "$@"

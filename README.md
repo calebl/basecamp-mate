@@ -49,6 +49,10 @@ One config per home, normally `<home>/data/basecamp-sync/config.json`. Copy
 
 - `account`, `project`: Basecamp ids.
 - `captain`: the captain's Basecamp person id (assignee, and whose comments are relayed).
+- `profile` (optional): the `basecamp` CLI login every call runs as (`-P <profile>`),
+  including `run.sh`'s token refresh. Absent means the CLI's default login. It changes
+  only who acts; `captain` stays the assignee and the only person whose comments and 👍
+  are relayed, so the acting user's own comments and boosts are ignored.
 - `repos`: backlog repo name -> board name.
 - `tables`: per board, the card table id (`table`) and a column id for each of
   `Triage`, `Not now`, `Figuring it out`, `In progress`, `Ready for QA`, `Done`.
@@ -92,7 +96,21 @@ python3 sync.py --home ~/path/to/home --config ~/path/to/home/data/basecamp-sync
 
 Drop `--dry-run` to apply. `run.sh <home> <config> [--dry-run]` is the scheduled entry
 point: it refreshes the Basecamp OAuth token when under three days remain (logging a
-failure to `sync.log`), then runs `sync.py` under a 25-minute timeout.
+failure to `sync.log`), then runs `sync.py`, all within a 240-second cap (each token
+call gets at most 30 seconds).
+
+### A dedicated Basecamp user
+
+To act as its own user instead of the captain, invite that user to the project, sign it
+in as a separate CLI login, verify it, and set `"profile"` in the config:
+
+```sh
+basecamp auth login -P firstmate --account <account id>
+basecamp api get /my/profile.json -P firstmate
+```
+
+Its token is short-lived; `run.sh` renews it with `basecamp auth refresh -P <profile>`.
+Full setup steps, and what changes for the captain: [docs/firstmate-account.md](docs/firstmate-account.md).
 
 ## Hourly with systemd
 

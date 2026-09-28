@@ -33,6 +33,7 @@ class Sync:
         cfg = json.load(open(config_path))
         self.account, self.project = str(cfg["account"]), str(cfg["project"])
         self.captain = int(cfg["captain"])
+        self.profile = cfg.get("profile")
         self.tables = cfg["tables"]
         self.repo_map = cfg["repos"]
         for board, t in self.tables.items():
@@ -60,7 +61,8 @@ class Sync:
             f.write(line + "\n")
 
     def bc(self, *args):
-        cmd = ["basecamp", "-a", self.account, *args, "-p", self.project, "--json"]
+        prof = ["-P", self.profile] if self.profile else []
+        cmd = ["basecamp", "-a", self.account, *prof, *args, "-p", self.project, "--json"]
         for attempt in range(3):
             r = self.run(cmd, capture_output=True, text=True, timeout=120)
             try:
