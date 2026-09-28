@@ -35,7 +35,37 @@ Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between
 - Only the configured account, project and card tables are touched.
 - Cards are never deleted, trashed or archived. Cards whose task left the backlog are
   left as they are (the run logs how many).
-- Nothing is posted to chat or as a comment.
+- The sync never posts to chat or as a comment. The only thing that posts is the explicit
+  `sync.py reply` command below, run by the relaying agent to answer a captain question
+  where it was asked: a comment on the card, or a line in the chat.
+- Chat questions: for each chat id in the optional `chats` config list, each run reads the
+  chat's lines newer than a cursor kept in `chats.json` (the first run only sets the
+  cursor, so older history is not relayed). A captain line that mentions the acting user
+  or contains `?` is appended to `pending-comments.jsonl` as a `chat-question`, recorded
+  once, and gets the acting user's 👀. Lines from anyone else, the acting user included,
+  are never captured. `sync.py reply --recording <line id>` answers it with a new line in
+  that chat as the acting user and then removes the 👀, under the same `--again` and
+  failure rules as a card reply.
+- Acknowledgement boost: when the run records a new captain comment or approval, the
+  acting user boosts it once (the comment itself, or the card for an approval). A comment
+  whose text contains `?` is recorded with `"kind": "question"` and gets 👀 ("looking into
+  it"); other comments and approvals get 👍 ("got it"). The sync never removes a 👀. Once the relaying agent
+  has the answer it runs
+  `sync.py reply --home <home> --config <config.json> --recording <question comment id> --body-file <file>`,
+  which posts the file's plain text (HTML-escaped, one `<div>` per paragraph) as a comment
+  on that card as the acting user, then removes the acting user's 👀 from the question; no
+  👍 is added. The question id is recorded in the card's `replied` list in `map.json` and a
+  second reply is refused unless `--again` is passed. A failed post removes nothing, so the
+  👀 stays. With no profile, or a profile signed in as the captain, it posts nothing;
+  `--dry-run` logs the plan only. The acting user's own replies are never relayed, since
+  only the captain's comments are. Boosts are posted via `POST /buckets/<project>/recordings/<id>/boosts.json`. The
+  acting identity is read from `/my/profile.json` once per run; with no `profile`, or a
+  profile that signs in as the captain, nothing is boosted, so the captain never appears
+  to boost his own items. A recording that already has the acting user's 👍 is not
+  boosted again, and boosted ids are kept in `map.json` (`ack` queued, `acked` done). A
+  failed boost is logged and retried next run; it never blocks the pending record or
+  fails the run. The acting user's boost is never read as an approval, since only the
+  captain's boosts are.
 - New comments by the captain are appended to `pending-comments.jsonl` for firstmate to
   relay; they are never acted on.
 - On cards assigned to the captain (and only those), the run reads the card's boosts. A 👍
@@ -47,8 +77,9 @@ Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between
   cards are ignored; each boost id is recorded in `map.json` so it is emitted once.
 - `map.json` maps `task|board` to a card id, so re-runs update the same card instead of
   creating a duplicate.
-- `--dry-run` makes no Basecamp writes (it only reads boosts on assigned cards, and logs
-  any new captain approval) and leaves `map.json` and the pending file alone; it logs, per card,
+- `--dry-run` makes no Basecamp writes (it only reads boosts on assigned cards and the
+  acting identity, and logs any new captain approval and the acknowledgement boosts it
+  would add) and leaves `map.json` and the pending file alone; it logs, per card,
   whether it would be created, updated, moved, assigned or unassigned, and a total.
 
 ## Config and state
@@ -62,6 +93,7 @@ One config per home, normally `<home>/data/basecamp-sync/config.json`. Copy
   including `run.sh`'s token refresh. Absent means the CLI's default login. It changes
   only who acts; `captain` stays the assignee and the only person whose comments and 👍
   are relayed, so the acting user's own comments and boosts are ignored.
+- `chats` (optional): chat (Campfire) ids whose captain questions are relayed.
 - `repos`: backlog repo name -> board name.
 - `tables`: per board, the card table id (`table`) and a column id for each of
   `Triage`, `Not now`, `Figuring it out`, `In progress`, `Ready for QA`, `Done`.
@@ -70,7 +102,8 @@ Everything else lives beside the config, never in this repo:
 
 | File | Kept by | Purpose |
 | --- | --- | --- |
-| `map.json` | the script | task/board -> card id, column, assignment, content digest, linked boards, seen comments and boosts |
+| `map.json` | the script | task/board -> card id, column, assignment, content digest, linked boards, seen comments and boosts, acknowledgement boosts queued and done, questions replied to |
+| `chats.json` | the script | chat id -> line cursor, captured question lines, acknowledgement boosts queued and done, questions replied to |
 | `sync.log` | the script | one line per action, plus a counts line per run |
 | `pending-comments.jsonl` | the script | captain comments and approvals waiting to be relayed, one JSON record per line (see below) |
 | `extra-repos.json` | hand | `{"task": ["board", ...]}`: extra boards for a task |
@@ -169,6 +202,8 @@ Each line of `pending-comments.jsonl` is one JSON object with a `kind`. Records 
 before `kind` existed have none; treat a missing `kind` as `"comment"`.
 
 - `comment`: `task`, `repo`, `card`, `comment` (id), `at`, `text`.
+- `question`: the same fields as `comment`, for a comment containing `?`.
+- `chat-question`: `chat` (id), `line` (id), `url`, `text`, `at`.
 - `approval`: `task`, `repo`, `card`, `url` (card URL), `boost` (id), `at`. The captain
   gave the card a 👍: approve every recommendation on it as recommended.
 

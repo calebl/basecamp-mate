@@ -5,15 +5,23 @@ Deterministic, no model calls. The backlog is the source of truth; Basecamp is a
 view of it. Safety bounds, enforced here:
   - only the configured account, project and card tables are touched;
   - cards are created, updated, moved, assigned and unassigned, never deleted,
-    trashed or archived, and nothing is posted to chat or as a comment;
+    trashed or archived, and the sync posts nothing to chat or as a comment; its one
+    other write is a 👀 or 👍 boost acknowledging a captured captain comment or
+    approval. Only the explicit `sync.py reply` command posts a comment (an answer
+    to a captain question) and removes the acting user's own 👀;
   - the id map (map.json) makes re-runs update the same card instead of
     duplicating it.
 New comments the captain writes on cards, and his 👍 boost on a card assigned to
 him (an approval of every recommendation on it), are appended to
 pending-comments.jsonl for firstmate to relay; they are never acted on here.
+When the profile signs in as someone other than the captain, that user boosts
+each captured comment (or, for an approval, the card) once, as a visible
+acknowledgement: 👀 on a question (a comment containing "?"), 👍 otherwise; a
+failed boost is retried on the next run. `sync.py reply`, run by the relaying
+agent, posts the answer on the card and then removes the 👀.
 
 All runtime state (map.json, sync.log, pending-comments.jsonl and the hand-kept
-extra-repos.json, figuring.json, not-now.json, skip.json, decisions.json, boards.json) lives in the directory
+extra-repos.json, figuring.json, not-now.json, skip.json, decisions.json, boards.json, chats.json) lives in the directory
 that holds the config file.
 
 Open Lavish review boards (read once per run from `lavish-axi`) whose file sits under
@@ -21,6 +29,7 @@ Open Lavish review boards (read once per run from `lavish-axi`) whose file sits 
 missing or fails, each card keeps the board links it last had.
 
 Usage: sync.py --home <firstmate home> --config <config.json> [--dry-run]
+       sync.py reply --home <home> --config <config.json> --recording <question comment id> --body-file <file> [--again] [--dry-run]
 """
 import argparse, csv, hashlib, html, json, os, re, subprocess, sys, time, tomllib
 from datetime import datetime, timezone
@@ -38,6 +47,7 @@ class Sync:
         self.account, self.project = str(cfg["account"]), str(cfg["project"])
         self.captain = int(cfg["captain"])
         self.profile = cfg.get("profile")
+        self.chats = [str(c) for c in cfg.get("chats", [])]
         self.tables = cfg["tables"]
         self.repo_map = cfg["repos"]
         for board, t in self.tables.items():
@@ -48,6 +58,8 @@ class Sync:
             if board not in self.tables:
                 raise ValueError(f"config repo {repo} names unknown board {board}")
         self.dry, self.run = dry, runner
+        self._acting = False  # acting person id once resolved; None when it can't be
+        self._acting_sgid = None  # the acting person's mention sgid, to spot @mentions in chat
         self.data = os.path.join(self.home, "data")
         self.state = os.path.join(self.home, "state")
 
@@ -165,10 +177,7 @@ class Sync:
         return "".join(parts)
 
     def save(self, cards):
-        tmp = self.path("map.json.tmp")
-        with open(tmp, "w") as f:
-            json.dump(cards, f, indent=1, sort_keys=True)
-        os.replace(tmp, self.path("map.json"))
+        self.save_json("map.json", cards)
 
     def main(self, items=None):
         cards = self.load("map.json", {})
@@ -224,6 +233,8 @@ class Sync:
                         self.log(f"dry {key}: {', '.join(acts) or 'unchanged'} [{col}]")
                     if rec is not None and rec.get("assigned"):
                         self.relay_boosts(it["id"], repo, key, rec)
+                    if rec is not None:
+                        self.acknowledge(key, rec)
                     counts[repo] = counts.get(repo, 0) + 1
                     continue
                 if rec is None:
@@ -254,8 +265,11 @@ class Sync:
                 self.relay_comments(it["id"], repo, key, rec)
                 if rec.get("assigned"):
                     self.relay_boosts(it["id"], repo, key, rec)
+                self.acknowledge(key, rec)
                 counts[repo] = counts.get(repo, 0) + 1
                 self.save(cards)
+        if self.chats:
+            self.relay_chats()
         stale = sorted(k for k in cards if k not in wanted)
         self.log(("dry plan " + json.dumps(plan, sort_keys=True) + " " if self.dry else "")
                  + "counts " + json.dumps(counts, sort_keys=True) + (f" unplaced {unplaced}" if unplaced else "")
@@ -274,10 +288,73 @@ class Sync:
                 continue
             rec["comments"].append(cid)
             if (c.get("creator") or {}).get("id") == self.captain:
+                text = re.sub(r"<[^>]+>", "", c.get("content", ""))
+                kind = "question" if "?" in html.unescape(text) else "comment"
                 with open(self.path("pending-comments.jsonl"), "a") as f:
-                    f.write(json.dumps({"kind": "comment", "task": task, "repo": repo, "card": rec["card"], "comment": cid,
-                                        "at": c.get("created_at"), "text": re.sub(r"<[^>]+>", "", c.get("content", ""))}) + "\n")
-                self.log(f"new captain comment on {key}: {cid}")
+                    f.write(json.dumps({"kind": kind, "task": task, "repo": repo, "card": rec["card"], "comment": cid,
+                                        "at": c.get("created_at"), "text": text}) + "\n")
+                rec.setdefault("ack", []).append([cid, EYES if kind == "question" else THUMBS])
+                self.log(f"new captain {kind} on {key}: {cid}")
+
+    def relay_chats(self):
+        """Capture the captain's questions for firstmate in the configured chats.
+
+        Per chat, chats.json keeps a cursor (the newest line id seen). The first run
+        only sets the cursor, so old history is not relayed. A captain line that
+        mentions the acting user or contains "?" is appended to the pending file as a
+        chat-question and queued for a 👀; every other line is skipped. A dry run
+        reads and logs only.
+        """
+        state = self.load("chats.json", {})
+        for chat in self.chats:
+            try:
+                lines = self.bc("api", "get", f"/buckets/{self.project}/chats/{chat}/lines.json") or []
+            except RuntimeError as e:
+                self.log(f"chat {chat}: {e}")
+                continue
+            lines = sorted(lines, key=lambda l: l.get("id", 0))
+            rec = dict(state.get(chat, {}))
+            first = "cursor" not in rec
+            cursor = rec.get("cursor", 0)
+            for ln in lines:
+                lid = ln.get("id", 0)
+                if lid <= cursor:
+                    continue
+                cursor = lid
+                if first or (ln.get("creator") or {}).get("id") != self.captain:
+                    continue
+                content = ln.get("content", "")
+                text = html.unescape(re.sub(r"<[^>]+>", "", content)).strip()
+                if "?" not in text:
+                    self.acting_id()
+                    if not (self._acting_sgid and self._acting_sgid in content):
+                        continue
+                if self.dry:
+                    self.log(f"dry chat {chat}: captain question {lid}")
+                    self.acknowledge(f"chat {chat}", dict(rec, ack=[*rec.get("ack", []), [lid, EYES]]))
+                    continue
+                with open(self.path("pending-comments.jsonl"), "a") as f:
+                    f.write(json.dumps({"kind": "chat-question", "chat": int(chat), "line": lid,
+                                        "url": ln.get("app_url") or f"https://3.basecamp.com/{self.account}/buckets/{self.project}/chats/{chat}@{lid}",
+                                        "text": text, "at": ln.get("created_at")}) + "\n")
+                rec.setdefault("lines", []).append(lid)
+                rec.setdefault("ack", []).append([lid, EYES])
+                self.log(f"new captain chat question in {chat}: {lid}")
+            if self.dry:
+                if first:
+                    self.log(f"dry chat {chat}: would start the cursor at {cursor}")
+                self.acknowledge(f"chat {chat}", rec)
+                continue
+            rec["cursor"] = cursor
+            state[chat] = rec
+            self.acknowledge(f"chat {chat}", rec)
+            self.save_json("chats.json", state)
+
+    def save_json(self, name, value):
+        tmp = self.path(name + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(value, f, indent=1, sort_keys=True)
+        os.replace(tmp, self.path(name))
 
     def relay_boosts(self, task, repo, key, rec):
         """Queue the captain's thumbs up on a card assigned to him as an approval record.
@@ -300,13 +377,132 @@ class Sync:
                 continue
             if self.dry:
                 self.log(f"dry {key}: captain approval boost {bid}")
+                self.acknowledge(key, dict(rec, ack=[*rec.get("ack", []), [rec["card"], THUMBS]]))
                 continue
             rec.setdefault("boosts", []).append(bid)
             with open(self.path("pending-comments.jsonl"), "a") as f:
                 f.write(json.dumps({"kind": "approval", "task": task, "repo": repo, "card": rec["card"],
                                     "url": f"https://app.basecamp.com/{self.account}/buckets/{self.project}/card_tables/cards/{rec['card']}",
                                     "boost": bid, "at": b.get("created_at")}) + "\n")
+            if [rec["card"], THUMBS] not in rec.setdefault("ack", []):
+                rec["ack"].append([rec["card"], THUMBS])
             self.log(f"captain approval on {key}: boost {bid}")
+
+    def acting_id(self):
+        """The person the profile signs in as, looked up once per run: an id, None to skip, or "retry"."""
+        if self._acting is False:
+            self._acting = None
+            if self.profile:
+                try:
+                    me = self.bc("api", "get", "/my/profile.json") or {}
+                    self._acting, self._acting_sgid = me.get("id"), me.get("attachable_sgid")
+                except RuntimeError as e:
+                    self.log(f"acting identity unknown, acknowledgement boosts wait for the next run: {e}")
+                    self._acting = "retry"
+        return self._acting
+
+    def acknowledge(self, key, rec):
+        """Boost each queued recording (a captain comment, or the card for an approval) once.
+
+        rec["ack"] holds [recording, emoji] pairs still to boost: 👀 for a question,
+        👍 otherwise. Each moves to rec["acked"] as [recording, emoji, boost id] once
+        boosted, so a failure is retried next run and a re-run never boosts twice.
+        Nothing is boosted when no profile is set or it signs in as the captain
+        himself; the queue is dropped. 👀 is only ever removed by the `reply` command.
+        """
+        done = [a[:2] for a in rec.get("acked", [])]
+        queue = [q for q in rec.get("ack", []) if q not in done]
+        if not queue:
+            return
+        me = self.acting_id()
+        if me == "retry":
+            return
+        if me is None or me == self.captain:
+            rec.pop("ack", None)
+            return
+        for rid, emoji in queue:
+            if self.dry:
+                self.log(f"dry {key}: acknowledge {rid} with {emoji}")
+                continue
+            try:
+                bid = self.boost(me, rid, emoji)
+                self.log(f"acknowledged {key}: {emoji} on {rid}")
+            except RuntimeError as e:
+                self.log(f"acknowledge {key} {rid} failed, retrying next run: {e}")
+                continue
+            rec.setdefault("acked", []).append([rid, emoji, bid])
+            rec["ack"].remove([rid, emoji])
+
+    def boosts_by(self, me, rid, emoji):
+        path = f"/buckets/{self.project}/recordings/{rid}/boosts.json"
+        return [b for b in self.bc("api", "get", path) or []
+                if (b.get("booster") or {}).get("id") == me and is_emoji(b.get("content", ""), emoji)]
+
+    def boost(self, me, rid, emoji):
+        """The acting user's boost id for `emoji` on `rid`, posting one only when absent."""
+        have = self.boosts_by(me, rid, emoji)
+        if have:
+            return have[0].get("id")
+        path = f"/buckets/{self.project}/recordings/{rid}/boosts.json"
+        return (self.bc("api", "post", path, "-d", json.dumps({"content": emoji})) or {}).get("id")
+
+    def reply(self, rid, text, again=False):
+        """Answer the captain's question `rid` where it was asked, then take the acting user's 👀 off it.
+
+        A card comment is answered with a comment on that card; a chat line with a
+        new line in that chat.
+
+        Run only by the relaying agent; the sync itself never posts comments. A reply
+        is recorded in the card's "replied" list and a second one is refused unless
+        `again`. A failed post removes nothing, so the 👀 stays.
+        """
+        chats = self.load("chats.json", {})
+        chat = next((c for c, r in chats.items() if rid in r.get("lines", [])), None)
+        if chat is not None:
+            store, rec = ("chats.json", chats), chats[chat]
+            target = f"/buckets/{self.project}/chats/{chat}/lines.json"
+        else:
+            cards = self.load("map.json", {})
+            rec = next((r for r in cards.values() if rid in r.get("comments", [])), None)
+            if rec is None:
+                raise RuntimeError(f"no card in map.json or chat in chats.json has {rid}")
+            store = ("map.json", cards)
+            target = f"/buckets/{self.project}/recordings/{rec['card']}/comments.json"
+        where = f"chat {chat}" if chat is not None else f"card {rec['card']}"
+        if rid in rec.get("replied", []) and not again:
+            self.log(f"reply {rid}: already replied, pass --again to post another")
+            return False
+        me = self.acting_id()
+        if me == "retry":
+            raise RuntimeError("acting identity unknown")
+        if me is None or me == self.captain:
+            self.log(f"reply {rid}: acting user is the captain or unset, not posting")
+            return False
+        body = render_reply(text)
+        if self.dry:
+            self.log(f"dry reply {rid}: post in {where}, then remove {EYES}")
+            return False
+        payload = {"content": body, "content_type": "text/html"} if chat is not None else {"content": body}
+        self.bc("api", "post", target, "-d", json.dumps(payload))
+        rec.setdefault("replied", []).append(rid)
+        self.save_json(*store)
+        self.log(f"reply {rid}: posted in {where}")
+        for b in self.boosts_by(me, rid, EYES):
+            self.bc("api", "delete", f"/buckets/{self.project}/boosts/{b.get('id')}.json")
+            self.log(f"reply {rid}: removed {EYES} boost {b.get('id')}")
+        return True
+
+THUMBS, EYES = "\U0001F44D", "\U0001F440"
+
+
+def render_reply(text):
+    """Plain text to comment HTML: escaped, one <div> per paragraph, no raw newlines."""
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
+    return "".join("<div>" + "<br>".join(html.escape(l) for l in p.splitlines()) + "</div>" for p in paras)
+
+
+def is_emoji(content, emoji):
+    return is_thumbs_up(content) if emoji == THUMBS else re.sub(r"<[^>]+>", "", content).strip() == emoji
 
 
 def is_thumbs_up(content):
@@ -383,6 +579,24 @@ def task_item(t):
 
 
 def cli(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["reply"]:
+        ap = argparse.ArgumentParser(prog="sync.py reply", description="Answer a captain question on its card, then remove the 👀.")
+        ap.add_argument("--home", required=True)
+        ap.add_argument("--config", required=True)
+        ap.add_argument("--recording", required=True, type=int, help="the question comment's id")
+        ap.add_argument("--body-file", required=True, help="plain-text answer")
+        ap.add_argument("--again", action="store_true", help="post even though this question was already answered")
+        ap.add_argument("--dry-run", action="store_true")
+        a = ap.parse_args(argv[1:])
+        s = Sync(a.home, a.config, dry=a.dry_run)
+        try:
+            with open(a.body_file) as f:
+                s.reply(a.recording, f.read(), again=a.again)
+        except Exception as e:
+            s.log(f"FAILED reply {a.recording} {type(e).__name__}: {e}")
+            return 1
+        return 0
     ap = argparse.ArgumentParser(description="Mirror a firstmate backlog onto Basecamp card tables.")
     ap.add_argument("--home", required=True, help="firstmate home (holds data/backlog.md and state/)")
     ap.add_argument("--config", required=True, help="config.json; its directory holds all runtime state")
