@@ -166,13 +166,50 @@ class InitTest(unittest.TestCase):
         self.assertIn("built-in", str(e.exception))
         self.assertEqual(self.stub.writes(), [])
 
-    def test_unmatched_table_refused(self):
+    def add_ideas(self, **kw):
+        self.stub.project["dock"].append({"name": "kanban_board", "id": 500, "title": "Ideas", "enabled": True})
+        self.stub.tables["500"] = table(500, "Ideas", **kw)
+
+    def test_unmatched_table_skipped(self):
+        self.add_ideas()
+        cfg, _ = self.init().discover()
+        self.assertEqual(cfg, EXPECTED)
+        plan = self.init(dry=True).main()
+        self.assertIn("skip card table 'ideas'", plan)
+        self.init().main()
+        self.assertEqual(json.load(open(os.path.join(self.dir, "config.json"))), EXPECTED)
+        self.assertIn("skipped card table 'ideas': no matching repo; pass --repo-map ideas=<repo> to include it",
+                      self.printed)
+        self.assertNotIn(["api", "get", "/buckets/22222222/card_tables/500.json"], self.stub.calls)
+
+    def test_skipped_table_columns_never_checked(self):
+        self.add_ideas(drop=("Triage", "In progress"))
+        self.init(create_missing=True).main()
+        self.assertEqual(json.load(open(os.path.join(self.dir, "config.json"))), EXPECTED)
+        self.assertEqual(self.stub.writes(), [])
+
+    def test_every_table_unmatched_refused(self):
+        with open(os.path.join(self.home, "data", "projects.md"), "w") as f:
+            f.write("- my-server [direct-PR] - the server\n")
         with self.assertRaises(init_home.Refuse) as e:
             self.init(repo_map=[]).main()
-        self.assertIn("card table 'server' matches no registered project", str(e.exception))
-        self.assertIn("--repo-map server=<repo>", str(e.exception))
+        self.assertIn("no card table matches a registered project", str(e.exception))
+        self.assertIn("skipped: engine, server", str(e.exception))
         self.assertFalse(os.path.exists(self.dir))
         self.assertEqual(self.system.calls, [])
+
+    def test_table_matching_several_repos_refused(self):
+        with open(os.path.join(self.home, "data", "projects.md"), "a") as f:
+            f.write("- engine [direct-PR] - a second engine\n")
+        with self.assertRaises(init_home.Refuse) as e:
+            self.init().discover()
+        self.assertIn("card table 'engine' matches several registered projects", str(e.exception))
+
+    def test_two_tables_one_repo_refused(self):
+        self.add_ideas()
+        with self.assertRaises(init_home.Refuse) as e:
+            self.init(repo_map=["server=my-server", "ideas=my-server"]).discover()
+        self.assertIn("repo 'my-server' is mapped to both", str(e.exception))
 
     def test_repo_map_must_name_a_table_and_a_registered_repo(self):
         with self.assertRaises(init_home.Refuse) as e:

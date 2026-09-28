@@ -5,7 +5,9 @@ needs: account and project from the URL, each card table in the dock (matched to
 backlog repo by its title, case-insensitively, against the home's data/projects.md, or
 by --repo-map), each table's columns by their exact names, the login's own identity,
 the captain, and the chats in the dock. Any missing or ambiguous table, column or
-identity is refused with a message; nothing is guessed.
+identity is refused with a message; nothing is guessed. A card table whose title
+matches no registered repo, and that --repo-map does not name, is skipped: it is left
+out of the config and its columns are never read.
 
 It then writes <home>/data/basecamp-sync/config.json and the empty hand-kept side files,
 installs and enables a per-home systemd user timer (every 5 minutes, 240s cap), and
@@ -201,7 +203,7 @@ class Init:
                 problems.append(f"--repo-map names {name!r}, but the project has no card table titled that "
                                 f"(tables: {', '.join(sorted(tables)) or 'none'})")
         registered = registered_projects(self.home)
-        repos = {}
+        repos, self.skipped = {}, []
         for board in sorted(tables):
             if board in self.repo_map:
                 repo = self.repo_map[board]
@@ -210,18 +212,26 @@ class Init:
                     continue
             else:
                 hits = [p for p in registered if p.lower() == board]
+                if not hits:
+                    self.skipped.append(board)
+                    continue
                 if len(hits) != 1:
-                    problems.append(f"card table {board!r} matches {'no' if not hits else 'several'} registered "
-                                    f"project{'s' if hits else ''} in data/projects.md"
-                                    f"{' (' + ', '.join(hits) + ')' if hits else ''}; pass --repo-map {board}=<repo>")
+                    problems.append(f"card table {board!r} matches several registered projects in data/projects.md "
+                                    f"({', '.join(hits)}); pass --repo-map {board}=<repo>")
                     continue
                 repo = hits[0]
             if repo in repos:
                 problems.append(f"repo {repo!r} is mapped to both {repos[repo]!r} and {board!r}")
                 continue
             repos[repo] = board
+        if tables and not repos and not problems:
+            problems.append("no card table matches a registered project in data/projects.md, so there is nothing to sync "
+                            f"(skipped: {', '.join(self.skipped)}); pass --repo-map <table name>=<repo>")
+        included = set(repos.values())
         cfg_tables, to_create = {}, []
         for board, tid in sorted(tables.items()):
+            if board not in included:
+                continue
             t = self.bc("api", "get", f"/buckets/{self.project}/card_tables/{tid}.json") or {}
             cols = {}
             for lst in t.get("lists", []):
@@ -300,6 +310,8 @@ class Init:
         config_path = os.path.join(self.dir, "config.json")
         existing = json.load(open(config_path)) if os.path.exists(config_path) else None
         plan = []
+        for board in self.skipped:
+            self.out(f"skipped card table {board!r}: no matching repo; pass --repo-map {board}=<repo> to include it")
         for board, col in to_create:
             plan.append(f"create column {col!r} in card table {board!r}")
             cfg["tables"][board][col] = "<new>"
@@ -325,7 +337,9 @@ class Init:
             self.out("dry run, nothing written. Would:" if plan else "dry run: nothing to change")
             for p in plan:
                 self.out(f"  {p}")
-            return plan
+            for board in self.skipped:
+                self.out(f"  skip card table {board!r} (no matching repo)")
+            return plan + [f"skip card table {b!r}" for b in self.skipped]
         for board, col in to_create:
             t = cfg["tables"][board]
             data = self.bc("cards", "column", "create", col, "--card-table", t["table"], "-p", self.project) or {}
