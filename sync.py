@@ -21,7 +21,7 @@ failed boost is retried on the next run. `sync.py reply`, run by the relaying
 agent, posts the answer on the card and then removes the 👀.
 
 All runtime state (map.json, sync.log, pending-comments.jsonl and the hand-kept
-extra-repos.json, figuring.json, not-now.json, skip.json, decisions.json, boards.json) lives in the directory
+extra-repos.json, figuring.json, not-now.json, skip.json, decisions.json, boards.json, chats.json) lives in the directory
 that holds the config file.
 
 Open Lavish review boards (read once per run from `lavish-axi`) whose file sits under
@@ -47,6 +47,7 @@ class Sync:
         self.account, self.project = str(cfg["account"]), str(cfg["project"])
         self.captain = int(cfg["captain"])
         self.profile = cfg.get("profile")
+        self.chats = [str(c) for c in cfg.get("chats", [])]
         self.tables = cfg["tables"]
         self.repo_map = cfg["repos"]
         for board, t in self.tables.items():
@@ -58,6 +59,7 @@ class Sync:
                 raise ValueError(f"config repo {repo} names unknown board {board}")
         self.dry, self.run = dry, runner
         self._acting = False  # acting person id once resolved; None when it can't be
+        self._acting_sgid = None  # the acting person's mention sgid, to spot @mentions in chat
         self.data = os.path.join(self.home, "data")
         self.state = os.path.join(self.home, "state")
 
@@ -175,10 +177,7 @@ class Sync:
         return "".join(parts)
 
     def save(self, cards):
-        tmp = self.path("map.json.tmp")
-        with open(tmp, "w") as f:
-            json.dump(cards, f, indent=1, sort_keys=True)
-        os.replace(tmp, self.path("map.json"))
+        self.save_json("map.json", cards)
 
     def main(self, items=None):
         cards = self.load("map.json", {})
@@ -269,6 +268,8 @@ class Sync:
                 self.acknowledge(key, rec)
                 counts[repo] = counts.get(repo, 0) + 1
                 self.save(cards)
+        if self.chats:
+            self.relay_chats()
         stale = sorted(k for k in cards if k not in wanted)
         self.log(("dry plan " + json.dumps(plan, sort_keys=True) + " " if self.dry else "")
                  + "counts " + json.dumps(counts, sort_keys=True) + (f" unplaced {unplaced}" if unplaced else "")
@@ -294,6 +295,66 @@ class Sync:
                                         "at": c.get("created_at"), "text": text}) + "\n")
                 rec.setdefault("ack", []).append([cid, EYES if kind == "question" else THUMBS])
                 self.log(f"new captain {kind} on {key}: {cid}")
+
+    def relay_chats(self):
+        """Capture the captain's questions for firstmate in the configured chats.
+
+        Per chat, chats.json keeps a cursor (the newest line id seen). The first run
+        only sets the cursor, so old history is not relayed. A captain line that
+        mentions the acting user or contains "?" is appended to the pending file as a
+        chat-question and queued for a 👀; every other line is skipped. A dry run
+        reads and logs only.
+        """
+        state = self.load("chats.json", {})
+        for chat in self.chats:
+            try:
+                lines = self.bc("api", "get", f"/buckets/{self.project}/chats/{chat}/lines.json") or []
+            except RuntimeError as e:
+                self.log(f"chat {chat}: {e}")
+                continue
+            lines = sorted(lines, key=lambda l: l.get("id", 0))
+            rec = dict(state.get(chat, {}))
+            first = "cursor" not in rec
+            cursor = rec.get("cursor", 0)
+            for ln in lines:
+                lid = ln.get("id", 0)
+                if lid <= cursor:
+                    continue
+                cursor = lid
+                if first or (ln.get("creator") or {}).get("id") != self.captain:
+                    continue
+                content = ln.get("content", "")
+                text = html.unescape(re.sub(r"<[^>]+>", "", content)).strip()
+                if "?" not in text:
+                    self.acting_id()
+                    if not (self._acting_sgid and self._acting_sgid in content):
+                        continue
+                if self.dry:
+                    self.log(f"dry chat {chat}: captain question {lid}")
+                    self.acknowledge(f"chat {chat}", dict(rec, ack=[*rec.get("ack", []), [lid, EYES]]))
+                    continue
+                with open(self.path("pending-comments.jsonl"), "a") as f:
+                    f.write(json.dumps({"kind": "chat-question", "chat": int(chat), "line": lid,
+                                        "url": ln.get("app_url") or f"https://3.basecamp.com/{self.account}/buckets/{self.project}/chats/{chat}@{lid}",
+                                        "text": text, "at": ln.get("created_at")}) + "\n")
+                rec.setdefault("lines", []).append(lid)
+                rec.setdefault("ack", []).append([lid, EYES])
+                self.log(f"new captain chat question in {chat}: {lid}")
+            if self.dry:
+                if first:
+                    self.log(f"dry chat {chat}: would start the cursor at {cursor}")
+                self.acknowledge(f"chat {chat}", rec)
+                continue
+            rec["cursor"] = cursor
+            state[chat] = rec
+            self.acknowledge(f"chat {chat}", rec)
+            self.save_json("chats.json", state)
+
+    def save_json(self, name, value):
+        tmp = self.path(name + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(value, f, indent=1, sort_keys=True)
+        os.replace(tmp, self.path(name))
 
     def relay_boosts(self, task, repo, key, rec):
         """Queue the captain's thumbs up on a card assigned to him as an approval record.
@@ -333,7 +394,8 @@ class Sync:
             self._acting = None
             if self.profile:
                 try:
-                    self._acting = (self.bc("api", "get", "/my/profile.json") or {}).get("id")
+                    me = self.bc("api", "get", "/my/profile.json") or {}
+                    self._acting, self._acting_sgid = me.get("id"), me.get("attachable_sgid")
                 except RuntimeError as e:
                     self.log(f"acting identity unknown, acknowledgement boosts wait for the next run: {e}")
                     self._acting = "retry"
@@ -385,16 +447,28 @@ class Sync:
         return (self.bc("api", "post", path, "-d", json.dumps({"content": emoji})) or {}).get("id")
 
     def reply(self, rid, text, again=False):
-        """Post an answer to the captain's question `rid` on its card, then take the acting user's 👀 off it.
+        """Answer the captain's question `rid` where it was asked, then take the acting user's 👀 off it.
+
+        A card comment is answered with a comment on that card; a chat line with a
+        new line in that chat.
 
         Run only by the relaying agent; the sync itself never posts comments. A reply
         is recorded in the card's "replied" list and a second one is refused unless
         `again`. A failed post removes nothing, so the 👀 stays.
         """
-        cards = self.load("map.json", {})
-        rec = next((r for r in cards.values() if rid in r.get("comments", [])), None)
-        if rec is None:
-            raise RuntimeError(f"no card in map.json has comment {rid}")
+        chats = self.load("chats.json", {})
+        chat = next((c for c, r in chats.items() if rid in r.get("lines", [])), None)
+        if chat is not None:
+            store, rec = ("chats.json", chats), chats[chat]
+            target = f"/buckets/{self.project}/chats/{chat}/lines.json"
+        else:
+            cards = self.load("map.json", {})
+            rec = next((r for r in cards.values() if rid in r.get("comments", [])), None)
+            if rec is None:
+                raise RuntimeError(f"no card in map.json or chat in chats.json has {rid}")
+            store = ("map.json", cards)
+            target = f"/buckets/{self.project}/recordings/{rec['card']}/comments.json"
+        where = f"chat {chat}" if chat is not None else f"card {rec['card']}"
         if rid in rec.get("replied", []) and not again:
             self.log(f"reply {rid}: already replied, pass --again to post another")
             return False
@@ -406,12 +480,13 @@ class Sync:
             return False
         body = render_reply(text)
         if self.dry:
-            self.log(f"dry reply {rid}: post on card {rec['card']}, then remove {EYES}")
+            self.log(f"dry reply {rid}: post in {where}, then remove {EYES}")
             return False
-        self.bc("api", "post", f"/buckets/{self.project}/recordings/{rec['card']}/comments.json", "-d", json.dumps({"content": body}))
+        payload = {"content": body, "content_type": "text/html"} if chat is not None else {"content": body}
+        self.bc("api", "post", target, "-d", json.dumps(payload))
         rec.setdefault("replied", []).append(rid)
-        self.save(cards)
-        self.log(f"reply {rid}: posted on card {rec['card']}")
+        self.save_json(*store)
+        self.log(f"reply {rid}: posted in {where}")
         for b in self.boosts_by(me, rid, EYES):
             self.bc("api", "delete", f"/buckets/{self.project}/boosts/{b.get('id')}.json")
             self.log(f"reply {rid}: removed {EYES} boost {b.get('id')}")

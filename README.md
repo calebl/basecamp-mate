@@ -35,9 +35,17 @@ Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between
 - Only the configured account, project and card tables are touched.
 - Cards are never deleted, trashed or archived. Cards whose task left the backlog are
   left as they are (the run logs how many).
-- The sync never posts to chat or as a comment. The only thing that posts a comment is the
-  explicit `sync.py reply` command below, run by the relaying agent to answer a captain
-  question on its card.
+- The sync never posts to chat or as a comment. The only thing that posts is the explicit
+  `sync.py reply` command below, run by the relaying agent to answer a captain question
+  where it was asked: a comment on the card, or a line in the chat.
+- Chat questions: for each chat id in the optional `chats` config list, each run reads the
+  chat's lines newer than a cursor kept in `chats.json` (the first run only sets the
+  cursor, so older history is not relayed). A captain line that mentions the acting user
+  or contains `?` is appended to `pending-comments.jsonl` as a `chat-question`, recorded
+  once, and gets the acting user's 👀. Lines from anyone else, the acting user included,
+  are never captured. `sync.py reply --recording <line id>` answers it with a new line in
+  that chat as the acting user and then removes the 👀, under the same `--again` and
+  failure rules as a card reply.
 - Acknowledgement boost: when the run records a new captain comment or approval, the
   acting user boosts it once (the comment itself, or the card for an approval). A comment
   whose text contains `?` is recorded with `"kind": "question"` and gets 👀 ("looking into
@@ -85,6 +93,7 @@ One config per home, normally `<home>/data/basecamp-sync/config.json`. Copy
   including `run.sh`'s token refresh. Absent means the CLI's default login. It changes
   only who acts; `captain` stays the assignee and the only person whose comments and 👍
   are relayed, so the acting user's own comments and boosts are ignored.
+- `chats` (optional): chat (Campfire) ids whose captain questions are relayed.
 - `repos`: backlog repo name -> board name.
 - `tables`: per board, the card table id (`table`) and a column id for each of
   `Triage`, `Not now`, `Figuring it out`, `In progress`, `Ready for QA`, `Done`.
@@ -94,6 +103,7 @@ Everything else lives beside the config, never in this repo:
 | File | Kept by | Purpose |
 | --- | --- | --- |
 | `map.json` | the script | task/board -> card id, column, assignment, content digest, linked boards, seen comments and boosts, acknowledgement boosts queued and done, questions replied to |
+| `chats.json` | the script | chat id -> line cursor, captured question lines, acknowledgement boosts queued and done, questions replied to |
 | `sync.log` | the script | one line per action, plus a counts line per run |
 | `pending-comments.jsonl` | the script | captain comments and approvals waiting to be relayed, one JSON record per line (see below) |
 | `extra-repos.json` | hand | `{"task": ["board", ...]}`: extra boards for a task |
@@ -193,6 +203,7 @@ before `kind` existed have none; treat a missing `kind` as `"comment"`.
 
 - `comment`: `task`, `repo`, `card`, `comment` (id), `at`, `text`.
 - `question`: the same fields as `comment`, for a comment containing `?`.
+- `chat-question`: `chat` (id), `line` (id), `url`, `text`, `at`.
 - `approval`: `task`, `repo`, `card`, `url` (card URL), `boost` (id), `at`. The captain
   gave the card a 👍: approve every recommendation on it as recommended.
 

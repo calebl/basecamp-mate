@@ -16,6 +16,7 @@ class Stub:
     def __init__(self, comments=None, boosts=None):
         self.profiles = []
         self.calls, self.next_id, self.comments, self.boosts = [], 500, comments or {}, boosts or {}
+        self.lines = {}  # chat id -> lines
         self.me, self.fail_post = ACTING, False  # /my/profile.json id; make boost posts fail
         self.lavish, self.lavish_calls = "", 0  # stdout of plain `lavish-axi`, or an exception to raise
 
@@ -41,7 +42,14 @@ class Stub:
         elif args[:2] == ["comments", "list"]:
             data = self.comments.get(args[2], [])
         elif args[:3] == ["api", "get", "/my/profile.json"]:
-            data = {"id": self.me}
+            data = {"id": self.me, "attachable_sgid": f"sgid-{self.me}"}
+        elif args[:2] == ["api", "get"] and "/chats/" in args[2]:
+            data = list(reversed(self.lines.get(args[2].split("/")[4], [])))
+        elif args[:2] == ["api", "post"] and "/chats/" in args[2]:
+            if self.fail_post:
+                return SimpleNamespace(stdout=json.dumps({"ok": False, "error": "boom"}), stderr="", returncode=1)
+            data = {"id": 700 + len(self.calls), "creator": {"id": self.me}, "content": json.loads(args[4])["content"]}
+            self.lines.setdefault(args[2].split("/")[4], []).append(data)
         elif args[:2] == ["api", "get"]:
             data = self.boosts.get(args[2].split("/")[4], [])
         elif args[:2] == ["api", "post"] and args[2].endswith("/comments.json"):
@@ -74,6 +82,10 @@ class Stub:
     def replies(self):
         return [(a[2].split("/")[4], json.loads(a[4])["content"]) for a in self.calls
                 if a[:2] == ["api", "post"] and a[2].endswith("/comments.json")]
+
+    def chat_posts(self):
+        return [(a[2].split("/")[4], json.loads(a[4])["content"]) for a in self.calls
+                if a[:2] == ["api", "post"] and "/chats/" in a[2]]
 
     def deletes(self):
         return [a[2] for a in self.calls if a[:2] == ["api", "delete"]]
@@ -256,7 +268,7 @@ class Boosts(Base):
         return [json.loads(l) for l in open(p)] if os.path.exists(p) else []
 
     def boost_calls(self):
-        return [c for c in self.stub.calls if c[:2] == ["api", "get"] and c[2] != "/my/profile.json"]
+        return [c for c in self.stub.calls if c[:2] == ["api", "get"] and c[2] != "/my/profile.json" and "/chats/" not in c[2]]
 
     def test_captain_thumbs_up_emitted_once(self):
         self.stub.boosts = {"501": [boost(7), boost(8, content="👍🏽")]}
@@ -618,3 +630,86 @@ class Acknowledge(Base):
         self.sync().main([item("a")])
         self.assertFalse(self.reply())
         self.assertEqual((self.stub.deletes(), self.stub.posted(), self.stub.replies()), ([], [], []))
+
+
+def line(id, who=CAPTAIN, content="where is it?"):
+    return {"id": id, "creator": {"id": who}, "content": content, "created_at": "t", "app_url": f"https://x/chats/1@{id}"}
+
+
+class Chats(Base):
+    set_profile, pending = Acknowledge.set_profile, Acknowledge.pending
+
+    def setUp(self):
+        super().setUp()
+        self.set_profile("firstmate")
+        p = os.path.join(self.cfgdir, "config.json")
+        cfg = json.load(open(p))
+        cfg["chats"] = [77]
+        json.dump(cfg, open(p, "w"))
+        self.stub.lines = {"77": [line(1, content="old?")]}
+        self.sync().main([])  # the first run only sets the cursor
+
+    def state(self):
+        return json.load(open(os.path.join(self.cfgdir, "chats.json")))["77"]
+
+    def test_first_run_sets_cursor_without_capturing(self):
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(self.state()["cursor"], 1)
+
+    def test_captain_question_captured_with_eyes_once(self):
+        self.stub.lines["77"].append(line(2))
+        self.sync().main([])
+        self.sync().main([])
+        recs = self.pending()
+        self.assertEqual(len(recs), 1)
+        self.assertEqual({k: recs[0][k] for k in ("kind", "chat", "line", "url", "text")},
+                         {"kind": "chat-question", "chat": 77, "line": 2, "url": "https://x/chats/1@2", "text": "where is it?"})
+        self.assertEqual(self.stub.posted(), [("2", "👀")])
+
+    def test_mention_without_question_mark_captured(self):
+        self.stub.lines["77"] += [line(2, content=f'<bc-attachment sgid="sgid-{ACTING}"></bc-attachment> look at this'),
+                                  line(3, content="just chatting")]
+        self.sync().main([])
+        self.assertEqual([r["line"] for r in self.pending()], [2])
+
+    def test_other_people_and_acting_user_ignored(self):
+        self.stub.lines["77"] += [line(2, who=1), line(3, who=ACTING)]
+        self.sync().main([])
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(self.stub.posted(), [])
+        self.assertEqual(self.state()["cursor"], 3)
+
+    def test_reply_posts_in_chat_and_removes_eyes(self):
+        self.stub.lines["77"].append(line(2))
+        self.sync().main([])
+        self.assertTrue(self.sync().reply(2, "Here."))
+        self.assertEqual(self.stub.chat_posts(), [("77", "<div>Here.</div>")])
+        self.assertEqual(self.stub.boosts["2"], [])
+        self.assertEqual(self.stub.replies(), [])
+        self.assertFalse(self.sync().reply(2, "Here."))
+        self.sync().main([])
+        self.assertEqual(len(self.pending()), 1)
+
+    def test_chat_reply_failure_keeps_eyes(self):
+        self.stub.lines["77"].append(line(2))
+        self.sync().main([])
+        self.stub.fail_post = True
+        with self.assertRaises(RuntimeError):
+            self.sync().reply(2, "Here.")
+        self.assertEqual([b["content"] for b in self.stub.boosts["2"]], ["👀"])
+        self.assertNotIn("replied", self.state())
+
+    def test_acting_captain_captures_but_never_boosts(self):
+        self.stub.me = CAPTAIN
+        self.stub.lines["77"].append(line(2))
+        self.sync().main([])
+        self.assertEqual(len(self.pending()), 1)
+        self.assertEqual(self.stub.posted(), [])
+        self.assertFalse(self.sync().reply(2, "x"))
+        self.assertEqual(self.stub.chat_posts(), [])
+
+    def test_sync_never_posts_to_chat(self):
+        self.stub.lines["77"].append(line(2))
+        for _ in range(2):
+            self.sync().main([])
+        self.assertEqual(self.stub.chat_posts(), [])
