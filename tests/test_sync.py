@@ -196,6 +196,30 @@ class Comments(Base):
         self.assertEqual(self.cards()["a|server"]["comments"], [9, 10])
 
 
+class NoteHtml(Base):
+    def test_blocks_have_no_raw_newlines(self):
+        self.pr("a")
+        it = dict(item("a", "In flight", hold="line one\nline two"), blocked_by=["b"], links=["https://github.com/o/r/pull/2"])
+        body = self.sync().body_for(it, "Ready for QA", False, {})
+        self.assertNotIn("\n", body.replace("line one\nline two", ""))
+        self.assertTrue(body.startswith("<div>") and body.endswith("</div>"))
+        self.assertIn("<ul><li><a href=\"https://github.com/o/r/pull/2\">", body)
+        self.assertIn("<li><a href=\"https://github.com/o/r/pull/1\">", body)
+
+    def test_decision_renders_numbered_list(self):
+        self.side("decisions.json", {"a": {"question": "Pick <one>", "items": ["first", "second & more"], "note": "rec first"}})
+        self.sync().main([item("a", hold="raw hold", hold_kind="captain")])
+        body = self.stub.calls[0][3]
+        self.assertIn("<div><strong>Waiting on you</strong>: Pick &lt;one&gt;</div>"
+                      "<ol><li>first</li><li>second &amp; more</li></ol><div>rec first</div>", body)
+        self.assertNotIn("raw hold", body)
+        self.assertNotIn("\n", body)
+
+    def test_decision_ignored_when_not_waiting(self):
+        body = self.sync().body_for(item("a"), "Triage", False, {}, {"a": {"question": "Q", "items": ["x"]}})
+        self.assertNotIn("<ol>", body)
+
+
 class TasksAxi(unittest.TestCase):
     def test_show_parsing_and_mapping(self):
         text = '''task:

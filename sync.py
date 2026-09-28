@@ -12,7 +12,7 @@ New comments the captain writes on cards are appended to pending-comments.jsonl
 for firstmate to relay; they are never acted on here.
 
 All runtime state (map.json, sync.log, pending-comments.jsonl and the hand-kept
-extra-repos.json, figuring.json, not-now.json, skip.json) lives in the directory
+extra-repos.json, figuring.json, not-now.json, skip.json, decisions.json) lives in the directory
 that holds the config file.
 
 Usage: sync.py --home <firstmate home> --config <config.json> [--dry-run]
@@ -119,22 +119,25 @@ class Sync:
             return ("Ready for QA", False) if self.meta_pr(it["id"]) else ("In progress", False)
         return "Triage", False
 
-    def body_for(self, it, col, waiting, notnow):
-        parts = [f"<p><strong>Task</strong>: {html.escape(it['id'])} &middot; <strong>Status</strong>: {col}</p>"]
-        if waiting:
-            parts.append(f"<p><strong>Waiting on you</strong>: {html.escape(it['hold'])}</p>")
+    def body_for(self, it, col, waiting, notnow, decisions=None):
+        decisions = decisions or {}
+        parts = [f"<div><strong>Task</strong>: {html.escape(it['id'])} &middot; <strong>Status</strong>: {col}</div>"]
+        if waiting and it["id"] in decisions:
+            parts.append(render_decision(decisions[it["id"]]))
+        elif waiting:
+            parts.append(f"<div><strong>Waiting on you</strong>: {html.escape(it['hold'])}</div>")
         elif it["id"] in notnow:
-            parts.append(f"<p><strong>Not now</strong>: {html.escape(notnow[it['id']])}</p>")
+            parts.append(f"<div><strong>Not now</strong>: {html.escape(notnow[it['id']])}</div>")
         elif it["hold"]:
-            parts.append(f"<p><strong>On hold</strong>: {html.escape(it['hold'])}</p>")
+            parts.append(f"<div><strong>On hold</strong>: {html.escape(it['hold'])}</div>")
         if it["blocked_by"]:
-            parts.append(f"<p><strong>After</strong>: {html.escape(', '.join(it['blocked_by']))}</p>")
+            parts.append(f"<div><strong>After</strong>: {html.escape(', '.join(it['blocked_by']))}</div>")
         pr = self.meta_pr(it["id"])
         prs = list(dict.fromkeys(it["links"] + ([pr] if pr else [])))
         if prs:
-            parts.append("<p><strong>PRs</strong>: " + ", ".join(f'<a href="{html.escape(u)}">{html.escape(u)}</a>' for u in prs) + "</p>")
-        parts.append("<p><em>Kept in sync from the backlog; edits to this text are overwritten. Comments are read and relayed.</em></p>")
-        return "\n".join(parts)
+            parts.append("<div><strong>PRs</strong>:</div><ul>" + "".join(f'<li><a href="{html.escape(u)}">{html.escape(u)}</a></li>' for u in prs) + "</ul>")
+        parts.append("<div><em>Kept in sync from the backlog; edits to this text are overwritten. Comments are read and relayed.</em></div>")
+        return "".join(parts)
 
     def save(self, cards):
         tmp = self.path("map.json.tmp")
@@ -148,6 +151,7 @@ class Sync:
         notnow = self.load("not-now.json", {})
         figuring = self.load("figuring.json", {})
         skip = set(self.load("skip.json", []))
+        decisions = self.load("decisions.json", {})
         counts, unplaced, wanted = {}, [], set()
         plan = {"create": 0, "update": 0, "move": 0, "assign": 0, "unassign": 0}
         for it in (self.parse_backlog() if items is None else items):
@@ -164,7 +168,7 @@ class Sync:
             if col == "Triage" and it["id"] in figuring:
                 col = "Figuring it out"
                 it = dict(it, hold=it["hold"] or figuring[it["id"]])
-            body = self.body_for(it, col, waiting, notnow)
+            body = self.body_for(it, col, waiting, notnow, decisions)
             for repo in repos:
                 key = f"{it['id']}|{repo}"
                 wanted.add(key)
@@ -238,6 +242,16 @@ class Sync:
                     f.write(json.dumps({"task": task, "repo": repo, "card": rec["card"], "comment": cid,
                                         "at": c.get("created_at"), "text": re.sub(r"<[^>]+>", "", c.get("content", ""))}) + "\n")
                 self.log(f"new captain comment on {key}: {cid}")
+
+
+def render_decision(d):
+    """A decision card body from decisions.json: a plain question, then a numbered list."""
+    out = f"<div><strong>Waiting on you</strong>: {html.escape(d['question'])}</div>"
+    if d.get("items"):
+        out += "<ol>" + "".join(f"<li>{html.escape(i)}</li>" for i in d["items"]) + "</ol>"
+    if d.get("note"):
+        out += f"<div>{html.escape(d['note'])}</div>"
+    return out
 
 
 def parse_show(text):

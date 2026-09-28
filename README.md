@@ -19,7 +19,7 @@ Column rules:
 | In flight with `pr=` in `state/<task>.meta` | Ready for QA |
 | Done | Done |
 
-When the captain hold is released the card is unassigned on the next run.
+Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between them. When the captain hold is released the card is unassigned on the next run.
 
 ## Safety bounds
 
@@ -56,6 +56,7 @@ Everything else lives beside the config, never in this repo:
 | `figuring.json` | hand | `{"task": "why"}`: queued tasks that need a plan approved |
 | `not-now.json` | hand | `{"task": "why"}`: tasks deferred |
 | `skip.json` | hand | `["task", ...]`: tasks never mirrored |
+| `decisions.json` | hand | `{"task": {"question": "...", "items": ["..."], "note": "..."}}`: decision text for a card waiting on the captain, rendered as the question, a numbered list and a note in place of the raw hold reason |
 
 ## Reading the backlog
 
