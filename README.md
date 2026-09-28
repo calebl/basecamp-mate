@@ -35,9 +35,24 @@ Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between
 - Only the configured account, project and card tables are touched.
 - Cards are never deleted, trashed or archived. Cards whose task left the backlog are
   left as they are (the run logs how many).
-- The sync never posts to chat or as a comment. The only thing that posts is the explicit
-  `sync.py reply` command below, run by the relaying agent to answer a captain question
-  where it was asked: a comment on the card, or a line in the chat.
+- The sync never posts to chat or as a comment. Its one automatic post is a release
+  announcement, and only on the Message Board (below). Otherwise the only thing that
+  posts is the explicit `sync.py reply` command below, run by the relaying agent to
+  answer a captain question where it was asked: a comment on the card, or a line in the chat.
+- Release announcements: for each GitHub repo in the optional `releases` config, each run
+  lists recent releases (`gh release list`, then `gh release view --json` for the notes)
+  and posts one Message Board message per new one as the acting user, with the subject
+  `<Name> <tag> released` (e.g. "Terminal v0.3.0 released") and a body of the release
+  notes rendered to Basecamp rich text (escaped; headings bold, lists, links), a link to
+  the release page, and the repo's optional `note`. The first run for a repo only seeds
+  the watch with the releases that exist then, so no backlog is announced; after that a
+  release is new when it was published after the watch started and is not yet recorded.
+  Drafts are always skipped, and prereleases unless `"prereleases": true` or
+  `--include-prereleases`. Announced tags are kept per repo in `releases.json`, so a
+  release is posted once; messages are never edited or deleted. A failed `gh` read or
+  post is logged and retried next run and never fails the sync. It posts even with no
+  `profile` or a profile signed in as the captain: an announcement is not an
+  acknowledgement. Merges and PRs are never announced.
 - Chat questions: for each chat id in the optional `chats` config list, each run reads the
   chat's lines newer than a cursor kept in `chats.json` (the first run only sets the
   cursor, so older history is not relayed). A captain line that mentions the acting user
@@ -92,7 +107,10 @@ python3 sync.py init https://app.basecamp.com/<account>/projects/<project> --log
 tables in the project's dock, each matched to a backlog repo by its title
 (case-insensitive, surrounding spaces ignored) against the names in the home's
 `data/projects.md`; each table's columns by their exact names; the login's own identity
-(`/my/profile.json`); the captain; and the chats in the dock. `--captain <person id or
+(`/my/profile.json`); the captain; the chats in the dock; and, when the dock has one
+Message Board, `releases`: its id and the GitHub repo behind each mapped repo's
+`<home>/projects/<repo>` origin (renames followed through `gh repo view`), named by its
+board. A repo's `note` is added by hand. `--captain <person id or
 email>` names the captain; by default it is the project's one account owner other than the
 login. `--repo-map <table>=<repo>` (repeatable) maps a table whose title is not a
 registered project's name. A table whose title matches no registered project and that
@@ -138,6 +156,10 @@ or by hand from
   only who acts; `captain` stays the assignee and the only person whose comments and 👍
   are relayed, so the acting user's own comments and boosts are ignored.
 - `chats` (optional): chat (Campfire) ids whose captain questions are relayed.
+- `releases` (optional): `{"board": "<message board id>", "repos": {"owner/name": "<name>"
+  or {"name": "<name>", "note": "<text>"}}, "prereleases": false}`. The name is the
+  subject's first word (capitalized; `init` uses the mapped board name) and the note is
+  appended to the body, e.g. `` "note": "Run `ta upgrade` to install." ``.
 - `repos`: backlog repo name -> board name.
 - `tables`: per board, the card table id (`table`) and a column id for each of
   `Triage`, `Not now`, `Figuring it out`, `In progress`, `Ready for QA`, `Done`.
@@ -147,6 +169,7 @@ Everything else lives beside the config, never in this repo:
 | File | Kept by | Purpose |
 | --- | --- | --- |
 | `map.json` | the script | task/board -> card id, column, assignment, content digest, linked boards, seen comments and boosts, acknowledgement boosts queued and done, questions replied to |
+| `releases.json` | the script | GitHub repo -> when the watch started (`since`), the tags seeded then, and the tags announced (tag -> message id) |
 | `chats.json` | the script | chat id -> line cursor, captured question lines, acknowledgement boosts queued and done, questions replied to |
 | `sync.log` | the script | one line per action, plus a counts line per run |
 | `pending-comments.jsonl` | the script | captain comments and approvals waiting to be relayed, one JSON record per line (see below) |
@@ -239,7 +262,7 @@ systemctl --user enable --now basecamp-sync.timer
 python3 -m unittest discover -s tests -v
 ```
 
-The `basecamp` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
+The `basecamp`, `gh` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
 registration sit behind a fake; tests make no network calls and touch no real home.
 
 ## Pending records

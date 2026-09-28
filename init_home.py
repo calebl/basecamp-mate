@@ -4,7 +4,9 @@ Reads the project through the `basecamp` CLI login and discovers every id the sy
 needs: account and project from the URL, each card table in the dock (matched to a
 backlog repo by its title, case-insensitively, against the home's data/projects.md, or
 by --repo-map), each table's columns by their exact names, the login's own identity,
-the captain, and the chats in the dock. Any missing or ambiguous table, column or
+the captain, the chats in the dock, and, when the dock has one message board, the
+GitHub repos behind the mapped repos' <home>/projects/<repo> origins, whose releases
+the sync announces there. Any missing or ambiguous table, column or
 identity is refused with a message; nothing is guessed. A card table whose title
 matches no registered repo, and that --repo-map does not name, is skipped: it is left
 out of the config and its columns are never read.
@@ -261,7 +263,34 @@ class Init:
         chats = [d["id"] for d in dock if d.get("name") == "chat"]
         if chats:
             cfg["chats"] = chats
+        boards = [d["id"] for d in dock if d.get("name") == "message_board"]
+        gh_repos = {}
+        for repo, board in sorted(repos.items()):
+            full = self.github_repo(repo)
+            if full:
+                gh_repos[full] = board
+        if len(boards) == 1 and gh_repos:
+            cfg["releases"] = {"board": str(boards[0]), "repos": gh_repos}
         return cfg, to_create
+
+    def github_repo(self, repo):
+        """owner/name of <home>/projects/<repo>'s GitHub origin, following renames through gh; None if not GitHub."""
+        try:
+            r = self.run(["git", "-C", os.path.join(self.home, "projects", repo), "remote", "get-url", "origin"],
+                         capture_output=True, text=True, timeout=30)
+        except Exception:
+            return None
+        m = re.search(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", r.stdout.strip()) if r.returncode == 0 else None
+        if not m:
+            return None
+        full = f"{m.group(1)}/{m.group(2)}"
+        try:
+            v = self.run(["gh", "repo", "view", full, "--json", "nameWithOwner"], capture_output=True, text=True, timeout=30)
+            if v.returncode == 0:
+                return json.loads(v.stdout).get("nameWithOwner") or full
+        except Exception:
+            pass
+        return full
 
     def find_captain(self, people, acting, problems):
         if self.captain_arg:

@@ -5,10 +5,12 @@ Deterministic, no model calls. The backlog is the source of truth; Basecamp is a
 view of it. Safety bounds, enforced here:
   - only the configured account, project and card tables are touched;
   - cards are created, updated, moved, assigned and unassigned, never deleted,
-    trashed or archived, and the sync posts nothing to chat or as a comment; its one
-    other write is a 👀 or 👍 boost acknowledging a captured captain comment or
-    approval. Only the explicit `sync.py reply` command posts a comment (an answer
-    to a captain question) and removes the acting user's own 👀;
+    trashed or archived, and the sync posts nothing to chat or as a comment; its
+    other writes are a 👀 or 👍 boost acknowledging a captured captain comment or
+    approval, and its one automatic post: a Message Board announcement per new
+    GitHub release of a repo in the optional "releases" config. Only the explicit
+    `sync.py reply` command posts a comment (an answer to a captain question) and
+    removes the acting user's own 👀;
   - the id map (map.json) makes re-runs update the same card instead of
     duplicating it.
 New comments the captain writes on cards, and his 👍 boost on a card assigned to
@@ -28,7 +30,7 @@ Open Lavish review boards (read once per run from `lavish-axi`) whose file sits 
 <home>/data/<task>/ are linked on that task's card as "Plan board". If lavish-axi is
 missing or fails, each card keeps the board links it last had.
 
-Usage: sync.py --home <firstmate home> --config <config.json> [--dry-run]
+Usage: sync.py --home <firstmate home> --config <config.json> [--dry-run] [--include-prereleases]
        sync.py reply --home <home> --config <config.json> --recording <question comment id> --body-file <file> [--again] [--dry-run]
        sync.py init <project URL> --login <profile> --home <home> [--captain <id or email>] [--repo-map TABLE=REPO] [--dry-run]
 """
@@ -41,7 +43,7 @@ PR_RE = r"https://github\.com/\S+?/pull/\d+"
 
 
 class Sync:
-    def __init__(self, home, config_path, dry=False, runner=subprocess.run):
+    def __init__(self, home, config_path, dry=False, runner=subprocess.run, prereleases=False):
         self.home = os.path.abspath(home)
         self.dir = os.path.dirname(os.path.abspath(config_path))
         cfg = json.load(open(config_path))
@@ -51,6 +53,11 @@ class Sync:
         self.chats = [str(c) for c in cfg.get("chats", [])]
         self.tables = cfg["tables"]
         self.repo_map = cfg["repos"]
+        self.releases = cfg.get("releases")
+        if self.releases is not None:
+            if not self.releases.get("board") or not isinstance(self.releases.get("repos"), dict):
+                raise ValueError('config "releases" needs "board" (message board id) and "repos" ({"owner/name": ...})')
+        self.prereleases = prereleases or bool((self.releases or {}).get("prereleases"))
         for board, t in self.tables.items():
             missing = [c for c in ("table", *COLUMNS) if c not in t]
             if missing:
@@ -271,6 +278,8 @@ class Sync:
                 self.save(cards)
         if self.chats:
             self.relay_chats()
+        if self.releases:
+            self.announce_releases()
         stale = sorted(k for k in cards if k not in wanted)
         self.log(("dry plan " + json.dumps(plan, sort_keys=True) + " " if self.dry else "")
                  + "counts " + json.dumps(counts, sort_keys=True) + (f" unplaced {unplaced}" if unplaced else "")
@@ -350,6 +359,66 @@ class Sync:
             state[chat] = rec
             self.acknowledge(f"chat {chat}", rec)
             self.save_json("chats.json", state)
+
+    def gh(self, *args):
+        r = self.run(["gh", *args], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError(f"gh {' '.join(args[:3])}: {(r.stdout + r.stderr)[:300]}")
+        return json.loads(r.stdout)
+
+    def announce_releases(self):
+        """Post one Message Board announcement per new GitHub release: the sync's one automatic post.
+
+        Per repo, releases.json keeps "since" (when the watch started), "seeded" (tags that
+        existed then, never announced) and "announced" (tag -> message id). The first run
+        only seeds. Drafts are always skipped and prereleases unless enabled. A failed read
+        or post is logged and retried next run; it never fails the sync. Messages are never
+        edited or deleted. Posted as the acting user whoever that is: an announcement is
+        not an acknowledgement. A dry run reads and logs only.
+        """
+        state = self.load("releases.json", {})
+        board = str(self.releases["board"])
+        for repo, spec in self.releases["repos"].items():
+            spec = spec if isinstance(spec, dict) else {"name": spec}
+            name = spec.get("name") or repo.split("/")[-1]
+            name = name[:1].upper() + name[1:]
+            rec = state.get(repo)
+            try:
+                listed = self.gh("release", "list", "-R", repo, "--limit", "30",
+                                 "--json", "tagName,isDraft,isPrerelease,publishedAt")
+            except Exception as e:
+                self.log(f"releases {repo}: {type(e).__name__}: {e}")
+                continue
+            if rec is None:
+                tags = sorted(r["tagName"] for r in listed if not r.get("isDraft"))
+                if self.dry:
+                    self.log(f"dry releases {repo}: would seed the watch with {', '.join(tags) or 'no releases'}")
+                    continue
+                state[repo] = {"since": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                               "seeded": tags, "announced": {}}
+                self.save_json("releases.json", state)
+                self.log(f"releases {repo}: watch started, seeded {', '.join(tags) or 'no releases'}")
+                continue
+            done = set(rec.get("seeded", [])) | set(rec.get("announced", {}))
+            new = [r for r in listed if not r.get("isDraft") and (self.prereleases or not r.get("isPrerelease"))
+                   and r["tagName"] not in done and (r.get("publishedAt") or "") > rec["since"]]
+            for r in sorted(new, key=lambda r: r["publishedAt"]):
+                tag = r["tagName"]
+                subject = f"{name} {tag} released"
+                if self.dry:
+                    self.log(f"dry releases {repo}: post {subject!r}")
+                    continue
+                try:
+                    rel = self.gh("release", "view", tag, "-R", repo, "--json", "tagName,body,url,isDraft,isPrerelease")
+                    body = render_release(rel.get("body") or "", rel["url"], spec.get("note"))
+                    msg = self.bc("api", "post", f"/buckets/{self.project}/message_boards/{board}/messages.json",
+                                  "-d", json.dumps({"subject": subject, "content": body, "status": "active"})) or {}
+                except Exception as e:
+                    self.log(f"releases {repo} {tag}: announcement failed, retrying next run: {type(e).__name__}: {e}")
+                    continue
+                rec.setdefault("announced", {})[tag] = msg.get("id")
+                self.save_json("releases.json", state)
+                self.log(f"releases {repo}: announced {tag} as message {msg.get('id')}")
 
     def save_json(self, name, value):
         tmp = self.path(name + ".tmp")
@@ -502,6 +571,46 @@ def render_reply(text):
     return "".join("<div>" + "<br>".join(html.escape(l) for l in p.splitlines()) + "</div>" for p in paras)
 
 
+def inline_md(text):
+    """One line of Markdown to escaped HTML: links, bare URLs, **bold**, `code` as plain text."""
+    out, pos = [], 0
+    for m in re.finditer(r"\[([^\]]+)\]\((https?://[^)\s]+)\)|(https?://[^\s<>()]+)", text):
+        out.append(html.escape(text[pos:m.start()]))
+        url = m.group(2) or m.group(3)
+        out.append(f'<a href="{html.escape(url)}">{html.escape(m.group(1) or url)}</a>')
+        pos = m.end()
+    out.append(html.escape(text[pos:]))
+    s = "".join(out)
+    s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+    return re.sub(r"`([^`]+)`", r"\1", s)
+
+
+def render_release(notes, url, note=None):
+    """Release notes (GitHub Markdown) to Basecamp rich text: headings bold, lists, a link to the release."""
+    parts, items = [], []
+
+    def flush():
+        if items:
+            parts.append("<ul>" + "".join(f"<li>{i}</li>" for i in items) + "</ul>")
+            items.clear()
+    for line in notes.replace("\r\n", "\n").split("\n"):
+        line = line.strip()
+        m = re.match(r"[*+-]\s+(.*)", line)
+        if m:
+            items.append(inline_md(m.group(1)))
+            continue
+        flush()
+        if not line:
+            continue
+        h = re.match(r"#{1,6}\s+(.*)", line)
+        parts.append(f"<div><strong>{inline_md(h.group(1))}</strong></div>" if h else f"<div>{inline_md(line)}</div>")
+    flush()
+    parts.append(f'<div><a href="{html.escape(url)}">{html.escape(url)}</a></div>')
+    if note:
+        parts.append(f"<div>{inline_md(note)}</div>")
+    return "".join(parts)
+
+
 def is_emoji(content, emoji):
     return is_thumbs_up(content) if emoji == THUMBS else re.sub(r"<[^>]+>", "", content).strip() == emoji
 
@@ -605,8 +714,9 @@ def cli(argv=None):
     ap.add_argument("--home", required=True, help="firstmate home (holds data/backlog.md and state/)")
     ap.add_argument("--config", required=True, help="config.json; its directory holds all runtime state")
     ap.add_argument("--dry-run", action="store_true", help="plan only: no Basecamp calls, map.json untouched")
+    ap.add_argument("--include-prereleases", action="store_true", help="also announce GitHub prereleases")
     a = ap.parse_args(argv)
-    s = Sync(a.home, a.config, dry=a.dry_run)
+    s = Sync(a.home, a.config, dry=a.dry_run, prereleases=a.include_prereleases)
     try:
         s.main()
     except Exception as e:
