@@ -30,6 +30,7 @@ missing or fails, each card keeps the board links it last had.
 
 Usage: sync.py --home <firstmate home> --config <config.json> [--dry-run]
        sync.py reply --home <home> --config <config.json> --recording <question comment id> --body-file <file> [--again] [--dry-run]
+       sync.py init <project URL> --login <profile> --home <home> [--captain <id or email>] [--repo-map TABLE=REPO] [--dry-run]
 """
 import argparse, csv, hashlib, html, json, os, re, subprocess, sys, time, tomllib
 from datetime import datetime, timezone
@@ -580,6 +581,9 @@ def task_item(t):
 
 def cli(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["init"]:
+        import init_home
+        return init_home.cli(argv[1:])
     if argv[:1] == ["reply"]:
         ap = argparse.ArgumentParser(prog="sync.py reply", description="Answer a captain question on its card, then remove the 👀.")
         ap.add_argument("--home", required=True)

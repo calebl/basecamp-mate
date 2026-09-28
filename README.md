@@ -82,10 +82,51 @@ Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between
   would add) and leaves `map.json` and the pending file alone; it logs, per card,
   whether it would be created, updated, moved, assigned or unassigned, and a total.
 
+## Set up a home
+
+```sh
+python3 sync.py init https://app.basecamp.com/<account>/projects/<project> --login firstmate --home <home> --dry-run
+```
+
+`init` reads the project as the `--login` profile and discovers every id below: the card
+tables in the project's dock, each matched to a backlog repo by its title
+(case-insensitive, surrounding spaces ignored) against the names in the home's
+`data/projects.md`; each table's columns by their exact names; the login's own identity
+(`/my/profile.json`); the captain; and the chats in the dock. `--captain <person id or
+email>` names the captain; by default it is the project's one account owner other than the
+login. `--repo-map <table>=<repo>` (repeatable) maps a table whose title is not a
+registered project's name. Any missing or ambiguous table, column, repo or identity is
+refused with a message, and nothing is guessed or written. `--create-missing-columns`
+creates a missing Figuring it out, In progress or Ready for QA column (the only Basecamp
+write `init` makes); Triage, Not now and Done are built in and never created.
+
+Without `--dry-run` it then:
+
+- writes `<home>/data/basecamp-sync/config.json` (refusing if one exists and differs,
+  unless `--force`) and creates the empty hand-kept side files that are missing;
+- installs and enables the systemd user units `basecamp-sync-<home path>.service` and
+  `.timer` (every 5 minutes, 240s cap), running this checkout's `run.sh`;
+- writes `<home>/state/basecamp-sync.check.sh` and registers it with the home's own
+  `bin/fm-check-register.sh`, so the home wakes on new pending records and failed runs.
+
+Re-running with the same inputs changes nothing. `--dry-run` prints the discovered config
+and what it would write, install or refuse, and writes nothing.
+
+### The agent skill
+
+[`skills/basecamp-sync/SKILL.md`](skills/basecamp-sync/SKILL.md) is the operating contract
+a firstmate or second mate follows in a home that uses the sync. Install it once for Claude,
+Codex and Pi from this checkout:
+
+```sh
+for d in ~/.claude/skills ~/.codex/skills ~/.pi/agent/skills; do mkdir -p "$d" && ln -sfn "$PWD/skills/basecamp-sync" "$d/basecamp-sync"; done
+```
+
 ## Config and state
 
-One config per home, normally `<home>/data/basecamp-sync/config.json`. Copy
-[`examples/config.example.json`](examples/config.example.json) and fill in the real ids:
+One config per home, normally `<home>/data/basecamp-sync/config.json`, written by `init`
+or by hand from
+[`examples/config.example.json`](examples/config.example.json):
 
 - `account`, `project`: Basecamp ids.
 - `captain`: the captain's Basecamp person id (assignee, and whose comments are relayed).
@@ -155,8 +196,9 @@ basecamp api get /my/profile.json -P firstmate
 Its token is short-lived; `run.sh` renews it with `basecamp auth refresh -P <profile>`.
 Full setup steps, and what changes for the captain: [docs/firstmate-account.md](docs/firstmate-account.md).
 
-## Hourly with systemd
+## Hourly with systemd by hand
 
+`init` installs a 5-minute timer; to set one up by hand instead,
 `~/.config/systemd/user/basecamp-sync.service` (also in [`examples/`](examples)):
 
 ```ini
@@ -194,7 +236,8 @@ systemctl --user enable --now basecamp-sync.timer
 python3 -m unittest discover -s tests -v
 ```
 
-The `basecamp` and `lavish-axi` CLIs are stubbed; tests make no network calls.
+The `basecamp` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
+registration sit behind a fake; tests make no network calls and touch no real home.
 
 ## Pending records
 
