@@ -320,7 +320,7 @@ class NoteHtml(Base):
         self.assertNotIn("<ol>", body)
 
 
-URL = "http://omarchy.tailcdcf4d.ts.net:4387/session/"
+URL = "http://lavish.example:4387/session/"
 
 
 class Boards(Base):
