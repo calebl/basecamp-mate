@@ -13,12 +13,16 @@ him (an approval of every recommendation on it), are appended to
 pending-comments.jsonl for firstmate to relay; they are never acted on here.
 
 All runtime state (map.json, sync.log, pending-comments.jsonl and the hand-kept
-extra-repos.json, figuring.json, not-now.json, skip.json, decisions.json) lives in the directory
+extra-repos.json, figuring.json, not-now.json, skip.json, decisions.json, boards.json) lives in the directory
 that holds the config file.
+
+Open Lavish review boards (read once per run from `lavish-axi`) whose file sits under
+<home>/data/<task>/ are linked on that task's card as "Plan board". If lavish-axi is
+missing or fails, each card keeps the board links it last had.
 
 Usage: sync.py --home <firstmate home> --config <config.json> [--dry-run]
 """
-import argparse, hashlib, html, json, os, re, subprocess, sys, time, tomllib
+import argparse, csv, hashlib, html, json, os, re, subprocess, sys, time, tomllib
 from datetime import datetime, timezone
 
 COLUMNS = ("Triage", "Not now", "Figuring it out", "In progress", "Ready for QA", "Done")
@@ -46,6 +50,21 @@ class Sync:
         self.dry, self.run = dry, runner
         self.data = os.path.join(self.home, "data")
         self.state = os.path.join(self.home, "state")
+
+    def lavish_boards(self):
+        """Open Lavish sessions by owning task: {task: [url, ...]}, or None when unreadable.
+
+        lavish-axi has no machine-readable listing, so its plain `sessions[N]{...}` table
+        is parsed. URLs are kept exactly as printed.
+        """
+        try:
+            r = self.run(["lavish-axi"], capture_output=True, text=True, timeout=15)
+            if r.returncode != 0:
+                raise RuntimeError((r.stdout + r.stderr)[:300])
+            return parse_lavish(r.stdout, self.data)
+        except Exception as e:
+            self.log(f"lavish-axi unavailable, keeping existing board links: {type(e).__name__}: {e}")
+            return None
 
     def path(self, name):
         return os.path.join(self.dir, name)
@@ -122,9 +141,12 @@ class Sync:
             return ("Ready for QA", False) if self.meta_pr(it["id"]) else ("In progress", False)
         return "Triage", False
 
-    def body_for(self, it, col, waiting, notnow, decisions=None):
+    def body_for(self, it, col, waiting, notnow, decisions=None, boards=()):
         decisions = decisions or {}
         parts = [f"<div><strong>Task</strong>: {html.escape(it['id'])} &middot; <strong>Status</strong>: {col}</div>"]
+        if boards:
+            links = ", ".join(f'<a href="{html.escape(u)}">{html.escape(u)}</a>' for u in boards)
+            parts.append(f"<div><strong>Plan board</strong>: {links}</div>")
         if waiting and it["id"] in decisions:
             parts.append(render_decision(decisions[it["id"]]))
         elif waiting:
@@ -155,6 +177,8 @@ class Sync:
         figuring = self.load("figuring.json", {})
         skip = set(self.load("skip.json", []))
         decisions = self.load("decisions.json", {})
+        board_owners = self.load("boards.json", {})
+        live = self.lavish_boards()
         counts, unplaced, wanted = {}, [], set()
         plan = {"create": 0, "update": 0, "move": 0, "assign": 0, "unassign": 0}
         for it in (self.parse_backlog() if items is None else items):
@@ -171,14 +195,18 @@ class Sync:
             if col == "Triage" and it["id"] in figuring:
                 col = "Figuring it out"
                 it = dict(it, hold=it["hold"] or figuring[it["id"]])
-            body = self.body_for(it, col, waiting, notnow, decisions)
+            if live is not None:
+                owners = [it["id"]] + [o for o in board_owners.get(it["id"], []) if o != it["id"]]
+                task_boards = list(dict.fromkeys(u for o in owners for u in live.get(o, [])))
             for repo in repos:
                 key = f"{it['id']}|{repo}"
                 wanted.add(key)
                 t = self.tables[repo]
                 title = it["title"][:240]
-                digest = hashlib.sha256((title + body).encode()).hexdigest()
                 rec = cards.get(key)
+                boards = task_boards if live is not None else (rec or {}).get("boards", [])
+                body = self.body_for(it, col, waiting, notnow, decisions, boards)
+                digest = hashlib.sha256((title + body).encode()).hexdigest()
                 if self.dry:
                     if rec is None:
                         plan["create"] += 1
@@ -203,13 +231,14 @@ class Sync:
                     if waiting:
                         args += ["--assignee", str(self.captain)]
                     data = self.bc(*args)
-                    rec = {"card": data["id"], "column": col, "assigned": waiting, "digest": digest, "comments": []}
+                    rec = {"card": data["id"], "column": col, "assigned": waiting, "digest": digest, "comments": [], "boards": boards}
                     cards[key] = rec
                     self.log(f"created {key} card {data['id']} in {col}")
                 else:
                     if rec.get("digest") != digest:
                         self.bc("cards", "update", str(rec["card"]), "--card-table", t["table"], "--title", title, "--body", body)
                         rec["digest"] = digest
+                        rec["boards"] = boards
                         self.log(f"updated {key}")
                     if rec.get("column") != col:
                         self.bc("cards", "move", str(rec["card"]), "--card-table", t["table"], "--to", t[col])
@@ -283,6 +312,29 @@ class Sync:
 def is_thumbs_up(content):
     """True for 👍 alone, with or without a skin-tone modifier or variation selector."""
     return re.fullmatch("\U0001F44D[\U0001F3FB-\U0001F3FF]?\uFE0F?", re.sub(r"<[^>]+>", "", content).strip()) is not None
+
+
+def parse_lavish(text, data):
+    """Map the open sessions in plain `lavish-axi` output to the task dir under `data` holding each file."""
+    root = os.path.realpath(data) + os.sep
+    out, inside = {}, False
+    for row in csv.reader(text.splitlines()):
+        if row and re.match(r"sessions\[\d+\]\{", row[0]):
+            inside = True
+            continue
+        if not inside:
+            continue
+        if not row or not row[0].startswith("  "):
+            break
+        if len(row) < 3 or row[1].strip() != "open":
+            continue
+        f = os.path.realpath(row[0].strip())
+        if not f.startswith(root):
+            continue
+        task = f[len(root):].split(os.sep)[0]
+        if task and f[len(root) + len(task):].startswith(os.sep):
+            out.setdefault(task, []).append(row[2].strip())
+    return out
 
 
 def render_decision(d):

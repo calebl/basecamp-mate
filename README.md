@@ -19,6 +19,15 @@ Column rules:
 | In flight with `pr=` in `state/<task>.meta` | Ready for QA |
 | Done | Done |
 
+If an agent hosts a Lavish review board for a task, the card links it. Each run reads the
+live sessions once from plain `lavish-axi` (it has no machine-readable listing, so its
+`sessions[N]{file,status,url,...}` table is parsed, with a 15s cap). A session with status
+`open` whose file is under `<home>/data/<task>/` belongs to that task, and its URL, exactly
+as printed, is listed as **Plan board** near the top of the note. `boards.json` adds boards
+owned by other tasks (e.g. a scout's plan). Once a session ends or disappears the link
+drops on the next run. If `lavish-axi` is missing, fails or times out, the run logs it and
+each card keeps the links it had.
+
 Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between them. When the captain hold is released the card is unassigned on the next run.
 
 ## Safety bounds
@@ -61,13 +70,14 @@ Everything else lives beside the config, never in this repo:
 
 | File | Kept by | Purpose |
 | --- | --- | --- |
-| `map.json` | the script | task/board -> card id, column, assignment, content digest, seen comments and boosts |
+| `map.json` | the script | task/board -> card id, column, assignment, content digest, linked boards, seen comments and boosts |
 | `sync.log` | the script | one line per action, plus a counts line per run |
 | `pending-comments.jsonl` | the script | captain comments and approvals waiting to be relayed, one JSON record per line (see below) |
 | `extra-repos.json` | hand | `{"task": ["board", ...]}`: extra boards for a task |
 | `figuring.json` | hand | `{"task": "why"}`: queued tasks that need a plan approved |
 | `not-now.json` | hand | `{"task": "why"}`: tasks deferred |
 | `skip.json` | hand | `["task", ...]`: tasks never mirrored |
+| `boards.json` | hand | `{"task": ["board-owning task", ...]}`: extra tasks whose open Lavish boards are linked on this task's card |
 | `decisions.json` | hand | `{"task": {"question": "...", "items": ["..."], "note": "..."}}`: decision text for a card waiting on the captain, rendered as the question, a numbered list and a note in place of the raw hold reason |
 
 ## Reading the backlog
@@ -151,7 +161,7 @@ systemctl --user enable --now basecamp-sync.timer
 python3 -m unittest discover -s tests -v
 ```
 
-The `basecamp` CLI is stubbed; tests make no network calls.
+The `basecamp` and `lavish-axi` CLIs are stubbed; tests make no network calls.
 
 ## Pending records
 

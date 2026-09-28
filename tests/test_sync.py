@@ -16,8 +16,14 @@ class Stub:
     def __init__(self, comments=None, boosts=None):
         self.profiles = []
         self.calls, self.next_id, self.comments, self.boosts = [], 500, comments or {}, boosts or {}
+        self.lavish, self.lavish_calls = "", 0  # stdout of plain `lavish-axi`, or an exception to raise
 
     def __call__(self, cmd, **kw):
+        if cmd[0] == "lavish-axi":
+            self.lavish_calls += 1
+            if isinstance(self.lavish, Exception):
+                raise self.lavish
+            return SimpleNamespace(stdout=self.lavish, stderr="", returncode=0)
         if cmd[0] != "basecamp":
             raise AssertionError(f"unexpected command {cmd}")
         args = cmd[3:-3]
@@ -312,6 +318,66 @@ class NoteHtml(Base):
     def test_decision_ignored_when_not_waiting(self):
         body = self.sync().body_for(item("a"), "Triage", False, {}, {"a": {"question": "Q", "items": ["x"]}})
         self.assertNotIn("<ol>", body)
+
+
+URL = "http://omarchy.tailcdcf4d.ts.net:4387/session/"
+
+
+class Boards(Base):
+    def sessions(self, *rows):
+        head = "bin: ~/lavish\ndescription: x\nsessions[%d]{file,status,url,pending_prompts,listener}:\n" % len(rows)
+        body = "".join(f'  {f},{st},"{u}",0,none\n' for f, st, u in rows)
+        self.stub.lavish = head + body + "visual_guidance[1]: x\n"
+
+    def board(self, task, name="review/index.html"):
+        return os.path.join(self.home, "data", task, name)
+
+    def body(self):
+        return [c for c in self.stub.calls if c[:2] in (["cards", "create"], ["cards", "update"])][-1]
+
+    def test_open_board_lands_on_card(self):
+        self.sessions((self.board("a"), "open", URL + "aa"), (self.board("a", "b.html"), "open", URL + "ab"),
+                      (self.board("other"), "open", URL + "zz"))
+        self.sync().main([item("a")])
+        note = self.stub.calls[0][3]
+        self.assertIn(f'<strong>Plan board</strong>: <a href="{URL}aa">{URL}aa</a>, <a href="{URL}ab">', note)
+        self.assertNotIn(URL + "zz", note)
+        self.assertEqual(self.stub.lavish_calls, 1)
+        self.assertLess(note.index("Plan board"), note.index("Kept in sync"))
+
+    def test_closed_or_ended_session_is_skipped_and_link_drops(self):
+        self.sessions((self.board("a"), "open", URL + "aa"))
+        self.sync().main([item("a")])
+        self.sessions((self.board("a"), "ended", URL + "aa"), (self.board("a", "x.html"), "feedback", URL + "ax"))
+        self.sync().main([item("a")])
+        self.assertEqual(self.body()[:2], ["cards", "update"])
+        self.assertNotIn("Plan board", self.body()[-1])
+
+    def test_boards_json_maps_scout_boards(self):
+        self.side("boards.json", {"a": ["a-scout"]})
+        self.sessions((self.board("a-scout"), "open", URL + "sc"))
+        self.sync().main([item("a"), item("b")])
+        notes = [c[3] for c in self.stub.calls if c[:2] == ["cards", "create"]]
+        self.assertIn(URL + "sc", notes[0])
+        self.assertNotIn(URL + "sc", notes[1])
+
+    def test_lavish_failure_keeps_links_and_run_succeeds(self):
+        self.sessions((self.board("a"), "open", URL + "aa"))
+        self.sync().main([item("a")])
+        n = len(self.stub.calls)
+        for err in (FileNotFoundError("lavish-axi"), sync.subprocess.TimeoutExpired("lavish-axi", 15)):
+            self.stub.lavish = err
+            self.sync().main([item("a")])
+        self.assertEqual([c for c in self.stub.calls[n:] if c[0] == "cards"], [])
+        self.assertIn(URL + "aa", self.cards()["a|server"]["boards"])
+        self.assertIn("lavish-axi unavailable", open(os.path.join(self.cfgdir, "sync.log")).read())
+
+    def test_unchanged_link_makes_no_update(self):
+        self.sessions((self.board("a"), "open", URL + "aa"))
+        self.sync().main([item("a")])
+        n = len(self.stub.calls)
+        self.sync().main([item("a")])
+        self.assertEqual([c for c in self.stub.calls[n:] if c[0] == "cards"], [])
 
 
 class TasksAxi(unittest.TestCase):
