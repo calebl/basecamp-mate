@@ -7,18 +7,25 @@ sys.path.insert(0, ROOT)
 import sync  # noqa: E402
 
 CAPTAIN = 33333333
+ACTING = 53286738  # the dedicated firstmate user the CLI profile signs in as
 
 
 class Stub:
     """Records every CLI call and answers like the basecamp CLI would."""
 
     def __init__(self, comments=None, boosts=None):
+        self.profiles = []
         self.calls, self.next_id, self.comments, self.boosts = [], 500, comments or {}, boosts or {}
 
     def __call__(self, cmd, **kw):
         if cmd[0] != "basecamp":
             raise AssertionError(f"unexpected command {cmd}")
         args = cmd[3:-3]
+        if args[:1] == ["-P"]:
+            self.profiles.append(args[1])
+            args = args[2:]
+        else:
+            self.profiles.append(None)
         self.calls.append(args)
         data = None
         if args[:2] == ["cards", "create"]:
@@ -245,6 +252,42 @@ class Boosts(Base):
         self.assertEqual(len(self.boost_calls()), 2)
         self.assertEqual(self.pending(), [])
         self.assertNotIn("boosts", self.cards()["a|server"])
+
+
+class Profile(Base):
+    WAIT = dict(hold="pick", hold_kind="captain")
+
+    def set_profile(self, name):
+        p = os.path.join(self.cfgdir, "config.json")
+        cfg = json.load(open(p))
+        cfg["profile"] = name
+        json.dump(cfg, open(p, "w"))
+
+    def run_all_kinds(self):
+        self.stub.comments = {"501": []}
+        self.sync().main([item("a", **self.WAIT)])
+        self.sync().main([item("a")])
+        kinds = {tuple(c[:2]) for c in self.stub.calls}
+        self.assertTrue({("cards", "create"), ("comments", "list"), ("api", "get"), ("unassign", "501")} <= kinds, kinds)
+
+    def test_profile_passed_on_every_call(self):
+        self.set_profile("firstmate")
+        self.run_all_kinds()
+        self.assertEqual(set(self.stub.profiles), {"firstmate"})
+
+    def test_no_profile_flag_when_unset(self):
+        self.run_all_kinds()
+        self.assertEqual(set(self.stub.profiles), {None})
+
+    def test_acting_user_comments_and_boosts_ignored(self):
+        self.set_profile("firstmate")
+        self.stub.comments = {"501": [{"id": 9, "creator": {"id": ACTING}, "content": "<p>mine</p>", "created_at": "t"}]}
+        self.stub.boosts = {"501": [boost(7, who=ACTING)]}
+        self.sync().main([item("a", **self.WAIT)])
+        self.assertFalse(os.path.exists(os.path.join(self.cfgdir, "pending-comments.jsonl")))
+        self.assertIn(["cards", "create"], [c[:2] for c in self.stub.calls])
+        create = next(c for c in self.stub.calls if c[:2] == ["cards", "create"])
+        self.assertEqual(create[create.index("--assignee") + 1], str(CAPTAIN))
 
 
 class NoteHtml(Base):
