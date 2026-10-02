@@ -21,7 +21,7 @@ the owner, and `--dry-run` only logs. All state lives in the directory holding t
 config.
 """
 import contextlib, csv, fcntl, html, json, os, re, subprocess, time, tomllib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 THUMBS, EYES = "\U0001F44D", "\U0001F440"
@@ -75,6 +75,14 @@ class Tools:
         print(line)
         with open(self.path("sync.log"), "a") as f:
             f.write(line + "\n")
+
+    def pending_lines(self):
+        """The lines of pending-comments.jsonl, oldest first."""
+        p = self.path("pending-comments.jsonl")
+        if not os.path.exists(p):
+            return []
+        with open(p) as f:
+            return f.read().splitlines()
 
     def record(self, rec):
         """Append one pending record for the agent."""
@@ -246,7 +254,73 @@ class Tools:
         return self.bc("api", "post", f"/buckets/{self.project}/message_boards/{board}/messages.json",
                        "-d", json.dumps({"subject": subject, "content": content, "status": "active"})) or {}
 
+    def inbox_note(self, fm_home, request_id, body):
+        """Queue `body` as a note in firstmate home `fm_home`'s inbox through its bin/fm-inbox.sh.
+
+        Idempotent by `request_id`: a repeat replays the original note instead of adding
+        one. Returns the outcome ("created" or "replay"); raises on any failure,
+        including exit 3 (saved but firstmate not woken), which a retry with the same
+        request id repairs.
+        """
+        cmd = [os.path.join(fm_home, "bin", "fm-inbox.sh"), "note", "--request-id", request_id, "--json", "-"]
+        env = {k: v for k, v in os.environ.items() if k not in ("FM_ROOT_OVERRIDE", "FM_STATE_OVERRIDE")}
+        env["FM_HOME"] = fm_home
+        r = self.run(cmd, input=body, capture_output=True, text=True, timeout=30, env=env)
+        if r.returncode != 0:
+            raise RuntimeError(f"fm-inbox.sh note exited {r.returncode}: {(r.stdout + r.stderr).strip()[:300]}")
+        try:
+            return json.loads(r.stdout).get("outcome")
+        except ValueError:
+            return None
+
     # --- readers: poll Basecamp, append pending records, acknowledge ---
+
+    def read_boosts(self, rec, surface, context, counted=None, always=()):
+        """Record the owner's new boosts on recordings as `boost` records: a boost is an answer.
+
+        `counted` is [(recording id, url, boosts_count)], each read only when its count
+        differs from rec["boost_counts"]; `always` is [(recording id, url)], read every
+        run. Boost ids already recorded are in rec["boost_seen"]. The first time a record
+        has no "boost_counts" (for counted) or no "boost_seen" (for always), they are
+        seeded without recording, so turning this on never replays history. A dry run
+        records nothing.
+        """
+        counts, seen = rec.get("boost_counts"), rec.get("boost_seen")
+        seed_counts, seed_seen = counts is None, seen is None
+        counts, seen = dict(counts or {}), list(seen or [])
+        items = [(rid, url, None) for rid, url in always] + list(counted or [])
+        for rid, url, count in items:
+            if count is not None:
+                if seed_counts:
+                    counts[str(rid)] = count
+                    continue
+                if count == counts.get(str(rid), 0):
+                    continue
+            try:
+                boosts = self.bc("api", "get", f"/buckets/{self.project}/recordings/{rid}/boosts.json") or []
+            except RuntimeError as e:
+                self.log(f"boosts {surface} {rid}: {e}")
+                continue
+            for b in sorted(boosts, key=lambda b: b.get("id", 0)):
+                bid = b.get("id")
+                if bid in seen or (b.get("booster") or {}).get("id") != self.captain:
+                    continue
+                if self.dry:
+                    self.log(f"dry {surface} {rid}: owner boost {bid}")
+                    continue
+                seen.append(bid)
+                if count is None and seed_seen:
+                    continue
+                self.record({"kind": "boost", "surface": surface, **context, "recording": rid, "boost": bid,
+                             "text": html.unescape(re.sub(r"<[^>]+>", "", b.get("content", ""))).strip(),
+                             "url": url, "at": b.get("created_at")})
+                self.log(f"new owner boost on {surface} {rid}: {bid}")
+            if count is not None:
+                counts[str(rid)] = count
+        if counted is not None:
+            rec["boost_counts"] = counts
+        if always or seen != list(rec.get("boost_seen") or []):
+            rec["boost_seen"] = seen
 
     def read_card_comments(self, task, repo, key, rec):
         """Record the captain's new comments on card rec["card"]: "question" when it has "?", else "comment"."""
@@ -267,32 +341,53 @@ class Tools:
                              "at": c.get("created_at"), "text": text})
                 rec.setdefault("ack", []).append([cid, EYES if kind == "question" else THUMBS])
                 self.log(f"new captain {kind} on {key}: {cid}")
+        self.read_boosts(rec, "card-comment", {"task": task, "repo": repo, "card": rec["card"]},
+                         counted=[(c.get("id"), c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
 
     def read_card_boosts(self, task, repo, key, rec):
-        """Record the captain's 👍 on card rec["card"] as an approval. A dry run reads and logs only."""
+        """Record the captain's 👍 on card rec["card"] as an approval, and any other owner boost as a `boost`.
+
+        A dry run reads and logs only. Other boosts already on the card the first time
+        it is read (no rec["card_boost_seen"]) are seeded, not recorded.
+        """
         path = f"/buckets/{self.project}/recordings/{rec['card']}/boosts.json"
         try:
             boosts = self.bc("api", "get", path) or []
         except RuntimeError as e:
             self.log(f"boosts {key}: {e}")
             return
+        url = f"https://app.basecamp.com/{self.account}/buckets/{self.project}/card_tables/cards/{rec['card']}"
+        seed = "card_boost_seen" not in rec
         for b in boosts:
             bid = b.get("id")
-            if bid in rec.get("boosts", []):
+            if bid in rec.get("boosts", []) or bid in rec.get("card_boost_seen", []):
                 continue
-            if (b.get("booster") or {}).get("id") != self.captain or not is_thumbs_up(b.get("content", "")):
+            if (b.get("booster") or {}).get("id") != self.captain:
+                continue
+            if not is_thumbs_up(b.get("content", "")):
+                if self.dry:
+                    self.log(f"dry {key}: owner boost {bid}")
+                    continue
+                rec.setdefault("card_boost_seen", []).append(bid)
+                if not seed:
+                    self.record({"kind": "boost", "surface": "card", "task": task, "repo": repo, "card": rec["card"],
+                                 "recording": rec["card"], "boost": bid,
+                                 "text": html.unescape(re.sub(r"<[^>]+>", "", b.get("content", ""))).strip(),
+                                 "url": url, "at": b.get("created_at")})
+                    self.log(f"new owner boost on {key}: {bid}")
                 continue
             if self.dry:
                 self.log(f"dry {key}: captain approval boost {bid}")
                 self.acknowledge(key, dict(rec, ack=[*rec.get("ack", []), [rec["card"], THUMBS]]))
                 continue
             rec.setdefault("boosts", []).append(bid)
-            self.record({"kind": "approval", "task": task, "repo": repo, "card": rec["card"],
-                         "url": f"https://app.basecamp.com/{self.account}/buckets/{self.project}/card_tables/cards/{rec['card']}",
-                         "boost": bid, "at": b.get("created_at")})
+            self.record({"kind": "approval", "task": task, "repo": repo, "card": rec["card"], "url": url,
+                         "boost": bid, "text": re.sub(r"<[^>]+>", "", b.get("content", "")).strip(), "at": b.get("created_at")})
             if [rec["card"], THUMBS] not in rec.setdefault("ack", []):
                 rec["ack"].append([rec["card"], THUMBS])
             self.log(f"captain approval on {key}: boost {bid}")
+        if not self.dry:
+            rec.setdefault("card_boost_seen", [])
 
     def read_chats(self, chats, every_line=()):
         """Record the captain's chat lines in `chats` as chat-question records.
@@ -337,6 +432,8 @@ class Tools:
                 rec.setdefault("lines", []).append(lid)
                 rec.setdefault("ack", []).append([lid, EYES])
                 self.log(f"new captain chat question in {chat}: {lid}")
+            self.read_boosts(rec, "chat", {"chat": int(chat)},
+                             counted=[(ln.get("id"), ln.get("app_url"), ln.get("boosts_count") or 0) for ln in lines])
             if self.dry:
                 if first:
                     self.log(f"dry chat {chat}: would start the cursor at {cursor}")
@@ -394,6 +491,72 @@ class Tools:
                 self.save_json("checkins.json", state)
                 self.log(f"checkin {qid} due {date}")
 
+    def agent(self):
+        """The acting user's id when it is someone other than the owner, else None."""
+        me = self.acting_id()
+        return None if me in (None, "retry", self.captain) else me
+
+    def read_answer_boosts(self, questionnaires, days=7):
+        """The owner's boosts on check-in answers the acting user posted in the last `days` days.
+
+        One answers read per question that has answers, then a boosts read per answer
+        whose boosts_count changed. State is the question's entry in checkins.json.
+        """
+        me = self.agent()
+        if me is None:
+            return
+        since = (self.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+        state = self.load("checkins.json", {})
+        for qn in questionnaires:
+            try:
+                questions = self.bc("api", "get", f"/buckets/{self.project}/questionnaires/{qn}/questions.json") or []
+                for q in questions:
+                    if not q.get("answers_count"):
+                        continue
+                    answers = self.bc("api", "get", f"/buckets/{self.project}/questions/{q['id']}/answers.json") or []
+                    mine = [a for a in answers if (a.get("creator") or {}).get("id") == me
+                            and (a.get("group_on") or (a.get("created_at") or "")[:10]) >= since]
+                    rec = state.setdefault(str(q["id"]), {})
+                    self.read_boosts(rec, "checkin-answer", {"question": q["id"]},
+                                     counted=[(a["id"], a.get("app_url"), a.get("boosts_count") or 0) for a in mine])
+            except RuntimeError as e:
+                self.log(f"checkin answer boosts {qn}: {e}")
+        if not self.dry:
+            self.save_json("checkins.json", state)
+
+    def read_message_boosts(self, board, days=14):
+        """The owner's boosts on messages the acting user posted on `board` in the last `days` days, and on their comments.
+
+        One read of the board's newest messages; a boosts read per message whose
+        boosts_count changed; a comments read per such message that has comments, and a
+        boosts read per comment whose count changed. State is messages.json.
+        """
+        me = self.agent()
+        if me is None:
+            return
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+        state = self.load("messages.json", {})
+        try:
+            msgs = self.bc("api", "get", f"/buckets/{self.project}/message_boards/{board}/messages.json") or []
+        except RuntimeError as e:
+            self.log(f"message boosts {board}: {e}")
+            return
+        mine = [m for m in msgs if (m.get("creator") or {}).get("id") == me and (m.get("created_at") or "") >= since]
+        for m in mine:
+            ctx = {"message": m["id"], "subject": m.get("subject")}
+            self.read_boosts(state.setdefault("messages", {}), "message", ctx, counted=[(m["id"], m.get("app_url"), m.get("boosts_count") or 0)])
+            if not m.get("comments_count"):
+                continue
+            try:
+                comments = self.bc("comments", "list", str(m["id"])) or []
+            except RuntimeError as e:
+                self.log(f"message {m['id']} comments: {e}")
+                continue
+            self.read_boosts(state.setdefault("comments", {}), "message-comment", ctx,
+                             counted=[(c["id"], c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
+        if not self.dry:
+            self.save_json("messages.json", state)
+
     def answered_today(self, qid, me, date):
         """True when `me` already answered question `qid` for `date` in Basecamp."""
         if me is None:
@@ -444,10 +607,18 @@ class Tools:
                                  "text": text, "at": c.get("created_at")})
                     rec.setdefault("comments", []).append(cid)
                     self.log(f"new owner comment on todo {key}: {cid}")
+                self.read_todo_boosts(key, rec, comments)
                 self.acknowledge(f"todo {key}", rec)
                 if not self.dry:
                     rec["cursor"] = cursor
                     self.save_json("todos.json", state)
+
+    def read_todo_boosts(self, key, rec, comments):
+        """The owner's boosts on the to-do (read every run) and on its comments (when their count changes)."""
+        ctx = {"key": key, "todo": rec["todo"]}
+        self.read_boosts(rec, "todo", ctx, always=[(rec["todo"], rec.get("url"))])
+        self.read_boosts(rec, "todo-comment", ctx,
+                         counted=[(c.get("id"), c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
 
     # --- commands: explicit posts, run by the agent ---
 
@@ -619,13 +790,13 @@ class Tools:
         with self.locked("todos.json"):
             state = self.load("todos.json", {})
             state[key] = {"todo": tid, "title": title.strip(), "url": data.get("app_url"), "cursor": 0,
-                          "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+                          "boost_counts": {}, "boost_seen": [], "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
             self.save_json("todos.json", state)
         self.log(f"todo create {key}: todo {tid} {data.get('app_url') or ''}".rstrip())
         return tid
 
     def todo_track(self, key, tid):
-        """Track an existing to-do under `key`; its comments so far are not relayed. Writes nothing to Basecamp."""
+        """Track an existing to-do under `key`; its comments and boosts so far are not relayed. Writes nothing to Basecamp."""
         self.need_todos()
         with self.locked("todos.json"):
             state = self.load("todos.json", {})
@@ -641,7 +812,7 @@ class Tools:
         with self.locked("todos.json"):
             state = self.load("todos.json", {})
             state[key] = {"todo": tid, "title": todo.get("content"), "url": todo.get("app_url"), "cursor": cursor,
-                          "created": todo.get("created_at")}
+                          "created": todo.get("created_at")}  # no boost state: the first read seeds it
             if todo.get("completed"):
                 state[key]["completed"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             self.save_json("todos.json", state)

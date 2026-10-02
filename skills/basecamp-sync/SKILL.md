@@ -36,8 +36,8 @@ is not a registered project's name). A card table matching no registered project
 skipped and printed, not refused; check the skipped list and pass `--repo-map` for any
 board that is really a repo's. When the owner wants only chat, check-ins or release
 announcements, or the project has no card tables, pass `--no-cards`. `--todos`,
-`--reports`, `--every-line` and `--checkins <time zone>` turn on decision to-dos,
-reports, every-line chat and check-in answering; `--no-releases` leaves announcements out. Never pass `--force` or `--create-missing-columns`
+`--reports`, `--every-line`, `--inbox` and `--checkins <time zone>` turn on decision
+to-dos, reports, every-line chat, inbox delivery and check-in answering; `--no-releases` leaves announcements out. Never pass `--force` or `--create-missing-columns`
 without the main firstmate's go-ahead.
 
 ## The backlog is the source of truth
@@ -73,7 +73,8 @@ With `todos` on, put each item waiting on the captain (a decision, approval, mer
 credential or login) to them as one to-do instead:
 `python3 $SYNC/sync.py todo create --home <home> --config <config> --key <stable key> --title "<plain question>" --body-file <file>`,
 with a Markdown description of the evidence, consequence, options, recommendation and the
-full URL of every PR. Their comment comes back as a `todo-comment` record. A decision: act
+full URL of every PR. Their comment comes back as a `todo-comment` record, and their
+boost on the to-do or on any comment under it (yours included) as a `boost` record. A decision: act
 on it (relaying first if this is not the main firstmate's home), then
 `sync.py todo complete --todo <key>`. Feedback that is not a decision: act on it and
 answer with `sync.py reply --recording <comment id>`; the to-do stays open. Complete a
@@ -83,6 +84,10 @@ to-do settled another way (the captain merged the PR themselves). Adopt one made
 ## Pending records
 
 The wake check fires when `pending-comments.jsonl` or a FAILED line in `sync.log` grows.
+With `inbox` set (`init --inbox`), each new record instead arrives as a note in this
+home's firstmate inbox (request id `basecamp-<kind>-<id>`) and the wake check watches
+only FAILED lines: the inbox note is the wake. Handle the record it names, then ack the
+note with `bin/fm-inbox.sh drain --ack <note id>`.
 Handle each new record by its `kind` (missing `kind` = `comment`):
 
 - `comment`, `approval`: relay to the main firstmate with the task and card link and wait
@@ -96,6 +101,11 @@ Handle each new record by its `kind` (missing `kind` = `comment`):
   A `chat-question` from a chat set to `every_line` may be any line the owner wrote there;
   treat each as addressed to you.
 - `todo-comment`: the captain commented on a tracked to-do; see "Decisions as to-dos".
+- `boost`: the captain boosted something being watched (`surface`: chat, card,
+  card-comment, todo, todo-comment, checkin-answer, message, message-comment); a boost
+  can carry short text. It is an answer to what was boosted, like a comment there: on a
+  decision to-do or a comment under it, a decision or feedback as above; elsewhere a reply
+  to that line, answer or post. Relay it like a comment outside the main firstmate's home.
 - `checkin`: a check-in question came due today. Work out the answer within this home's
   scope and post it once with
   `python3 $SYNC/sync.py answer --home <home> --config <home>/data/basecamp-sync/config.json --question <question id> --body-file <file>`.

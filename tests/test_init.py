@@ -312,6 +312,13 @@ class InitTest(unittest.TestCase):
                                           "todos": {"todoset": "66"},
                                           "checkins": {"questionnaires": ["55"], "timezone": "America/Chicago"}})
 
+    def test_inbox_turns_on_delivery_and_a_failures_only_check(self):
+        cfg, _ = self.init(inbox=True).discover()
+        self.assertEqual(cfg, EXPECTED | {"inbox": {}})
+        self.init(inbox=True).main()
+        self.assertEqual(self.system.checks["basecamp-sync"], init_home.CHECK_INBOX)
+        self.assertNotIn("pending-comments", init_home.CHECK_INBOX.split("Pending records")[1])
+
     def test_no_releases_reads_no_origins(self):
         self.stub.origins = {"Engine": "https://github.com/acme/engine.git"}
         cfg, _ = self.init(cards=False, repo_map=[], releases=False).discover()

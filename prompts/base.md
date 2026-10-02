@@ -36,7 +36,7 @@ to you and where you put everything that needs them:
 
    ```sh
    python3 SYNC/sync.py init URL --login firstmate --home HOME --no-cards --no-releases \
-     --todos --reports --every-line --checkins <account time zone, e.g. America/New_York> --dry-run
+     --todos --reports --every-line --inbox --checkins <account time zone, e.g. America/New_York> --dry-run
    ```
 
    Drop `--no-cards` only when the captain wants the card mirror, and `--no-releases` only
@@ -47,7 +47,7 @@ to you and where you put everything that needs them:
 4. Read the printed config, then run the same command without `--dry-run`. It writes the
    config, installs a 5-minute timer and registers the wake check.
 5. Confirm with `python3 SYNC/sync.py behaviors C`: `chat-inbox`, `checkin-answering`,
-   `decision-todos` and `reports` on (plus `card-mirror` and `release-announcements` if they
+   `decision-todos`, `reports` and `inbox-delivery` on (plus `card-mirror` and `release-announcements` if they
    asked for them).
 6. Adopt to-dos that already wait on the captain, if any: for each open to-do assigned to them that
    you made by hand, `python3 SYNC/sync.py todo track C --key <key> --todo <id>`.
@@ -56,8 +56,12 @@ to you and where you put everything that needs them:
 ## 2. Pending records
 
 The timer appends what it reads to `HOME/data/basecamp-sync/pending-comments.jsonl`, one
-JSON record per line, and the wake check fires when the file grows or a run fails. Handle
-each new line once, in order, by its `kind`:
+JSON record per line, and with `inbox-delivery` on it also delivers each new record as a
+note in your firstmate inbox. The inbox note is the wake: it says what the record is, who
+wrote it, the text, its link and how to handle it. Handle it, then acknowledge it with
+`HOME/bin/fm-inbox.sh drain --ack <note id>`. (Without `inbox-delivery`, the wake check
+fires when the file grows instead; handle each new line once, in order.) The wake check
+still fires on a FAILED line in `sync.log`. By `kind`:
 
 - `todo-comment`: the captain commented on a decision to-do (section 3).
 - `chat-question`: a line the captain posted in chat. With `every_line` on, that is every line, not
@@ -66,6 +70,12 @@ each new line once, in order, by its `kind`:
   `python3 SYNC/sync.py reply C --recording <line> --body-file <file>`.
   Answer every line, even if only to say what you did or that you are on it.
 - `checkin`: a check-in question came due today (section 4).
+- `boost`: the captain boosted something you are watching; a boost can carry short text
+  (e.g. "a", "yes", "later"). It is an answer to what was boosted, exactly like a comment
+  there: on a decision to-do or a comment under it (including yours) it is their decision
+  or feedback (section 3); on a chat line, check-in answer or report of yours it is their
+  reply to it. `surface` says where, `recording` is what was boosted and `text` is the
+  boost. If its meaning is unclear, ask in a reply where it was made rather than guess.
 - `comment`, `question`, `approval` (card mirror only): their comment or 👍 on a card. Answer
   a question with `reply`; act on an approval as approving every recommendation on the card.
 - A FAILED line in `sync.log`: read it. A token failure needs `basecamp auth login -P firstmate`,
@@ -91,14 +101,15 @@ happened and the evidence, what happens on a yes or a no, the options, your
 recommendation, and the full URL of every PR it concerns. One decision per to-do. The key
 makes the command safe to re-run: a key already tracked is never created twice.
 
-Then wait for their comment; do not ask the same thing in chat as well. When a
-`todo-comment` arrives:
+Then wait for their comment or boost; do not ask the same thing in chat as well. When a
+`todo-comment` or a `boost` on the to-do or one of its comments arrives:
 
 - **A decision** (e.g. "merge it", "go with option 2", "use this login"): it is their
   answer. Carry it out, then `python3 SYNC/sync.py todo complete C --todo <key>`.
 - **Feedback or a question rather than a decision** (e.g. "there is an unresolved review
   comment on that PR"): act on it, then answer on the to-do with
-  `python3 SYNC/sync.py reply C --recording <comment> --body-file <file>` saying what you
+  `python3 SYNC/sync.py reply C --recording <comment> --body-file <file>` (for a boost,
+  `python3 SYNC/sync.py todo comment C --todo <key> --body-file <file>`) saying what you
   found and did. The to-do stays open. Update it with
   `python3 SYNC/sync.py todo comment C --todo <key> --body-file <file>` when it is ready
   again.

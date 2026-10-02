@@ -24,7 +24,8 @@ Four opt-in flags turn on more behaviors from the dock, each refusing when the d
 has none or several of what it needs: --todos (decision to-dos on the one to-do set),
 --reports (posting to the one message board), --every-line (relay every owner line
 in the chats) and --checkins <time zone> (the one Automatic Check-ins questionnaire).
---no-releases leaves release announcements out.
+--no-releases leaves release announcements out. --inbox delivers each pending record
+as a firstmate inbox note, and the wake check then watches only failures.
 
 The only Basecamp write is creating a missing regular column, and only with
 --create-missing-columns.
@@ -54,6 +55,23 @@ cur="$n $f"
 [ "$(cat "$MARK" 2>/dev/null)" = "$cur" ] && exit 0
 printf '%s\\n' "$cur" > "$MARK"
 [ "$n" -gt 0 ] || [ "$f" -gt 0 ] && echo "basecamp sync: $n pending record(s), $f failed run(s) - follow the basecamp-sync skill: read data/basecamp-sync/pending-comments.jsonl and sync.log; relay comments and approvals to the main firstmate and wait for its answer before acting; answer informational questions in this home's scope with sync.py reply"
+exit 0
+"""
+
+# With inbox delivery on, each pending record already arrives as a firstmate inbox note
+# (its own wake), so the check watches only for failed runs and failed notes.
+CHECK_INBOX = """#!/usr/bin/env bash
+# Wakes this home's firstmate when a Basecamp sync run or inbox note fails
+# (a FAILED line in data/basecamp-sync/sync.log), once per change. Pending records
+# arrive as inbox notes. Installed by firstmate-basecamp-sync `sync.py init --inbox`.
+set -u
+STATE_DIR="$(cd "$(dirname "$0")" && pwd)"
+D="$STATE_DIR/../data/basecamp-sync"
+MARK="$STATE_DIR/.basecamp-sync.seen"
+f=$(grep -c "FAILED" "$D/sync.log" 2>/dev/null); f=${f:-0}
+[ "$(cat "$MARK" 2>/dev/null)" = "$f" ] && exit 0
+printf '%s\\n' "$f" > "$MARK"
+[ "$f" -gt 0 ] && echo "basecamp sync: $f failed run(s) or inbox note(s) - follow the basecamp-sync skill: read data/basecamp-sync/sync.log"
 exit 0
 """
 
@@ -167,7 +185,7 @@ class System:
 
 class Init:
     def __init__(self, url, login, home, captain=None, repo_map=(), create_missing=False, dry=False,
-                 force=False, cards=True, todos=False, reports=False, every_line=False, checkins=None, releases=True,
+                 force=False, cards=True, todos=False, reports=False, every_line=False, checkins=None, releases=True, inbox=False,
                  runner=subprocess.run, system=None, sync_dir=HERE, out=print):
         self.account, self.project = parse_url(url)
         self.login, self.home = login, os.path.abspath(home)
@@ -182,7 +200,7 @@ class Init:
         if not cards and (self.repo_map or create_missing):
             raise Refuse("--no-cards cannot be combined with --repo-map or --create-missing-columns")
         self.todos, self.reports, self.every_line, self.checkins = todos, reports, every_line, checkins
-        self.releases = releases
+        self.releases, self.inbox = releases, inbox
         if checkins is not None:
             try:
                 ZoneInfo(checkins)
@@ -302,6 +320,8 @@ class Init:
                 cfg[key] = {"todoset": ids[0]}
             elif key == "checkins":
                 cfg[key] = {"questionnaires": ids, "timezone": self.checkins}
+        if self.inbox:
+            cfg["inbox"] = {}
         if problems:
             raise Refuse("init refused, nothing was written:\n  - " + "\n  - ".join(problems))
         gh_repos = {}
@@ -408,7 +428,7 @@ class Init:
         self.out(json.dumps(cfg, indent=1))
         if self.dry:
             plan += self.system.install_timer(*self.units(config_path), dry=True)
-            plan += self.system.register_check(self.home, CHECK_ID, CHECK, dry=True)
+            plan += self.system.register_check(self.home, CHECK_ID, CHECK_INBOX if self.inbox else CHECK, dry=True)
             self.out("dry run, nothing written. Would:" if plan else "dry run: nothing to change")
             for p in plan:
                 self.out(f"  {p}")
@@ -433,7 +453,7 @@ class Init:
                     f.write("" if empty is None else json.dumps(empty) + "\n")
         done = [p for p in plan if not p.startswith("create column")]
         done += self.system.install_timer(*self.units(config_path), dry=False)
-        done += self.system.register_check(self.home, CHECK_ID, CHECK, dry=False)
+        done += self.system.register_check(self.home, CHECK_ID, CHECK_INBOX if self.inbox else CHECK, dry=False)
         self.out("done:" if done else "nothing to change")
         for p in done:
             self.out(f"  {p}")
@@ -458,6 +478,8 @@ def cli(argv, **kw):
     ap.add_argument("--every-line", action="store_true", help="relay every owner line in the chats, not only questions")
     ap.add_argument("--checkins", metavar="TIME_ZONE",
                     help="record due Automatic Check-ins questions, scheduled in this IANA time zone")
+    ap.add_argument("--inbox", action="store_true",
+                    help="deliver each new pending record as a note in this home's firstmate inbox (the wake)")
     ap.add_argument("--no-releases", action="store_true", help="leave release announcements out of the config")
     ap.add_argument("--force", action="store_true", help="replace an existing config.json that differs")
     ap.add_argument("--dry-run", action="store_true", help="print the discovered config and planned installs; write nothing")
@@ -466,7 +488,7 @@ def cli(argv, **kw):
         Init(a.url, a.login, a.home, captain=a.captain, repo_map=a.repo_map,
              create_missing=a.create_missing_columns, dry=a.dry_run, force=a.force,
              cards=not a.no_cards, todos=a.todos, reports=a.reports, every_line=a.every_line,
-             checkins=a.checkins, releases=not a.no_releases, **kw).main()
+             checkins=a.checkins, releases=not a.no_releases, inbox=a.inbox, **kw).main()
     except Refuse as e:
         print(e, file=sys.stderr)
         return 2

@@ -9,7 +9,7 @@ agent's side of every behavior is in prompts/base.md.
 Behaviors never call a CLI themselves; every Basecamp, GitHub and backlog read or
 write goes through a Tools method.
 """
-import hashlib, html, json, re
+import hashlib, html, json, os, re
 from datetime import datetime, timezone
 
 COLUMNS = ("Triage", "Not now", "Figuring it out", "In progress", "Ready for QA", "Done")
@@ -284,6 +284,7 @@ class CheckinAnswering(Behavior):
 
     def run(self, items=None):
         self.t.read_checkins(self.checkins["questionnaires"])
+        self.t.read_answer_boosts(self.checkins["questionnaires"])
 
 
 class DecisionTodos(Behavior):
@@ -302,16 +303,127 @@ class DecisionTodos(Behavior):
 
 
 class Reports(Behavior):
-    """The agent posts investigation reports to the Message Board with `sync.py post-message`."""
-    name, keys, timer = "reports", ("message_board",), False
+    """The agent posts reports to the Message Board with `sync.py post-message`; the timer relays the owner's boosts on them."""
+    name, keys = "reports", ("message_board",)
 
     def __init__(self, t, cfg):
         super().__init__(t, cfg)
         self.on = cfg.get("message_board") is not None
+        self.board = str(cfg.get("message_board"))
+
+    def run(self, items=None):
+        self.t.read_message_boosts(self.board)
 
 
-# The timer runs the "on" behaviors in this order.
-ALL = (CardMirror, ChatInbox, ChatAsks, ReleaseAnnouncements, CheckinAnswering, DecisionTodos, Reports)
+class InboxDelivery(Behavior):
+    """Deliver each new pending record to the firstmate inbox as a note: the wake for the agent.
+
+    "inbox": {} delivers to the --home's bin/fm-inbox.sh; {"fm_home": "<home>"} to another
+    home's. Records are delivered in order from a line cursor in inbox.json; the first
+    run starts at the records that existed when it began, so history is not delivered.
+    Each note's request id (basecamp-<kind>-<id>) makes a replay not a new note. A failed
+    note stops the run's delivery, is logged (FAILED once per request id, so the wake
+    check sees it) and retried next run; it never fails the sync. A dry run logs only.
+    """
+    name, keys = "inbox-delivery", ("inbox",)
+
+    def __init__(self, t, cfg):
+        super().__init__(t, cfg)
+        inbox = cfg.get("inbox")
+        if inbox is not None and inbox is not True and not isinstance(inbox, dict):
+            raise ValueError('config "inbox" must be {} or {"fm_home": "<firstmate home>"}')
+        self.on = inbox is not None and inbox is not False
+        self.fm_home = os.path.abspath((inbox if isinstance(inbox, dict) else {}).get("fm_home") or t.home)
+        # Where a first run starts: the records that exist before this run's readers append.
+        self.start = len(t.pending_lines()) if self.on else 0
+
+    def run(self, items=None):
+        t = self.t
+        state = t.load("inbox.json", None)
+        if state is None:
+            state = {"cursor": self.start, "failing": []}
+        lines = t.pending_lines()
+        for i in range(state["cursor"], len(lines)):
+            try:
+                rec = json.loads(lines[i])
+            except ValueError:
+                t.log(f"inbox: line {i + 1} of pending-comments.jsonl is not JSON, skipped")
+                state["cursor"] = i + 1
+                continue
+            rid, body = inbox_note(rec, t.account, t.project)
+            if t.dry:
+                t.log(f"dry inbox: note {rid}")
+                continue
+            try:
+                outcome = t.inbox_note(self.fm_home, rid, body)
+            except Exception as e:
+                if rid in state["failing"]:
+                    t.log(f"inbox: note {rid} still failing, retrying next run: {type(e).__name__}: {e}")
+                else:
+                    state["failing"].append(rid)
+                    t.log(f"FAILED inbox note {rid}, retrying next run: {type(e).__name__}: {e}")
+                break
+            state["cursor"] = i + 1
+            state["failing"] = [f for f in state["failing"] if f != rid]
+            t.log(f"inbox: note {rid} {outcome or 'sent'}")
+        if not t.dry:
+            t.save_json("inbox.json", state)
+
+
+# The timer runs the "on" behaviors in this order; inbox delivery last, after every reader.
+ALL = (CardMirror, ChatInbox, ChatAsks, ReleaseAnnouncements, CheckinAnswering, DecisionTodos, Reports, InboxDelivery)
+
+
+def inbox_note(rec, account, project):
+    """A pending record as an inbox note: (request id, short plain body)."""
+    kind = rec.get("kind") or "comment"
+    card_url = f"https://app.basecamp.com/{account}/buckets/{project}/card_tables/cards/{rec.get('card')}"
+    text = " ".join(str(rec.get("text") or "").split())
+    if len(text) > 600:
+        text = text[:600] + "..."
+    if kind in ("comment", "question"):
+        rid = rec.get("comment")
+        what = f"Basecamp card {kind} from the captain on task {rec.get('task')}"
+        handle = (f"answer: sync.py reply --recording {rid}" if kind == "question"
+                  else "relay or act as the basecamp-sync skill says")
+        url = card_url
+    elif kind == "approval":
+        rid = rec.get("boost")
+        what = f"Basecamp card approval (the captain's 👍) on task {rec.get('task')}"
+        text = text or "approve every recommendation on the card as recommended"
+        handle, url = "record the decision in the backlog", rec.get("url") or card_url
+    elif kind == "chat-question":
+        rid = rec.get("line")
+        what, handle, url = "Basecamp chat line from the captain", f"answer: sync.py reply --recording {rid}", rec.get("url")
+    elif kind == "todo-comment":
+        rid = rec.get("comment")
+        what = f"Basecamp comment from the captain on decision to-do {rec.get('key')}"
+        handle = (f"a decision: act, then sync.py todo complete --todo {rec.get('key')}; "
+                  f"feedback: act, then sync.py reply --recording {rid}")
+        url = rec.get("url")
+    elif kind == "boost":
+        rid = rec.get("boost")
+        where = {"todo": f"decision to-do {rec.get('key')}", "todo-comment": f"a comment on decision to-do {rec.get('key')}",
+                 "card": f"the card for task {rec.get('task')}",
+                 "card-comment": f"a comment on the card for task {rec.get('task')}", "chat": "a chat line",
+                 "checkin-answer": f"your check-in answer to question {rec.get('question')}",
+                 "message": f"your message {rec.get('subject')!r}",
+                 "message-comment": f"a comment on your message {rec.get('subject')!r}"}.get(rec.get("surface"), rec.get("surface"))
+        what = f"Basecamp boost from the captain on {where} (recording {rec.get('recording')})"
+        handle = "an answer to what was boosted, like a comment: act on it" + (
+            f", then sync.py todo complete --todo {rec.get('key')} if it settles the decision" if rec.get("surface") in ("todo", "todo-comment") else "")
+        url = rec.get("url")
+    elif kind == "checkin":
+        rid = f"{rec.get('question')}-{rec.get('date')}"
+        what = f"Basecamp check-in due {rec.get('date')}"
+        text = text or str(rec.get("title") or "")
+        handle, url = f"answer once today: sync.py answer --question {rec.get('question')}", rec.get("url")
+    else:
+        rid = hashlib.sha256(json.dumps(rec, sort_keys=True).encode()).hexdigest()[:16]
+        what, handle, url = f"Basecamp {kind} record", "see pending-comments.jsonl", rec.get("url")
+    request_id = re.sub(r"[^A-Za-z0-9._:-]", "-", f"basecamp-{kind}-{rid}")[:128]
+    body = "\n".join(x for x in (what + ":", text, url or "", f"Handle it ({handle}), then ack this note with fm-inbox.sh drain --ack <note id>.") if x)
+    return request_id, body
 
 
 def configure(t, cfg, prereleases=False):

@@ -7,7 +7,7 @@ from contextlib import redirect_stdout
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_sync import ACTING, CAPTAIN, Base, Stub, item  # noqa: E402
+from test_sync import ACTING, CAPTAIN, Base, Stub, item, line  # noqa: E402
 import sync  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,8 +19,21 @@ class TodoStub(Stub):
     def __init__(self):
         super().__init__()
         self.inputs, self.todo_records, self.fail_create = [], {}, False
+        self.notes, self.note_ids, self.inbox_exit = [], {}, 0  # fm-inbox.sh notes (request id, body, FM_HOME)
 
     def __call__(self, cmd, **kw):
+        if cmd[0].endswith("/bin/fm-inbox.sh"):
+            if isinstance(self.inbox_exit, Exception):
+                raise self.inbox_exit
+            assert cmd[1:3] == ["note", "--request-id"] and cmd[4:] == ["--json", "-"], cmd
+            rid = cmd[3]
+            if self.inbox_exit:
+                return SimpleNamespace(stdout="", stderr="not woken", returncode=self.inbox_exit)
+            outcome = "replay" if rid in self.note_ids else "created"
+            if outcome == "created":
+                self.note_ids[rid] = len(self.note_ids) + 1
+                self.notes.append((rid, kw["input"], kw["env"]["FM_HOME"], cmd[0]))
+            return SimpleNamespace(stdout=json.dumps({"outcome": outcome, "note_id": self.note_ids[rid]}), stderr="", returncode=0)
         if cmd[0] == "basecamp":
             args = cmd[3:-3]
             core = args[2:] if args[:1] == ["-P"] else args
@@ -294,7 +307,239 @@ class Cli(ToolBase):
         self.assertEqual(code, 0)
         on = {ln.split()[0]: ln.split()[1] for ln in out.splitlines()}
         self.assertEqual(on, {"card-mirror": "on", "chat-inbox": "off", "chat-asks": "off", "release-announcements": "off",
-                              "checkin-answering": "off", "decision-todos": "on", "reports": "on"})
+                              "checkin-answering": "off", "decision-todos": "on", "reports": "on",
+                              "inbox-delivery": "off"})
+
+
+def boost(id, who=CAPTAIN, content="a"):
+    return {"id": id, "booster": {"id": who}, "content": content, "created_at": "tb"}
+
+
+class TodoBoosts(ToolBase):
+    def setUp(self):
+        super().setUp()
+        self.tid = self.create()
+        self.c = str(self.tid)
+
+    def boost_reads(self):
+        return [c[2].split("/")[4] for c in self.stub.calls if c[:2] == ["api", "get"] and c[2].endswith("/boosts.json")]
+
+    def test_owner_boost_on_the_todo_recorded_once(self):
+        self.stub.boosts[self.c] = [boost(70, content="<div>yes</div>"), boost(71, who=ACTING)]
+        self.poll()
+        self.poll()
+        [rec] = self.pending()
+        self.assertEqual(rec, {"kind": "boost", "surface": "todo", "key": "ta-x", "todo": self.tid, "boost": 70,
+                               "recording": self.tid, "text": "yes", "url": f"https://x/todos/{self.tid}", "at": "tb"})
+        self.assertEqual(self.todos()["ta-x"]["boost_seen"], [70])
+
+    def test_owner_boost_on_the_agents_own_comment_is_an_answer(self):
+        mine = dict(comment(5, who=ACTING, content="<p>Ready again</p>"), boosts_count=1)
+        self.stub.comments[self.c] = [mine]
+        self.stub.boosts["5"] = [boost(80)]
+        self.poll()
+        self.assertEqual([(r["kind"], r["surface"], r["boost"], r["recording"], r["text"], r["url"]) for r in self.pending()],
+                         [("boost", "todo-comment", 80, 5, "a", "https://x/todos/c5")])
+        reads = len(self.boost_reads())
+        self.poll()  # unchanged boosts_count: the comment's boosts are not read again
+        self.assertEqual(self.boost_reads()[reads:], [self.c])
+        mine["boosts_count"] = 2
+        self.stub.boosts["5"].append(boost(81, content="b"))
+        self.poll()
+        self.assertEqual([r["boost"] for r in self.pending()], [80, 81])
+
+    def test_dry_run_records_no_boost(self):
+        self.stub.boosts[self.c] = [boost(70)]
+        self.poll(dry=True)
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(self.todos()["ta-x"]["boost_seen"], [])
+
+    def test_track_skips_existing_boosts(self):
+        self.stub.comments["42"] = [dict(comment(3), boosts_count=1)]
+        self.stub.boosts.update({"42": [boost(90)], "3": [boost(91)]})
+        self.sync().todo_track("old", 42)
+        self.poll()
+        self.assertEqual([r for r in self.pending() if r["key"] == "old"], [])
+        self.stub.boosts["42"].append(boost(92))
+        self.poll()
+        self.assertEqual([r["boost"] for r in self.pending() if r["key"] == "old"], [92])
+
+
+class Inbox(ToolBase):
+    def setUp(self):
+        super().setUp()
+        self.cfg(chats=[77], checkins={"questionnaires": [55], "timezone": "UTC"})
+        self.stub.lines = {"77": [line(1)]}
+        self.stub.questions = []
+        self.poll()  # cursor set; inbox still off
+        self.stub.lines["77"].append(line(2))
+        self.poll()  # one record from before the inbox was turned on
+        self.cfg(inbox={})
+
+    def test_new_records_become_notes_once(self):
+        self.poll()
+        self.assertEqual(self.stub.notes, [])  # the record from before is not delivered
+        tid = self.create()
+        self.stub.lines["77"].append(line(3, content="ship it?"))
+        self.stub.comments[str(tid)] = [comment(9, content="<p>Merge it</p>")]
+        self.stub.boosts[str(tid)] = [boost(70)]
+        self.poll()
+        self.poll()
+        self.assertEqual([n[0] for n in self.stub.notes],
+                         ["basecamp-chat-question-3", "basecamp-todo-comment-9", "basecamp-boost-70"])
+        rid, body, fm_home, cmd = self.stub.notes[1]
+        self.assertEqual((fm_home, cmd), (self.home, os.path.join(self.home, "bin", "fm-inbox.sh")))
+        self.assertEqual(body.splitlines()[:3], ["Basecamp comment from the captain on decision to-do ta-x:",
+                                                 "Merge it", "https://x/todos/c9"])
+        self.assertIn("drain --ack", body)
+        self.assertEqual(json.load(open(os.path.join(self.cfgdir, "inbox.json")))["cursor"], len(self.pending()))
+
+    def test_failed_note_logged_once_and_retried_in_order(self):
+        self.poll()
+        self.stub.lines["77"] += [line(3), line(4)]
+        self.stub.inbox_exit = 3
+        self.poll()
+        self.poll()
+        log = open(os.path.join(self.cfgdir, "sync.log")).read()
+        self.assertEqual(log.count("FAILED inbox note basecamp-chat-question-3"), 1)
+        self.assertIn("still failing", log)
+        self.assertEqual(self.stub.notes, [])
+        self.stub.inbox_exit = FileNotFoundError("fm-inbox.sh")
+        self.poll()  # a missing fm-inbox.sh never fails the run
+        self.stub.inbox_exit = 0
+        self.poll()
+        self.assertEqual([n[0] for n in self.stub.notes], ["basecamp-chat-question-3", "basecamp-chat-question-4"])
+        self.assertEqual(json.load(open(os.path.join(self.cfgdir, "inbox.json")))["failing"], [])
+
+    def test_replay_is_not_a_new_note(self):
+        self.poll()
+        self.stub.lines["77"].append(line(3))
+        self.poll()
+        os.remove(os.path.join(self.cfgdir, "inbox.json"))
+        state = {"cursor": 0, "failing": []}
+        json.dump(state, open(os.path.join(self.cfgdir, "inbox.json"), "w"))
+        self.poll()  # every record again: the earlier one is created, the delivered one replays
+        self.assertEqual([n[0] for n in self.stub.notes], ["basecamp-chat-question-3", "basecamp-chat-question-2"])
+
+    def test_other_home_dry_run_and_off(self):
+        self.cfg(inbox={"fm_home": os.path.join(self.tmp, "main")})
+        self.poll(dry=True)
+        self.stub.lines["77"].append(line(3))
+        self.poll(dry=True)
+        self.assertEqual(self.stub.notes, [])
+        self.assertFalse(os.path.exists(os.path.join(self.cfgdir, "inbox.json")))
+        self.poll()
+        self.stub.lines["77"].append(line(4))
+        self.poll()
+        self.assertEqual([(n[0], n[2]) for n in self.stub.notes],
+                         [("basecamp-chat-question-3", os.path.join(self.tmp, "main")),
+                          ("basecamp-chat-question-4", os.path.join(self.tmp, "main"))])
+
+    def test_note_for_every_kind(self):
+        recs = [{"task": "t", "card": 5, "comment": 9, "text": "ok"}, {"kind": "question", "task": "t", "card": 5, "comment": 10, "text": "why?"},
+                {"kind": "approval", "task": "t", "card": 5, "boost": 11, "url": "u"},
+                {"kind": "chat-question", "chat": 1, "line": 12, "text": "hi", "url": "u"},
+                {"kind": "checkin", "question": 13, "date": "2026-10-02", "title": "Open issues?", "url": "u"},
+                {"kind": "todo-comment", "key": "k", "comment": 14, "text": "x", "url": "u"},
+                {"kind": "boost", "surface": "todo-comment", "key": "k", "boost": 15, "recording": 3, "text": "a", "url": "u"}]
+        ids = [sync.behaviors.inbox_note(r, "1", "2")[0] for r in recs]
+        self.assertEqual(ids, ["basecamp-comment-9", "basecamp-question-10", "basecamp-approval-11", "basecamp-chat-question-12",
+                               "basecamp-checkin-13-2026-10-02", "basecamp-todo-comment-14", "basecamp-boost-15"])
+        _, body = sync.behaviors.inbox_note(recs[1], "1", "2")
+        self.assertIn("https://app.basecamp.com/1/buckets/2/card_tables/cards/5", body)
+        self.assertIn("sync.py reply --recording 10", body)
+        self.assertIn("Open issues?", sync.behaviors.inbox_note(recs[4], "1", "2")[1])
+        self.assertIn("a comment on decision to-do k", sync.behaviors.inbox_note(recs[6], "1", "2")[1])
+
+
+class Boosts(ToolBase):
+    """Owner boosts on every monitored surface, each recorded once with its text, recording and surface."""
+
+    def boosts(self):
+        return [(r["surface"], r["recording"], r["boost"], r["text"]) for r in self.pending() if r["kind"] == "boost"]
+
+    def test_chat_lines_including_the_agents_own(self):
+        self.cfg(chats=[77])
+        self.stub.lines = {"77": [line(1)]}
+        self.poll()  # seeds the cursor and boost counts
+        mine = dict(line(2, who=ACTING, content="Done, see the PR."), boosts_count=1)
+        self.stub.lines["77"].append(mine)
+        self.stub.boosts["2"] = [boost(60, content="thanks"), boost(61, who=ACTING)]
+        self.poll()
+        self.poll()
+        self.assertEqual(self.boosts(), [("chat", 2, 60, "thanks")])
+        self.assertEqual(self.pending()[-1]["chat"], 77)
+
+    def test_history_is_seeded_not_replayed(self):
+        self.cfg(chats=[77])
+        self.stub.lines = {"77": [line(1)]}
+        self.poll()
+        self.stub.lines["77"][0]["boosts_count"] = 1
+        self.stub.boosts["1"] = [boost(60)]
+        chats = os.path.join(self.cfgdir, "chats.json")
+        state = json.load(open(chats))
+        state["77"].pop("boost_counts")  # chats.json from before boosts were read
+        json.dump(state, open(chats, "w"))
+        self.poll()
+        self.assertEqual(self.boosts(), [])
+        self.stub.lines["77"][0]["boosts_count"] = 2
+        self.stub.boosts["1"].append(boost(62, content="more"))
+        self.poll()
+        self.assertEqual([b[2] for b in self.boosts()], [60, 62])  # a seeded count cannot tell old boosts apart
+
+    def test_card_boosts_keep_approval_and_carry_text(self):
+        self.sync().main([item("a", hold="q", hold_kind="captain")])  # seeds the card
+        self.stub.boosts["501"] = [boost(7, content="👍"), boost(8, content="later please")]
+        self.stub.comments = {"501": [dict(comment(9, who=ACTING, content="my reply"), boosts_count=1)]}
+        self.stub.boosts["9"] = [boost(10, content="ok")]
+        self.sync().main([item("a", hold="q", hold_kind="captain")])
+        self.sync().main([item("a", hold="q", hold_kind="captain")])
+        approvals = [(r["boost"], r["text"]) for r in self.pending() if r["kind"] == "approval"]
+        self.assertEqual(approvals, [(7, "👍")])
+        self.assertEqual(sorted(self.boosts()), [("card", 501, 8, "later please"), ("card-comment", 9, 10, "ok")])
+
+    def test_checkin_answers_the_agent_posted(self):
+        self.cfg(checkins={"questionnaires": [55], "timezone": "UTC"})
+        now = sync.datetime(2026, 10, 2, 9, 30, tzinfo=sync.timezone.utc)
+        q = {"id": 1, "title": "Run /stow and report", "answers_count": 2, "paused": True}
+        self.stub.questions = [q]
+        self.stub.answers["1"] = [{"id": 30, "creator": {"id": ACTING}, "group_on": "2026-10-01", "boosts_count": 0},
+                                  {"id": 31, "creator": {"id": CAPTAIN}, "group_on": "2026-10-01", "boosts_count": 1},
+                                  {"id": 32, "creator": {"id": ACTING}, "group_on": "2026-09-01", "boosts_count": 1}]
+
+        def run():
+            s = self.sync()
+            s.today = lambda: now
+            s.main([])
+        run()  # seeds
+        self.stub.answers["1"][0]["boosts_count"] = 1
+        self.stub.boosts.update({"30": [boost(40, content="good")], "31": [boost(41)], "32": [boost(42)]})
+        run()
+        run()
+        self.assertEqual(self.boosts(), [("checkin-answer", 30, 40, "good")])
+        self.assertEqual(self.pending()[-1]["question"], 1)
+
+    def test_messages_the_agent_posted_and_their_comments(self):
+        recent = sync.datetime.now(sync.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        msgs = [{"id": 20, "creator": {"id": ACTING}, "subject": "Report", "created_at": recent, "boosts_count": 0,
+                 "comments_count": 1, "app_url": "https://x/m/20"},
+                {"id": 21, "creator": {"id": CAPTAIN}, "subject": "His", "created_at": recent, "boosts_count": 1},
+                {"id": 22, "creator": {"id": ACTING}, "subject": "Old", "created_at": "2020-01-01T00:00:00Z", "boosts_count": 1}]
+        self.stub.boosts["99"] = msgs  # the stub answers the board's messages read from its boosts table
+        self.stub.comments["20"] = [dict(comment(25), boosts_count=0)]
+        self.poll()  # seeds
+        msgs[0]["boosts_count"] = 1
+        self.stub.comments["20"][0]["boosts_count"] = 1
+        self.stub.boosts.update({"20": [boost(50, content="agree")], "25": [boost(51)], "21": [boost(52)], "22": [boost(53)]})
+        self.poll()
+        self.poll()
+        self.assertEqual(self.boosts(), [("message", 20, 50, "agree"), ("message-comment", 25, 51, "a")])
+        self.assertEqual(self.pending()[0]["subject"], "Report")
+
+    def test_owner_profile_reads_no_agent_posts(self):
+        self.stub.me = CAPTAIN
+        self.poll()
+        self.assertFalse([c for c in self.stub.calls if "/message_boards/" in " ".join(c)])
 
 
 class Layers(unittest.TestCase):
