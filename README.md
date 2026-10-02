@@ -1,22 +1,58 @@
 # firstmate-basecamp-sync
 
-A set of independent, opt-in tools that connect an agent home to one Basecamp
-project through the `basecamp` CLI. No model calls. Each tool runs only when its config
-keys are present; a home picks just the pieces it needs:
+Connects an agent home to one Basecamp project through the `basecamp` CLI, in two
+layers. No model calls.
 
-| Tool | Config keys | What it does |
+## Two layers: tools and behaviors
+
+**Tools** ([`tools.py`](tools.py)) are small, explicit, single-purpose operations with no
+policy. Each does one thing to the configured account and project:
+
+| Tool | Kind | What it does |
 | --- | --- | --- |
-| Card mirror | `tables`, `repos` (off with `"cards": false`) | mirrors the backlog onto card tables; relays the owner's card comments and 👍 approvals |
-| Chat relay | `chats` | records the owner's chat questions (or every line) for the agent |
-| Chat asks | `ask_chat` | `sync.py ask` posts a question to the owner in chat |
-| Check-ins | `checkins` | records due check-in questions; `sync.py answer` answers them |
-| Release announcements | `releases` | posts a Message Board message per new GitHub release |
-| Replies | (any of the above) | `sync.py reply` answers a recorded card or chat question |
+| card comment and 👍 readers | reader | record the captain's new card comments (`comment`, `question`) and their 👍 on an assigned card (`approval`) |
+| chat reader | reader | records the captain's chat lines (questions and mentions, or every line) as `chat-question` |
+| check-in reader | reader | records each check-in question due today as `checkin` |
+| to-do comment reader | reader | records the owner's new comments on tracked open to-dos as `todo-comment` |
+| `sync.py reply` | command | answers a recorded comment, chat line or to-do comment where it was made, then removes the 👀 |
+| `sync.py ask` | command | posts a new chat line @mentioning the owner |
+| `sync.py answer` | command | answers a check-in question, once per question per day |
+| `sync.py todo create` | command | creates a to-do assigned to the owner, with a description, and tracks it under a key |
+| `sync.py todo track` | command | tracks an existing to-do under a key, without relaying its old comments |
+| `sync.py todo comment` | command | comments on a tracked to-do |
+| `sync.py todo complete` | command | completes a tracked to-do |
+| `sync.py post-message` | command | posts a message (subject and body) on the configured message board |
+| card, Message Board and boost primitives | primitive | create, update, move, assign and unassign a card; post a board message; add an acknowledgement boost |
 
-Every tool shares `account`, `project`, `captain` (the owner's person id) and the optional
+A reader polls and appends what it finds to `pending-comments.jsonl`, once each, keeping a
+cursor or seen-list beside the config; it never acts on what it reads. A command posts
+exactly what the agent hands it, and only when the agent runs it.
+
+**Behaviors** ([`behaviors.py`](behaviors.py)) are opt-in workflows a home turns on in its
+config, each composed from tools. A behavior whose keys are absent makes no calls at all.
+Some have a timer step (run every 5 minutes by `run.sh`); the others are carried out by
+the agent with the commands. The agent's side of each is in
+[`prompts/base.md`](prompts/base.md).
+
+| Behavior | Config keys | `init` flag | Timer step | Agent side |
+| --- | --- | --- | --- | --- |
+| `card-mirror` | `tables`, `repos` (off with `"cards": false`) | default (`--no-cards` to leave off) | mirror the backlog; card comment and 👍 readers | relay comments and approvals; `reply` |
+| `chat-inbox` | `chats` | default; `--every-line` | chat reader | `reply` to each line |
+| `chat-asks` | `ask_chat` | by hand | none | `ask` |
+| `release-announcements` | `releases` | default, when the dock has one message board | post one message per new GitHub release | none |
+| `checkin-answering` | `checkins` | `--checkins <time zone>` | check-in reader | `answer` |
+| `decision-todos` | `todos` | `--todos` | to-do comment reader | `todo create`, `reply`/`todo comment`, `todo complete` |
+| `reports` | `message_board` | `--reports` | none | `post-message` |
+
+The boundary: behaviors never run a CLI themselves (every Basecamp, GitHub, backlog or
+Lavish call goes through a tool), and tools never decide whether to run or what to do
+with what they read. `sync.py behaviors --home <home> --config <config.json>` lists which
+behaviors a config turns on.
+
+Every piece shares `account`, `project`, `captain` (the owner's person id) and the optional
 `profile`. A config without `tables` (or with `"cards": false`) never reads the backlog,
-never calls a card or card-table endpoint, and never writes `map.json`; the other tools
-run the same either way. Set such a home up with `sync.py init --no-cards`.
+never calls a card or card-table endpoint, and never writes `map.json`; the other
+behaviors run the same either way. Set such a home up with `sync.py init --no-cards`.
 
 ## Card mirror
 
@@ -49,7 +85,8 @@ Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between
 
 ## Safety bounds
 
-- Only the configured account, project and card tables are touched.
+- Only the configured account, project, card tables, chats, check-ins, to-do set and
+  message board are touched.
 - Cards are never deleted, trashed or archived. Cards whose task left the backlog are
   left as they are (the run logs how many).
 - The sync never posts to chat or as a comment. Its one automatic post is a release
@@ -57,7 +94,8 @@ Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between
   posts is the explicit `sync.py reply` command below, run by the relaying agent to
   answer a captain question where it was asked: a comment on the card, or a line in the chat.
   Two more explicit commands post, both opt-in: `sync.py ask` (a new chat line for the
-  owner) and `sync.py answer` (a check-in answer). The sync run never calls either.
+  owner) and `sync.py answer` (a check-in answer). The sync run never calls either, nor
+  the to-do commands or `sync.py post-message` (below).
 - Release announcements: for each GitHub repo in the optional `releases` config, each run
   lists recent releases (`gh release list`, then `gh release view --json` for the notes)
   and posts one Message Board message per new one as the acting user, with the subject
@@ -100,6 +138,30 @@ Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between
   does, through `basecamp checkins answer create <id> <content> --date <today>`, at most
   once per question per day (checked in `checkins.json` and in the question's answers),
   and under the same refusal rules as `ask`.
+- Decision to-dos: with `todos` set,
+  `sync.py todo create --home <home> --config <config.json> --key <key> --title <text> --body-file <file>`
+  creates a to-do assigned to the owner, loose on the configured to-do set
+  (`"todos": {"todoset": <id>}`, or the project's only one with `"todos": {}`), or in a
+  to-do list (`--list <id>`, or `"todos": {"list": <id>}`), with an optional `--due`. The
+  body file is the description in Markdown, rendered by the CLI (bare URLs become links).
+  The to-do is tracked in `todos.json` under the key; a key already tracked is refused, so
+  a re-run never creates a duplicate. Each run reads the comments of every tracked to-do
+  that is not completed and records each owner comment newer than that to-do's cursor as
+  a `todo-comment`, once, with the same acknowledgement as a card comment (👀 when it
+  contains `?`, 👍 otherwise); other people's comments, the acting user's included, only
+  move the cursor. `sync.py reply --recording <comment id>` answers one with a comment on
+  the to-do (Markdown) and removes the 👀; `sync.py todo comment --todo <key or id>
+  --body-file <file>` posts any other comment; `sync.py todo complete --todo <key or id>`
+  completes it, after which its comments are no longer read. `sync.py todo track --key
+  <key> --todo <id>` adopts a to-do made some other way: its existing comments are skipped
+  and only later ones are recorded. Only tracked to-dos can be commented on or completed;
+  to-dos are never deleted, trashed or archived. All of these post nothing with no
+  profile or a profile signed in as the owner, and `--dry-run` only logs.
+- Reports: with `message_board` set,
+  `sync.py post-message --home <home> --config <config.json> --subject <text> --body-file <file>`
+  posts one message on that board (Markdown body, rendered by the CLI) as the acting user,
+  under the same refusal rules as `reply`. Each run of the command posts a new message;
+  messages are never edited or deleted.
 - Acknowledgement boost: when the run records a new captain comment or approval, the
   acting user boosts it once (the comment itself, or the card for an approval). A comment
   whose text contains `?` is recorded with `"kind": "question"` and gets 👀 ("looking into
@@ -169,6 +231,14 @@ Without `--dry-run` it then:
 - writes `<home>/state/basecamp-sync.check.sh` and registers it with the home's own
   `bin/fm-check-register.sh`, so the home wakes on new pending records and failed runs.
 
+Four opt-in flags turn on more behaviors from the project's dock, each refusing when the
+dock lacks what it needs: `--todos` (`todos` with the one enabled to-do set),
+`--reports` (`message_board`, the one enabled message board), `--every-line` (every
+discovered chat as `{"chat": <id>, "every_line": true}`) and `--checkins <IANA time zone>`
+(`checkins` with the one enabled Automatic Check-ins questionnaire). Without them the
+config is the same as before they existed, so re-running `init` on an older home changes
+nothing. `--no-releases` leaves `releases` out.
+
 `--no-cards` sets a home up without the card mirror: it reads no card tables (the project
 need not have any), writes a config without `tables` or `repos`, creates only
 `pending-comments.jsonl`, and takes every registered repo with a GitHub origin as a
@@ -179,11 +249,17 @@ up as usual.
 Re-running with the same inputs changes nothing. `--dry-run` prints the discovered config
 and what it would write, install or refuse, and writes nothing.
 
-### The agent skill
+### The base prompt and the agent skill
+
+[`prompts/base.md`](prompts/base.md) is a base prompt that, given a fresh firstmate home,
+this checkout and a Basecamp project URL, sets the home up and re-establishes every
+behavior: which to turn on, how to handle each pending record, the decision to-do
+lifecycle, chat replies, check-in answers, reports and the safety bounds. Hand it to the
+agent once, with `SYNC`, `HOME` and the project URL filled in.
 
 [`skills/basecamp-sync/SKILL.md`](skills/basecamp-sync/SKILL.md) is the operating contract
-a firstmate or second mate follows in a home that uses the sync. Install it once for Claude,
-Codex and Pi from this checkout:
+a firstmate or second mate follows in a home that uses the sync, and points to the base
+prompt. Install it once for Claude, Codex and Pi from this checkout:
 
 ```sh
 for d in ~/.claude/skills ~/.codex/skills ~/.pi/agent/skills; do mkdir -p "$d" && ln -sfn "$PWD/skills/basecamp-sync" "$d/basecamp-sync"; done
@@ -201,6 +277,10 @@ or by hand from
   including `run.sh`'s token refresh. Absent means the CLI's default login. It changes
   only who acts; `captain` stays the assignee and the only person whose comments and 👍
   are relayed, so the acting user's own comments and boosts are ignored.
+- `todos` (optional): `{}`, `{"todoset": "<to-do set id>"}` or `{"list": "<to-do list id>"}`:
+  where `sync.py todo create` puts the owner's to-dos (loose on the set, or in the list);
+  turns on the to-do comment reader.
+- `message_board` (optional): the message board id `sync.py post-message` posts on.
 - `chats` (optional): chat (Campfire) ids whose captain questions are relayed.
   An entry may be `{"chat": <id>, "every_line": true}` to relay every owner line in that chat.
 - `ask_chat` (optional): the chat id `sync.py ask` posts in.
@@ -225,6 +305,7 @@ Everything else lives beside the config, never in this repo:
 | `releases.json` | the script | GitHub repo -> when the watch started (`since`), the tags seeded then, and the tags announced (tag -> message id) |
 | `chats.json` | the script | chat id -> line cursor, captured question lines, acknowledgement boosts queued and done, questions replied to |
 | `checkins.json` | the script | check-in question id -> dates recorded as due (`recorded`) and dates answered (`answered`) |
+| `todos.json` | the script | to-do key -> to-do id, title, URL, created and completed times, comment cursor, owner comments recorded, acknowledgement boosts queued and done, comments replied to |
 | `sync.log` | the script | one line per action, plus a counts line per run |
 | `pending-comments.jsonl` | the script | captain comments and approvals waiting to be relayed, one JSON record per line (see below) |
 | `extra-repos.json` | hand | `{"task": ["board", ...]}`: extra boards for a task |
@@ -316,7 +397,9 @@ systemctl --user enable --now basecamp-sync.timer
 python3 -m unittest discover -s tests -v
 ```
 
-The `basecamp`, `gh` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
+`tests/test_sync.py` covers the existing behaviors and is unchanged by the layer split;
+`tests/test_tools.py` covers the to-do and message tools, the to-do comment reader, the
+new commands and the layer boundary. The `basecamp`, `gh` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
 registration sit behind a fake; tests make no network calls and touch no real home.
 
 ## Pending records
@@ -331,6 +414,9 @@ before `kind` existed have none; treat a missing `kind` as `"comment"`.
   `url`, `at`. A check-in question came due today; answer it with `sync.py answer`.
 - `approval`: `task`, `repo`, `card`, `url` (card URL), `boost` (id), `at`. The captain
   gave the card a 👍: approve every recommendation on it as recommended.
+- `todo-comment`: `key`, `todo` (id), `comment` (id), `question` (true when it contains
+  `?`), `url` (the comment), `text`, `at`. The owner commented on a tracked to-do; answer
+  with `sync.py reply --recording <comment>`.
 
 ## License
 

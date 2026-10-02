@@ -295,6 +295,38 @@ class InitTest(unittest.TestCase):
         with self.assertRaises(init_home.Refuse):
             self.init(cards=False, repo_map=[], create_missing=True)
 
+    def add_dock(self):
+        self.stub.project["dock"] += [{"name": "todoset", "id": 66, "title": "Decisions", "enabled": True},
+                                      {"name": "questionnaire", "id": 55, "title": "Automatic Check-ins", "enabled": True},
+                                      {"name": "todoset", "id": 67, "title": "Off", "enabled": False}]
+
+    def test_behavior_flags_are_off_by_default(self):
+        self.add_dock()
+        cfg, _ = self.init().discover()
+        self.assertEqual(cfg, EXPECTED)
+
+    def test_behavior_flags_add_their_keys(self):
+        self.add_dock()
+        cfg, _ = self.init(todos=True, reports=True, every_line=True, checkins="America/Chicago").discover()
+        self.assertEqual(cfg, EXPECTED | {"chats": [{"chat": 700, "every_line": True}], "message_board": "9",
+                                          "todos": {"todoset": "66"},
+                                          "checkins": {"questionnaires": ["55"], "timezone": "America/Chicago"}})
+
+    def test_no_releases_reads_no_origins(self):
+        self.stub.origins = {"Engine": "https://github.com/acme/engine.git"}
+        cfg, _ = self.init(cards=False, repo_map=[], releases=False).discover()
+        self.assertNotIn("releases", cfg)
+
+    def test_behavior_flags_refuse_a_missing_or_doubled_dock_tool(self):
+        self.stub.project["dock"] = [d for d in self.stub.project["dock"] if d["name"] not in ("chat", "message_board")]
+        with self.assertRaises(init_home.Refuse) as e:
+            self.init(todos=True, reports=True, every_line=True, checkins="UTC").discover()
+        for flag in ("--todos needs one enabled todoset", "--reports needs one enabled message_board",
+                     "--every-line needs an enabled chat", "--checkins needs one enabled questionnaire"):
+            self.assertIn(flag, str(e.exception))
+        with self.assertRaises(init_home.Refuse):
+            self.init(checkins="Mars/Olympus")
+
     def test_dry_run_writes_nothing(self):
         plan = self.init(dry=True).main()
         self.assertFalse(os.path.exists(self.dir))

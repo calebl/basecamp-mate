@@ -20,12 +20,19 @@ and the planned installs and writes nothing, locally or in Basecamp.
 With --no-cards no card table is read and the config has no "tables" or "repos"; every
 registered repo with a GitHub origin becomes a release source.
 
+Four opt-in flags turn on more behaviors from the dock, each refusing when the dock
+has none or several of what it needs: --todos (decision to-dos on the one to-do set),
+--reports (posting to the one message board), --every-line (relay every owner line
+in the chats) and --checkins <time zone> (the one Automatic Check-ins questionnaire).
+--no-releases leaves release announcements out.
+
 The only Basecamp write is creating a missing regular column, and only with
 --create-missing-columns.
 """
 import argparse, hashlib, json, os, re, subprocess, sys
+from zoneinfo import ZoneInfo
 
-from sync import COLUMNS
+from behaviors import COLUMNS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CREATABLE = ("Figuring it out", "In progress", "Ready for QA")  # Triage, Not now and Done are built in
@@ -160,7 +167,8 @@ class System:
 
 class Init:
     def __init__(self, url, login, home, captain=None, repo_map=(), create_missing=False, dry=False,
-                 force=False, cards=True, runner=subprocess.run, system=None, sync_dir=HERE, out=print):
+                 force=False, cards=True, todos=False, reports=False, every_line=False, checkins=None, releases=True,
+                 runner=subprocess.run, system=None, sync_dir=HERE, out=print):
         self.account, self.project = parse_url(url)
         self.login, self.home = login, os.path.abspath(home)
         self.captain_arg = captain
@@ -173,6 +181,13 @@ class Init:
         self.create_missing, self.dry, self.force, self.cards = create_missing, dry, force, cards
         if not cards and (self.repo_map or create_missing):
             raise Refuse("--no-cards cannot be combined with --repo-map or --create-missing-columns")
+        self.todos, self.reports, self.every_line, self.checkins = todos, reports, every_line, checkins
+        self.releases = releases
+        if checkins is not None:
+            try:
+                ZoneInfo(checkins)
+            except Exception:
+                raise Refuse(f"--checkins takes an IANA time zone such as America/Chicago, got {checkins!r}")
         self.run = runner
         self.system = system or System()
         self.sync_dir = sync_dir
@@ -268,12 +283,31 @@ class Init:
             cfg.update(repos=dict(sorted(repos.items())), tables=cfg_tables)
         chats = [d["id"] for d in dock if d.get("name") == "chat"]
         if chats:
-            cfg["chats"] = chats
+            cfg["chats"] = [{"chat": c, "every_line": True} for c in chats] if self.every_line else chats
         boards = [d["id"] for d in dock if d.get("name") == "message_board"]
+        opted = ((self.every_line, "--every-line", "chat", None),
+                 (self.reports, "--reports", "message_board", "message_board"),
+                 (self.todos, "--todos", "todoset", "todos"),
+                 (self.checkins is not None, "--checkins", "questionnaire", "checkins"))
+        for wanted, flag, kind, key in opted:
+            if not wanted:
+                continue
+            ids = [str(d["id"]) for d in dock if d.get("name") == kind]
+            if not ids or (len(ids) > 1 and key is not None):
+                problems.append(f"{flag} needs {'an' if key is None else 'one'} enabled {kind} in the project's dock, "
+                                f"found {len(ids)}")
+            elif key == "message_board":
+                cfg[key] = ids[0]
+            elif key == "todos":
+                cfg[key] = {"todoset": ids[0]}
+            elif key == "checkins":
+                cfg[key] = {"questionnaires": ids, "timezone": self.checkins}
+        if problems:
+            raise Refuse("init refused, nothing was written:\n  - " + "\n  - ".join(problems))
         gh_repos = {}
         # Without cards, every registered repo is a release source, named after itself.
         sources = repos if self.cards else {r: r for r in registered}
-        for repo, board in sorted(sources.items()):
+        for repo, board in sorted(sources.items()) if self.releases else ():
             full = self.github_repo(repo)
             if full:
                 gh_repos[full] = board
@@ -418,13 +452,21 @@ def cli(argv, **kw):
                     help="create a missing Figuring it out, In progress or Ready for QA column")
     ap.add_argument("--no-cards", action="store_true",
                     help="set up without the card-table mirror: no card tables are read or written")
+    ap.add_argument("--todos", action="store_true",
+                    help="decision to-dos: create the owner's decisions on the dock's to-do set and relay the owner's comments")
+    ap.add_argument("--reports", action="store_true", help="let the agent post reports on the dock's message board")
+    ap.add_argument("--every-line", action="store_true", help="relay every owner line in the chats, not only questions")
+    ap.add_argument("--checkins", metavar="TIME_ZONE",
+                    help="record due Automatic Check-ins questions, scheduled in this IANA time zone")
+    ap.add_argument("--no-releases", action="store_true", help="leave release announcements out of the config")
     ap.add_argument("--force", action="store_true", help="replace an existing config.json that differs")
     ap.add_argument("--dry-run", action="store_true", help="print the discovered config and planned installs; write nothing")
     a = ap.parse_args(argv)
     try:
         Init(a.url, a.login, a.home, captain=a.captain, repo_map=a.repo_map,
              create_missing=a.create_missing_columns, dry=a.dry_run, force=a.force,
-             cards=not a.no_cards, **kw).main()
+             cards=not a.no_cards, todos=a.todos, reports=a.reports, every_line=a.every_line,
+             checkins=a.checkins, releases=not a.no_releases, **kw).main()
     except Refuse as e:
         print(e, file=sys.stderr)
         return 2

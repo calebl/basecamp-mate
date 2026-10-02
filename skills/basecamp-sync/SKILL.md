@@ -1,16 +1,26 @@
 ---
 name: basecamp-sync
-description: Operating contract for a firstmate or second mate whose home mirrors its backlog into a Basecamp project with firstmate-basecamp-sync. Use when told to "use this Basecamp project", when setting a home up with `sync.py init`, when the basecamp-sync wake check fires, when handling data/basecamp-sync/pending-comments.jsonl, or when editing figuring.json, not-now.json, decisions.json, boards.json, extra-repos.json or skip.json.
+description: Operating contract for a firstmate or second mate whose home mirrors its backlog into a Basecamp project with firstmate-basecamp-sync. Use when told to "use this Basecamp project", when setting a home up with `sync.py init`, when the basecamp-sync wake check fires, when handling data/basecamp-sync/pending-comments.jsonl, when putting a decision to the owner as a Basecamp to-do (`sync.py todo`), when posting a report to the Message Board (`sync.py post-message`), or when editing figuring.json, not-now.json, decisions.json, boards.json, extra-repos.json or skip.json.
 ---
 
 # Basecamp sync
 
-The sync runs every 5 minutes and does only what the config turns on: the card mirror
-(`tables`, `repos`; off with `"cards": false` or without `tables`), the chat relay
-(`chats`), chat asks (`ask_chat`), check-ins (`checkins`) and release announcements
-(`releases`). Sections below about cards and the side files apply only when the card
-mirror is on. Mechanics (column rules, file formats, record fields, safety bounds) are in the repo's
-README: `firstmate-basecamp-sync/README.md`. `SYNC` below means that checkout.
+The sync has two layers. Tools are single-purpose: readers that the 5-minute timer runs
+to append pending records, and commands you run to post (`reply`, `ask`, `answer`,
+`todo create|track|comment|complete`, `post-message`). Behaviors are the workflows the
+config turns on, each composed from tools: the card mirror (`tables`, `repos`; off with
+`"cards": false` or without `tables`), the chat inbox (`chats`), chat asks (`ask_chat`),
+check-in answering (`checkins`), release announcements (`releases`), decision to-dos
+(`todos`) and reports (`message_board`). `python3 $SYNC/sync.py behaviors --home <home>
+--config <config>` lists which are on. Sections below about cards and the side files apply
+only when the card mirror is on. Mechanics (column rules, file formats, record fields,
+safety bounds) are in the repo's README: `firstmate-basecamp-sync/README.md`. `SYNC` below
+means that checkout.
+
+`$SYNC/prompts/base.md` is the full policy for a home that runs everything through
+Basecamp (decision to-dos, every-line chat, check-in answers, reports): set-up flags,
+the decision to-do lifecycle, and how to handle each record. Follow it in such a home;
+this skill is the short form.
 
 ## Set up
 
@@ -25,7 +35,9 @@ guesses; fix what it names (usually `--repo-map <table>=<repo>` when a card tabl
 is not a registered project's name). A card table matching no registered project is
 skipped and printed, not refused; check the skipped list and pass `--repo-map` for any
 board that is really a repo's. When the owner wants only chat, check-ins or release
-announcements, or the project has no card tables, pass `--no-cards`. Never pass `--force` or `--create-missing-columns`
+announcements, or the project has no card tables, pass `--no-cards`. `--todos`,
+`--reports`, `--every-line` and `--checkins <time zone>` turn on decision to-dos,
+reports, every-line chat and check-in answering; `--no-releases` leaves announcements out. Never pass `--force` or `--create-missing-columns`
 without the main firstmate's go-ahead.
 
 ## The backlog is the source of truth
@@ -55,6 +67,19 @@ The card moves to Figuring it out and is assigned to the captain automatically. 
 answer is recorded and the hold released, the next run unassigns it. Remove the
 `decisions.json` entry then.
 
+## Decisions as to-dos
+
+With `todos` on, put each item waiting on the captain (a decision, approval, merge call,
+credential or login) to them as one to-do instead:
+`python3 $SYNC/sync.py todo create --home <home> --config <config> --key <stable key> --title "<plain question>" --body-file <file>`,
+with a Markdown description of the evidence, consequence, options, recommendation and the
+full URL of every PR. Their comment comes back as a `todo-comment` record. A decision: act
+on it (relaying first if this is not the main firstmate's home), then
+`sync.py todo complete --todo <key>`. Feedback that is not a decision: act on it and
+answer with `sync.py reply --recording <comment id>`; the to-do stays open. Complete a
+to-do settled another way (the captain merged the PR themselves). Adopt one made by hand with
+`sync.py todo track --key <key> --todo <id>`.
+
 ## Pending records
 
 The wake check fires when `pending-comments.jsonl` or a FAILED line in `sync.log` grows.
@@ -70,9 +95,15 @@ Handle each new record by its `kind` (missing `kind` = `comment`):
   like a comment.
   A `chat-question` from a chat set to `every_line` may be any line the owner wrote there;
   treat each as addressed to you.
+- `todo-comment`: the captain commented on a tracked to-do; see "Decisions as to-dos".
 - `checkin`: a check-in question came due today. Work out the answer within this home's
   scope and post it once with
   `python3 $SYNC/sync.py answer --home <home> --config <home>/data/basecamp-sync/config.json --question <question id> --body-file <file>`.
+  A question that is an instruction (e.g. "Run /stow and report") is carried out first,
+  and the answer reports what was done.
+- To post a report (only when `message_board` is set):
+  `python3 $SYNC/sync.py post-message --home <home> --config <config> --subject <text> --body-file <file>`
+  (Markdown); each run posts a new message.
 - To put a question or decision to the owner in chat (only when `ask_chat` is set), post
   one per line with
   `python3 $SYNC/sync.py ask --home <home> --config <home>/data/basecamp-sync/config.json --body-file <file>`;
@@ -84,7 +115,9 @@ The main firstmate's own home answers its questions itself rather than relaying.
 
 ## Never
 
-- Post, delete, archive or trash anything in Basecamp outside `sync.py`, `sync.py reply`, `sync.py ask` and `sync.py answer`.
+- Post, comment, complete, delete, archive or trash anything in Basecamp outside `sync.py`
+  and its commands (`reply`, `ask`, `answer`, `todo create|track|comment|complete`,
+  `post-message`), or hand-edit `todos.json`.
   The sync's one automatic post is a release announcement: releases only (GitHub releases
   of the repos in `releases`, never merges or PRs), Message Board only. Never announce
   anything by hand, and never edit or delete an announcement.
