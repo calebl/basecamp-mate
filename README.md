@@ -39,6 +39,8 @@ Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between
   announcement, and only on the Message Board (below). Otherwise the only thing that
   posts is the explicit `sync.py reply` command below, run by the relaying agent to
   answer a captain question where it was asked: a comment on the card, or a line in the chat.
+  Two more explicit commands post, both opt-in: `sync.py ask` (a new chat line for the
+  owner) and `sync.py answer` (a check-in answer). The sync run never calls either.
 - Release announcements: for each GitHub repo in the optional `releases` config, each run
   lists recent releases (`gh release list`, then `gh release view --json` for the notes)
   and posts one Message Board message per new one as the acting user, with the subject
@@ -60,7 +62,27 @@ Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between
   once, and gets the acting user's 👀. Lines from anyone else, the acting user included,
   are never captured. `sync.py reply --recording <line id>` answers it with a new line in
   that chat as the acting user and then removes the 👀, under the same `--again` and
-  failure rules as a card reply.
+  failure rules as a card reply. A chat configured as `{"chat": <id>, "every_line": true}`
+  relays every line the owner posts there, not only mention or `?` lines; each goes
+  through the same record, cursor and 👀 rules.
+- Asking the owner: with `ask_chat` set,
+  `sync.py ask --home <home> --config <config.json> --body-file <file>` posts the file's
+  plain text (rendered like a reply) as a new line in that chat as the acting user,
+  starting with an @mention of the owner (their person record's `attachable_sgid`, read
+  from `/people/<id>.json`). Post one question or decision per line. With no profile, or a
+  profile signed in as the owner, it posts nothing; `--dry-run` logs only. The owner's
+  answer comes back through the chat relay when the chat is also in `chats`.
+- Check-ins: with `checkins` set, each run lists the questions of every configured
+  questionnaire and records each one that is due today as a `checkin` in
+  `pending-comments.jsonl`, once per question per day. A question is due when it is not
+  paused, today's weekday is in its schedule `days` (Basecamp numbering, 0 = Sunday), its
+  `start_date` has been reached (and any `end_date` not passed), and its `hour`:`minute`
+  has passed in the configured `timezone` (the machine's local time when unset). One the
+  acting user already answered today is not recorded. The run never answers;
+  `sync.py answer --home <home> --config <config.json> --question <id> --body-file <file>`
+  does, through `basecamp checkins answer create <id> <content> --date <today>`, at most
+  once per question per day (checked in `checkins.json` and in the question's answers),
+  and under the same refusal rules as `ask`.
 - Acknowledgement boost: when the run records a new captain comment or approval, the
   acting user boosts it once (the comment itself, or the card for an approval). A comment
   whose text contains `?` is recorded with `"kind": "question"` and gets 👀 ("looking into
@@ -156,6 +178,11 @@ or by hand from
   only who acts; `captain` stays the assignee and the only person whose comments and 👍
   are relayed, so the acting user's own comments and boosts are ignored.
 - `chats` (optional): chat (Campfire) ids whose captain questions are relayed.
+  An entry may be `{"chat": <id>, "every_line": true}` to relay every owner line in that chat.
+- `ask_chat` (optional): the chat id `sync.py ask` posts in.
+- `checkins` (optional): `{"questionnaires": ["<questionnaire id>", ...], "timezone":
+  "<IANA zone, e.g. America/Chicago>"}`. Use the account's time zone so the schedule's
+  hour and minute match Basecamp's.
 - `releases` (optional): `{"board": "<message board id>", "repos": {"owner/name": "<name>"
   or {"name": "<name>", "note": "<text>"}}, "prereleases": false}`. The name is the
   subject's first word (capitalized; `init` uses the mapped board name) and the note is
@@ -171,6 +198,7 @@ Everything else lives beside the config, never in this repo:
 | `map.json` | the script | task/board -> card id, column, assignment, content digest, linked boards, seen comments and boosts, acknowledgement boosts queued and done, questions replied to |
 | `releases.json` | the script | GitHub repo -> when the watch started (`since`), the tags seeded then, and the tags announced (tag -> message id) |
 | `chats.json` | the script | chat id -> line cursor, captured question lines, acknowledgement boosts queued and done, questions replied to |
+| `checkins.json` | the script | check-in question id -> dates recorded as due (`recorded`) and dates answered (`answered`) |
 | `sync.log` | the script | one line per action, plus a counts line per run |
 | `pending-comments.jsonl` | the script | captain comments and approvals waiting to be relayed, one JSON record per line (see below) |
 | `extra-repos.json` | hand | `{"task": ["board", ...]}`: extra boards for a task |
@@ -273,6 +301,8 @@ before `kind` existed have none; treat a missing `kind` as `"comment"`.
 - `comment`: `task`, `repo`, `card`, `comment` (id), `at`, `text`.
 - `question`: the same fields as `comment`, for a comment containing `?`.
 - `chat-question`: `chat` (id), `line` (id), `url`, `text`, `at`.
+- `checkin`: `questionnaire`, `question` (ids), `date` (local, `YYYY-MM-DD`), `title`,
+  `url`, `at`. A check-in question came due today; answer it with `sync.py answer`.
 - `approval`: `task`, `repo`, `card`, `url` (card URL), `boost` (id), `at`. The captain
   gave the card a 👍: approve every recommendation on it as recommended.
 

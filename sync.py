@@ -10,7 +10,9 @@ view of it. Safety bounds, enforced here:
     approval, and its one automatic post: a Message Board announcement per new
     GitHub release of a repo in the optional "releases" config. Only the explicit
     `sync.py reply` command posts a comment (an answer to a captain question) and
-    removes the acting user's own 👀;
+    removes the acting user's own 👀. Two more explicit commands post, never the
+    sync run: `sync.py ask` (a new chat line @mentioning the owner) and
+    `sync.py answer` (a check-in answer, at most once per question per day);
   - the id map (map.json) makes re-runs update the same card instead of
     duplicating it.
 New comments the captain writes on cards, and his 👍 boost on a card assigned to
@@ -32,10 +34,13 @@ missing or fails, each card keeps the board links it last had.
 
 Usage: sync.py --home <firstmate home> --config <config.json> [--dry-run] [--include-prereleases]
        sync.py reply --home <home> --config <config.json> --recording <question comment id> --body-file <file> [--again] [--dry-run]
+       sync.py ask --home <home> --config <config.json> --body-file <file> [--dry-run]
+       sync.py answer --home <home> --config <config.json> --question <check-in question id> --body-file <file> [--dry-run]
        sync.py init <project URL> --login <profile> --home <home> [--captain <id or email>] [--repo-map TABLE=REPO] [--dry-run]
 """
 import argparse, csv, hashlib, html, json, os, re, subprocess, sys, time, tomllib
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 COLUMNS = ("Triage", "Not now", "Figuring it out", "In progress", "Ready for QA", "Done")
 SECTIONS = {"in_flight": "In flight", "queued": "Queued", "held": "Queued", "done": "Done"}
@@ -50,7 +55,17 @@ class Sync:
         self.account, self.project = str(cfg["account"]), str(cfg["project"])
         self.captain = int(cfg["captain"])
         self.profile = cfg.get("profile")
-        self.chats = [str(c) for c in cfg.get("chats", [])]
+        # A chat is an id, or {"chat": id, "every_line": true} to relay every owner line.
+        self.chats, self.every_line = [], set()
+        for c in cfg.get("chats", []):
+            cid = str(c["chat"] if isinstance(c, dict) else c)
+            self.chats.append(cid)
+            if isinstance(c, dict) and c.get("every_line"):
+                self.every_line.add(cid)
+        self.ask_chat = str(cfg["ask_chat"]) if cfg.get("ask_chat") is not None else None
+        self.checkins = cfg.get("checkins")
+        if self.checkins is not None and not isinstance(self.checkins.get("questionnaires"), list):
+            raise ValueError('config "checkins" needs "questionnaires" (a list of questionnaire ids)')
         self.tables = cfg["tables"]
         self.repo_map = cfg["repos"]
         self.releases = cfg.get("releases")
@@ -280,6 +295,8 @@ class Sync:
             self.relay_chats()
         if self.releases:
             self.announce_releases()
+        if self.checkins:
+            self.relay_checkins()
         stale = sorted(k for k in cards if k not in wanted)
         self.log(("dry plan " + json.dumps(plan, sort_keys=True) + " " if self.dry else "")
                  + "counts " + json.dumps(counts, sort_keys=True) + (f" unplaced {unplaced}" if unplaced else "")
@@ -312,8 +329,9 @@ class Sync:
         Per chat, chats.json keeps a cursor (the newest line id seen). The first run
         only sets the cursor, so old history is not relayed. A captain line that
         mentions the acting user or contains "?" is appended to the pending file as a
-        chat-question and queued for a 👀; every other line is skipped. A dry run
-        reads and logs only.
+        chat-question and queued for a 👀; every other line is skipped, unless the
+        chat is configured with "every_line", where every owner line is captured.
+        A dry run reads and logs only.
         """
         state = self.load("chats.json", {})
         for chat in self.chats:
@@ -335,7 +353,7 @@ class Sync:
                     continue
                 content = ln.get("content", "")
                 text = html.unescape(re.sub(r"<[^>]+>", "", content)).strip()
-                if "?" not in text:
+                if "?" not in text and chat not in self.every_line:
                     self.acting_id()
                     if not (self._acting_sgid and self._acting_sgid in content):
                         continue
@@ -562,6 +580,143 @@ class Sync:
             self.log(f"reply {rid}: removed {EYES} boost {b.get('id')}")
         return True
 
+    def owner_mention(self):
+        """The owner's mention attachment, from their person record's sgid."""
+        me = self.bc("api", "get", f"/people/{self.captain}.json") or {}
+        if not me.get("attachable_sgid"):
+            raise RuntimeError(f"person {self.captain} has no attachable_sgid")
+        return f'<bc-attachment sgid="{html.escape(me["attachable_sgid"])}" content-type="application/vnd.basecamp.mention"></bc-attachment>'
+
+    def ask(self, text):
+        """Post `text` as a new line in the "ask_chat" chat, @mentioning the owner.
+
+        Run only by the relaying agent; the sync itself never posts to chat. Refused,
+        like `reply`, when no profile is set or it signs in as the owner.
+        """
+        if self.ask_chat is None:
+            raise RuntimeError('config has no "ask_chat"')
+        me = self.acting_id()
+        if me == "retry":
+            raise RuntimeError("acting identity unknown")
+        if me is None or me == self.captain:
+            self.log("ask: acting user is the owner or unset, not posting")
+            return False
+        if self.dry:
+            self.log(f"dry ask: post in chat {self.ask_chat}")
+            return False
+        body = render_reply(text)
+        body = body.replace("<div>", "<div>" + self.owner_mention() + " ", 1) if body else "<div>" + self.owner_mention() + "</div>"
+        line = self.bc("api", "post", f"/buckets/{self.project}/chats/{self.ask_chat}/lines.json",
+                       "-d", json.dumps({"content": body, "content_type": "text/html"})) or {}
+        self.log(f"ask: posted line {line.get('id')} in chat {self.ask_chat}")
+        return True
+
+    def today(self):
+        tz = self.checkins.get("timezone")
+        return datetime.now(ZoneInfo(tz) if tz else None)
+
+    def relay_checkins(self):
+        """Record each check-in question that is due today and not yet answered by the acting user.
+
+        Due: not paused, today's weekday in the schedule's "days" (0 = Sunday), the
+        start_date reached, and the schedule's hour:minute passed in the configured
+        "timezone" (the machine's local time when unset). Each question is recorded
+        once per day in the pending file as a `checkin`; nothing is answered here.
+        checkins.json keeps question id -> {"recorded": [dates], "answered": [dates]}.
+        A dry run reads and logs only.
+        """
+        now = self.today()
+        date = now.strftime("%Y-%m-%d")
+        state = self.load("checkins.json", {})
+        for qn in self.checkins["questionnaires"]:
+            try:
+                questions = self.bc("api", "get", f"/buckets/{self.project}/questionnaires/{qn}/questions.json") or []
+            except RuntimeError as e:
+                self.log(f"checkins {qn}: {e}")
+                continue
+            for q in questions:
+                qid = str(q.get("id"))
+                rec = state.get(qid, {})
+                if date in rec.get("recorded", []) or not is_due(q, now):
+                    continue
+                me = self.acting_id()
+                if me == "retry":
+                    return
+                try:
+                    if self.answered_today(q["id"], me, date):
+                        continue
+                except RuntimeError as e:
+                    self.log(f"checkin {qid}: {e}")
+                    continue
+                if self.dry:
+                    self.log(f"dry checkin {qid}: due {date}")
+                    continue
+                with open(self.path("pending-comments.jsonl"), "a") as f:
+                    f.write(json.dumps({"kind": "checkin", "questionnaire": int(qn), "question": q["id"], "date": date,
+                                        "title": q.get("title"), "url": q.get("app_url"), "at": now.isoformat(timespec="seconds")}) + "\n")
+                rec.setdefault("recorded", []).append(date)
+                state[qid] = rec
+                self.save_json("checkins.json", state)
+                self.log(f"checkin {qid} due {date}")
+
+    def answered_today(self, qid, me, date):
+        """True when `me` already answered question `qid` for `date` in Basecamp."""
+        if me is None:
+            return False
+        answers = self.bc("api", "get", f"/buckets/{self.project}/questions/{qid}/answers.json") or []
+        return any((a.get("creator") or {}).get("id") == me and (a.get("group_on") or (a.get("created_at") or "")[:10]) == date
+                   for a in answers)
+
+    def answer(self, qid, text):
+        """Answer check-in question `qid` for today as the acting user, at most once a day.
+
+        Run only by the relaying agent; the sync itself never answers. Refused, like
+        `reply`, when no profile is set or it signs in as the owner, and when the
+        acting user already answered today (recorded in checkins.json or in Basecamp).
+        """
+        if not self.checkins:
+            raise RuntimeError('config has no "checkins"')
+        date = self.today().strftime("%Y-%m-%d")
+        state = self.load("checkins.json", {})
+        rec = state.get(str(qid), {})
+        if date in rec.get("answered", []):
+            self.log(f"answer {qid}: already answered {date}")
+            return False
+        me = self.acting_id()
+        if me == "retry":
+            raise RuntimeError("acting identity unknown")
+        if me is None or me == self.captain:
+            self.log(f"answer {qid}: acting user is the owner or unset, not posting")
+            return False
+        if self.answered_today(qid, me, date):
+            self.log(f"answer {qid}: already answered {date}")
+            return False
+        if self.dry:
+            self.log(f"dry answer {qid}: answer for {date}")
+            return False
+        self.bc("checkins", "answer", "create", str(qid), render_reply(text), "--date", date)
+        rec.setdefault("answered", []).append(date)
+        state[str(qid)] = rec
+        self.save_json("checkins.json", state)
+        self.log(f"answer {qid}: answered for {date}")
+        return True
+
+
+def is_due(q, now):
+    """Whether check-in question `q` has come due by `now` (local time), from its schedule."""
+    if q.get("paused"):
+        return False
+    sch = q.get("schedule") or {}
+    if (now.isoweekday() % 7) not in sch.get("days", []):
+        return False
+    if (sch.get("start_date") or "") > now.strftime("%Y-%m-%d"):
+        return False
+    end = sch.get("end_date")
+    if end and end < now.strftime("%Y-%m-%d"):
+        return False
+    return (now.hour, now.minute) >= (int(sch.get("hour", 0)), int(sch.get("minute", 0)))
+
+
 THUMBS, EYES = "\U0001F44D", "\U0001F440"
 
 
@@ -708,6 +863,27 @@ def cli(argv=None):
                 s.reply(a.recording, f.read(), again=a.again)
         except Exception as e:
             s.log(f"FAILED reply {a.recording} {type(e).__name__}: {e}")
+            return 1
+        return 0
+    if argv[:1] in (["ask"], ["answer"]):
+        what = argv[0]
+        ap = argparse.ArgumentParser(prog=f"sync.py {what}", description=(
+            "Post a new line in the configured ask_chat, @mentioning the owner." if what == "ask"
+            else "Answer a recorded check-in question for today."))
+        ap.add_argument("--home", required=True)
+        ap.add_argument("--config", required=True)
+        if what == "answer":
+            ap.add_argument("--question", required=True, type=int, help="the check-in question's id")
+        ap.add_argument("--body-file", required=True, help="plain text")
+        ap.add_argument("--dry-run", action="store_true")
+        a = ap.parse_args(argv[1:])
+        s = Sync(a.home, a.config, dry=a.dry_run)
+        try:
+            with open(a.body_file) as f:
+                text = f.read()
+            s.ask(text) if what == "ask" else s.answer(a.question, text)
+        except Exception as e:
+            s.log(f"FAILED {what} {type(e).__name__}: {e}")
             return 1
         return 0
     ap = argparse.ArgumentParser(description="Mirror a firstmate backlog onto Basecamp card tables.")

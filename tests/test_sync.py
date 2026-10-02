@@ -17,6 +17,7 @@ class Stub:
         self.profiles = []
         self.calls, self.next_id, self.comments, self.boosts = [], 500, comments or {}, boosts or {}
         self.lines = {}  # chat id -> lines
+        self.questions, self.answers = [], {}  # check-in questions; question id -> answers
         self.me, self.fail_post = ACTING, False  # /my/profile.json id; make boost posts fail
         self.lavish, self.lavish_calls = "", 0  # stdout of plain `lavish-axi`, or an exception to raise
 
@@ -43,6 +44,15 @@ class Stub:
             data = self.comments.get(args[2], [])
         elif args[:3] == ["api", "get", "/my/profile.json"]:
             data = {"id": self.me, "attachable_sgid": f"sgid-{self.me}"}
+        elif args[:2] == ["api", "get"] and args[2].startswith("/people/"):
+            data = {"id": int(args[2].split("/")[2].split(".")[0]), "attachable_sgid": "sgid-owner"}
+        elif args[:2] == ["api", "get"] and "/questionnaires/" in args[2]:
+            data = self.questions
+        elif args[:2] == ["api", "get"] and "/questions/" in args[2]:
+            data = self.answers.get(args[2].split("/")[4], [])
+        elif args[:3] == ["checkins", "answer", "create"]:
+            data = {"id": 600 + len(self.calls)}
+            self.answers.setdefault(args[3], []).append({"creator": {"id": self.me}, "group_on": args[6]})
         elif args[:2] == ["api", "get"] and "/chats/" in args[2]:
             data = list(reversed(self.lines.get(args[2].split("/")[4], [])))
         elif args[:2] == ["api", "post"] and "/chats/" in args[2]:
@@ -106,6 +116,8 @@ class Base(unittest.TestCase):
         shutil.copy(os.path.join(ROOT, "examples", "config.example.json"), os.path.join(self.cfgdir, "config.json"))
         cfg = json.load(open(os.path.join(self.cfgdir, "config.json")))
         cfg["repos"] = {"srv": "server", "eng": "engine"}
+        for opt in ("chats", "ask_chat", "checkins"):  # opt-in features the example shows; off by default here
+            cfg.pop(opt)
         json.dump(cfg, open(os.path.join(self.cfgdir, "config.json"), "w"))
         self.stub = Stub()
 
@@ -713,6 +725,146 @@ class Chats(Base):
         for _ in range(2):
             self.sync().main([])
         self.assertEqual(self.stub.chat_posts(), [])
+
+    def test_every_line_chat_captures_plain_lines(self):
+        p = os.path.join(self.cfgdir, "config.json")
+        cfg = json.load(open(p))
+        cfg["chats"] = [{"chat": 77, "every_line": True}]
+        json.dump(cfg, open(p, "w"))
+        self.stub.lines["77"] += [line(2, content="just chatting"), line(3, who=1, content="hi")]
+        self.sync().main([])
+        self.sync().main([])
+        self.assertEqual([(r["kind"], r["line"]) for r in self.pending()], [("chat-question", 2)])
+        self.assertEqual(self.stub.posted(), [("2", "👀")])
+
+    def test_plain_lines_skipped_by_default(self):
+        self.stub.lines["77"].append(line(2, content="just chatting"))
+        self.sync().main([])
+        self.assertEqual(self.pending(), [])
+
+
+class Ask(Base):
+    set_profile = Acknowledge.set_profile
+
+    def setUp(self):
+        super().setUp()
+        self.set_profile("agent")
+        self.cfg(ask_chat=77)
+
+    def cfg(self, **kw):
+        p = os.path.join(self.cfgdir, "config.json")
+        cfg = json.load(open(p))
+        cfg.update(kw)
+        json.dump(cfg, open(p, "w"))
+
+    def test_posts_line_mentioning_owner(self):
+        self.assertTrue(self.sync().ask("Ship it?\n\nOr wait."))
+        [(chat, body)] = self.stub.chat_posts()
+        self.assertEqual(chat, "77")
+        self.assertEqual(body, '<div><bc-attachment sgid="sgid-owner" content-type="application/vnd.basecamp.mention">'
+                               '</bc-attachment> Ship it?</div><div>Or wait.</div>')
+        post = next(a for a in self.stub.calls if a[:2] == ["api", "post"])
+        self.assertEqual(json.loads(post[4])["content_type"], "text/html")
+
+    def test_refused_as_owner_without_profile_or_in_dry_run(self):
+        self.stub.me = CAPTAIN
+        self.assertFalse(self.sync().ask("x"))
+        self.stub.me = ACTING
+        self.assertFalse(self.sync(dry=True).ask("x"))
+        self.cfg(profile=None)
+        self.assertFalse(self.sync().ask("x"))
+        self.assertEqual(self.stub.chat_posts(), [])
+
+    def test_unset_ask_chat_fails(self):
+        self.cfg(ask_chat=None)
+        with self.assertRaises(RuntimeError):
+            self.sync().ask("x")
+
+    def test_sync_never_asks(self):
+        self.sync().main([item("a")])
+        self.assertEqual(self.stub.chat_posts(), [])
+
+
+class Checkins(Base):
+    set_profile, pending = Acknowledge.set_profile, Acknowledge.pending
+
+    def setUp(self):
+        super().setUp()
+        self.set_profile("agent")
+        p = os.path.join(self.cfgdir, "config.json")
+        cfg = json.load(open(p))
+        cfg["checkins"] = {"questionnaires": [55], "timezone": "UTC"}
+        json.dump(cfg, open(p, "w"))
+        self.now = sync.datetime(2026, 10, 2, 9, 30, tzinfo=sync.timezone.utc)  # a Friday
+        self.stub.questions = [self.q(1)]
+
+    def q(self, id, days=(1, 2, 3, 4, 5), hour=9, minute=0, start="2026-01-01", paused=False):
+        return {"id": id, "title": "Open issues?", "app_url": f"https://x/questions/{id}", "paused": paused,
+                "schedule": {"frequency": "every_week", "days": list(days), "hour": hour, "minute": minute, "start_date": start}}
+
+    def sync(self, dry=False):
+        s = super().sync(dry)
+        s.today = lambda: self.now
+        return s
+
+    def test_due_question_recorded_once_per_day(self):
+        self.sync().main([])
+        self.sync().main([])
+        recs = self.pending()
+        self.assertEqual([(r["kind"], r["question"], r["date"], r["questionnaire"]) for r in recs],
+                         [("checkin", 1, "2026-10-02", 55)])
+        self.now = self.now.replace(day=5)  # Monday
+        self.sync().main([])
+        self.assertEqual([r["date"] for r in self.pending()], ["2026-10-02", "2026-10-05"])
+
+    def test_not_due(self):
+        self.stub.questions = [self.q(1, hour=10), self.q(2, days=(0, 6)), self.q(3, start="2026-10-03"),
+                               self.q(4, paused=True), self.q(5, minute=31)]
+        self.sync().main([])
+        self.assertEqual(self.pending(), [])
+
+    def test_sunday_is_zero(self):
+        self.now = self.now.replace(day=4)  # Sunday
+        self.stub.questions = [self.q(1, days=(0,))]
+        self.sync().main([])
+        self.assertEqual(len(self.pending()), 1)
+
+    def test_already_answered_today_not_recorded(self):
+        self.stub.answers["1"] = [{"creator": {"id": ACTING}, "group_on": "2026-10-02"}]
+        self.sync().main([])
+        self.assertEqual(self.pending(), [])
+
+    def test_answer_once_per_day(self):
+        self.sync().main([])
+        self.assertTrue(self.sync().answer(1, "None today."))
+        creates = [a for a in self.stub.calls if a[:3] == ["checkins", "answer", "create"]]
+        self.assertEqual(creates, [["checkins", "answer", "create", "1", "<div>None today.</div>", "--date", "2026-10-02"]])
+        self.assertFalse(self.sync().answer(1, "again"))
+        os.remove(os.path.join(self.cfgdir, "checkins.json"))
+        self.assertFalse(self.sync().answer(1, "again"))  # Basecamp already has today's answer
+        self.assertEqual(len([a for a in self.stub.calls if a[:3] == ["checkins", "answer", "create"]]), 1)
+
+    def test_answer_refused_as_owner_or_dry(self):
+        self.stub.me = CAPTAIN
+        self.assertFalse(self.sync().answer(1, "x"))
+        self.stub.me = ACTING
+        self.assertFalse(self.sync(dry=True).answer(1, "x"))
+        self.assertEqual([a for a in self.stub.calls if a[0] == "checkins"], [])
+
+    def test_sync_never_answers_and_dry_records_nothing(self):
+        self.sync(dry=True).main([])
+        self.assertEqual(self.pending(), [])
+        self.sync().main([])
+        self.assertEqual([a for a in self.stub.calls if a[0] == "checkins"], [])
+
+    def test_off_by_default(self):
+        p = os.path.join(self.cfgdir, "config.json")
+        cfg = json.load(open(p))
+        del cfg["checkins"]
+        json.dump(cfg, open(p, "w"))
+        self.sync().main([])
+        self.assertEqual(self.pending(), [])
+        self.assertFalse([a for a in self.stub.calls if "/questionnaires/" in " ".join(a)])
 
 
 class Releases(Base):
