@@ -12,6 +12,8 @@ write goes through a Tools method.
 import hashlib, html, json, os, re
 from datetime import datetime, timezone
 
+from tools import recording_type
+
 COLUMNS = ("Triage", "Not now", "Figuring it out", "In progress", "Ready for QA", "Done")
 
 
@@ -411,38 +413,54 @@ class OwnerEvents(Behavior):
     at, then inbox delivery. An event's own fields are never recorded; the readers
     refetch, record, acknowledge and dedupe exactly as on the timer, whose full run stays
     the repair sweep for anything the best-effort feed misses.
+
+    Unmonitored events (on unless "listen" has "unmonitored": false, and only with a
+    profile, since without one the sync's own writes are the owner's): the feed is read
+    for every event type, still only the owner's in this project, and an owner event no
+    behavior handles (a type outside TYPES, or one of TYPES on something nothing
+    monitors) is recorded once per kind of thing as an `unmonitored` record for the agent
+    to put to the owner.
     """
     name, keys, timer = "owner-events", ("listen",), False
     runs = "listener"
     TYPES = ("boost.created", "chat.line.created", "comment.created")
+    # The recording type an event type is about, for the unmonitored key without a refetch.
+    SUBJECTS = {"todo": "Todo", "card": "Kanban::Card", "message": "Message", "question": "Question",
+                "question.answer": "Question::Answer", "chat.line": "Chat::Lines"}
 
     def __init__(self, t, cfg):
         super().__init__(t, cfg)
         listen = cfg.get("listen")
         if listen is not None and not isinstance(listen, (bool, dict)):
-            raise ValueError('config "listen" must be {} or {"interval": <seconds>}')
+            raise ValueError('config "listen" must be {} or {"interval": <seconds>, "unmonitored": false}')
         self.on = listen is not None and listen is not False
-        self.interval = int((listen if isinstance(listen, dict) else {}).get("interval") or 30)
+        opts = listen if isinstance(listen, dict) else {}
+        self.interval = int(opts.get("interval") or 30)
         if self.interval < 10:
             raise ValueError('config "listen" "interval" must be at least 10 seconds')
+        if not isinstance(opts.get("unmonitored", True), bool):
+            raise ValueError('config "listen" "unmonitored" must be true or false')
+        self.unmonitored = self.on and opts.get("unmonitored", True) and bool(t.profile)
         self.others = {}  # every behavior by name, set by configure()
 
     def run(self, items=None):
         """One listener cycle: every page of new owner events, each dispatched once handled. Returns the events seen."""
-        return self.t.read_feed(self.TYPES, [self.t.captain], self.dispatch)
+        return self.t.read_feed(() if self.unmonitored else self.TYPES, [self.t.captain], self.dispatch)
 
     def dispatch(self, events):
         """Run, once each, the readers the page's events point at, then deliver what they recorded."""
         b, t = self.others, self.t
         want = {"cards": set(), "todos": set(), "chats": False, "checkins": False, "messages": False}
+        checks = []  # (event, its comment): each classified once the readers have run
         for ev in events:
             if str(ev.get("bucket_id")) != t.project or ev.get("creator_id") != t.captain:
                 continue  # the filters already say so; a stray event is never acted on
             kind, rid = ev.get("event_type"), ev.get("recording_id")
+            checks.append((ev, None))
             if kind == "chat.line.created":
                 want["chats"] = True
             elif kind == "comment.created":
-                self.comment_target(rid, want)
+                checks[-1] = (ev, self.comment_target(rid, want))
             elif kind == "boost.created" and not self.boost_target(rid, want):
                 # A boost on something not yet seen (the agent's newest line, answer or post):
                 # every cheap boost reader; a card's waits for the timer's sweep.
@@ -464,23 +482,99 @@ class OwnerEvents(Behavior):
         if want["messages"] and b["reports"].on:
             t.read_messages(b["reports"].board)
             ran.append("messages")
+        if self.unmonitored and checks:
+            found = self.detect(checks)
+            if found:
+                ran.append(f"unmonitored {found}")
         if b["inbox-delivery"].on:
             b["inbox-delivery"].deliver()
         t.log(f"listen: {len(events)} event(s) -> {'; '.join(ran) or 'nothing to read'}")
 
     def comment_target(self, cid, want):
-        """A new owner comment: the reader for the mirrored card, tracked to-do or message it is on."""
+        """A new owner comment: the reader for the mirrored card, tracked to-do or message it is on. Returns the comment."""
         try:
-            ptype, pid = self.t.comment_parent(cid)
+            c = self.t.comment(cid)
         except RuntimeError as e:
             self.t.log(f"listen: comment {cid}: {e}")
-            return
+            return None
+        ptype, pid = (c.get("parent") or {}).get("type"), (c.get("parent") or {}).get("id")
         if ptype == "Kanban::Card":
             want["cards"].update(k for k, r in self.t.load("map.json", {}).items() if r.get("card") == pid)
         elif ptype == "Todo":
             want["todos"].update(k for k, r in self.t.load("todos.json", {}).items() if r.get("todo") == pid)
         elif ptype == "Message":
             want["messages"] = True
+        return c
+
+    def detect(self, checks):
+        """Record each owner event in `checks` that no enabled behavior handled; returns how many were new.
+
+        Run after the readers, so their state already holds what this page made them see:
+        a chat line is handled when chat-inbox read it, a comment when it is on a mirrored
+        card, an open tracked to-do or a message of the agent's the reports reader knows, a
+        boost when a reader's state knows the boosted recording (or it is on a comment
+        under such a card, which the timer's sweep reads). Anything else is unmonitored.
+        """
+        b, t, found = self.others, self.t, 0
+        if t.dry:
+            t.log("listen: dry run, so the readers saved nothing to tell unmonitored events apart by; not checked")
+            return 0
+        if t.agent() is None:
+            t.log("listen: the acting user is the owner or unknown, so unmonitored events are not told apart this cycle")
+            return 0
+        for ev, comment in checks:
+            kind, rid = ev.get("event_type"), ev.get("recording_id")
+            rtype, rec, on = self.SUBJECTS.get(kind.rsplit(".", 1)[0]) if kind else None, None, None
+            if kind == "chat.line.created":
+                if b["chat-inbox"].on and any(str(rid) in (r.get("boost_counts") or {}) or rid in (r.get("lines") or [])
+                                              for r in t.load("chats.json", {}).values()):
+                    continue
+            elif kind == "comment.created":
+                if comment is None:
+                    continue  # its parent is unknown: logged, and the timer's sweep still runs
+                on = comment.get("parent") or {}
+                if self.monitored(on.get("type"), on.get("id")):
+                    continue
+                rtype, rec = on.get("type") or "unknown", comment
+            elif kind == "boost.created":
+                if self.boost_target(rid, {"cards": set(), "todos": set()}):
+                    continue
+                try:
+                    rec = t.recording(rid)
+                except RuntimeError as e:
+                    t.log(f"listen: boosted recording {rid}: {e}")
+                    continue
+                rtype = recording_type(rec.get("type")) or "unknown"
+                if rtype == "Comment":
+                    on = rec.get("parent") or {}
+                    if on.get("type") == "Kanban::Card" and self.monitored("Kanban::Card", on.get("id")):
+                        continue
+                    rtype = f"Comment on {on.get('type') or 'unknown'}"
+            elif kind and kind.startswith("comment."):  # an edit: keyed, like a new comment, on what it is on
+                try:
+                    rec = t.comment(rid)
+                except RuntimeError as e:
+                    t.log(f"listen: comment {rid}: {e}")
+                    continue
+                on = rec.get("parent") or {}
+                rtype = on.get("type") or "unknown"
+            if t.record_unmonitored(ev, rtype, rec, on):
+                found += 1
+        return found
+
+    def monitored(self, ptype, pid):
+        """True when a comment on recording `pid` of type `ptype` is relayed by an enabled behavior."""
+        b, t = self.others, self.t
+        if ptype == "Kanban::Card":
+            return b["card-mirror"].on and any(r.get("card") == pid for r in t.load("map.json", {}).values())
+        if ptype == "Todo":
+            return b["decision-todos"].on and any(r.get("todo") == pid and not r.get("completed")
+                                                  for r in t.load("todos.json", {}).values())
+        if ptype == "Message":
+            msgs = t.load("messages.json", {})
+            return b["reports"].on and (str(pid) in msgs.get("posts", {}) or
+                                        str(pid) in (msgs.get("messages") or {}).get("boost_counts", {}))
+        return False
 
     def boost_target(self, rid, want):
         """Add the reader whose state already knows boosted recording `rid`; False when none does."""
@@ -554,6 +648,14 @@ def inbox_note(rec, account, project):
         what = f"Basecamp boost from the captain on {where} (recording {rec.get('recording')})"
         handle = "an answer to what was boosted, like a comment: act on it" + (
             f", then sync.py todo complete --todo {rec.get('key')} if it settles the decision" if rec.get("surface") in ("todo", "todo-comment") else "")
+        url = rec.get("url")
+    elif kind == "unmonitored":
+        rid, key = f"{rec.get('key')}-{rec.get('event')}", rec.get("key")
+        what = (f"Basecamp event from the captain that nothing monitors: {rec.get('event_type')} on "
+                f"{rec.get('recording_type')}" + (f" {rec.get('title')!r}" if rec.get("title") else ""))
+        handle = ("put it to the captain as a decision to-do (sync.py todo create) asking how events like this should be "
+                  "handled: start monitoring them and how, ignore them, or something else; act on the answer, then "
+                  f"sync.py unmonitored handle --key '{key}' --decision <what they decided>")
         url = rec.get("url")
     elif kind == "checkin":
         rid = f"{rec.get('question')}-{rec.get('date')}"

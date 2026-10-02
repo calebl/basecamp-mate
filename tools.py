@@ -6,9 +6,12 @@ A tool does one explicit thing to the configured account and project, through th
   - readers poll Basecamp and append what they find to pending-comments.jsonl, once
     each, with a cursor or seen-list kept beside the config: card comments and
     approvals, chat lines, due check-in questions, comments on tracked to-dos; the
-    event-feed reader hands pages of the account event feed to a behavior instead;
+    event-feed reader hands pages of the account event feed to a behavior instead,
+    and the unmonitored-event recorder records, once per kind, the owner events it
+    finds no behavior handles;
   - commands post exactly what the agent hands them: `reply`, `ask`, `answer`,
-    `todo create|track|comment|complete`, `post-message`;
+    `todo create|track|comment|complete`, `post-message`; `unmonitored handle|forget`
+    only edit local state;
   - primitives the behaviors compose: card create/update/move/assign/unassign, a
     Message Board post, acknowledgement boosts.
 
@@ -667,13 +670,64 @@ class Tools:
 
     # --- the account event feed: wake-ups for the readers, never records ---
 
-    def comment_parent(self, cid):
-        """(type, id) of what comment `cid` is on, refetched from Basecamp, e.g. ("Kanban::Card", 5)."""
-        parent = (self.bc("api", "get", f"/buckets/{self.project}/comments/{cid}.json") or {}).get("parent") or {}
-        return parent.get("type"), parent.get("id")
+    def comment(self, cid):
+        """Comment `cid`, refetched from Basecamp; its "parent" names what it is on."""
+        return self.bc("api", "get", f"/buckets/{self.project}/comments/{cid}.json") or {}
+
+    def recording(self, rid):
+        """Recording `rid` of any type, refetched from Basecamp (type, title, content, creator, parent, app_url)."""
+        return self.bc("api", "get", f"/buckets/{self.project}/recordings/{rid}.json") or {}
+
+    def record_unmonitored(self, ev, rtype=None, rec=None, on=None):
+        """Record an owner event no behavior handles as an `unmonitored` record, once per kind of thing.
+
+        The key is "<event type>/<recording type>" (for a comment, the type of what it is
+        on), e.g. "comment.created/Document". unmonitored.json keeps each key with the
+        first event recorded, how many were seen and, once the agent marks it handled, the
+        decision; a key already there is only counted, so the owner is asked once.
+        `rtype` None means the recording's own type, refetched; otherwise the recording
+        (or `rec`, already fetched) is read only for a new key, for its title, excerpt and
+        link, and a failed read still records what the event says. `on` is the parent a
+        comment is on. A dry run records and saves nothing. Returns the key when recorded.
+        """
+        kind, rid = ev.get("event_type"), ev.get("recording_id")
+        state = self.load("unmonitored.json", {})
+        if rtype is None or f"{kind}/{rtype}" not in state:
+            if rec is None:
+                try:
+                    rec = self.recording(rid)
+                except RuntimeError as e:
+                    self.log(f"unmonitored: recording {rid}: {e}")
+                    rec = {}
+            rtype = rtype or recording_type(rec.get("type")) or "unknown"
+        key = f"{kind}/{rtype}"
+        if key in state:
+            if not self.dry:
+                state[key]["seen"] = state[key].get("seen", 1) + 1
+                self.save_json("unmonitored.json", state)
+            return None
+        if self.dry:
+            self.log(f"dry unmonitored: {key} (event {ev.get('id')})")
+            return None
+        title = (on or {}).get("title") or rec.get("title") or rec.get("subject")
+        texts = (re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", rec.get(f) or ""))).strip()
+                 for f in ("content", "description"))  # a to-do's content is its name; its notes are the description
+        text = next((x for x in texts if x and x != title), "")
+        creator = rec.get("creator") or {}
+        self.record({"kind": "unmonitored", "key": key, "event_type": kind, "recording_type": rtype,
+                     "event": ev.get("id"), "recording": rid, "title": title,
+                     "text": text[:300] + ("..." if len(text) > 300 else ""),
+                     "creator": {"id": ev.get("creator_id"), "name": creator.get("name")},
+                     "url": rec.get("app_url") or (on or {}).get("app_url"), "at": ev.get("created_at")})
+        state[key] = {"event": ev.get("id"), "recording": rid, "recorded_at": now_iso(), "seen": 1}
+        self.save_json("unmonitored.json", state)
+        self.log(f"unmonitored owner event: {key} (event {ev.get('id')})")
+        return key
 
     def read_feed(self, types, creators, on_page, max_pages=20):
         """Hand each page of the account event feed, filtered to this project, `types` and `creators`, to `on_page`.
+
+        Empty `types` means every type in the feed's catalog, new ones included.
 
         An event is a thin pointer (id, event_type, bucket_id, creator_id,
         recording_id, details), never content: it only says which reader to run.
@@ -691,7 +745,8 @@ class Tools:
         `reason`, so the error text tells them apart; an invalid filter is never retried.
         A dry run hands pages over but saves nothing. Returns the number of events handed over.
         """
-        filters = {"types": ",".join(sorted(types)), "buckets": self.project}
+        filters = {"types": ",".join(sorted(types))} if types else {}
+        filters["buckets"] = self.project
         if creators:
             filters["creators"] = ",".join(str(c) for c in sorted(creators))
         key = urlencode(filters, safe=",", quote_via=quote)
@@ -1012,6 +1067,41 @@ class Tools:
         m = self.bc("messages", "create", subject.strip(), "-", "--message-board", self.message_board, input=body) or {}
         self.log(f"post-message: message {m.get('id')} {m.get('app_url') or ''}".rstrip())
         return True
+
+    def unmonitored_handle(self, key, decision):
+        """Mark unmonitored key `key` handled with the owner's `decision`; it stays quiet until forgotten."""
+        state = self.load("unmonitored.json", {})
+        if key not in state:
+            raise ValueError(f"no unmonitored key {key!r} (see sync.py unmonitored list)")
+        if not decision.strip():
+            raise ValueError("a decision is needed")
+        if self.dry:
+            self.log(f"dry unmonitored handle: {key}")
+            return
+        state[key]["handled"] = {"at": now_iso(), "decision": decision.strip()}
+        self.save_json("unmonitored.json", state)
+        self.log(f"unmonitored: {key} handled: {decision.strip()}")
+
+    def unmonitored_forget(self, key):
+        """Drop unmonitored key `key`, so the next such event is recorded (and put to the owner) again."""
+        state = self.load("unmonitored.json", {})
+        if key not in state:
+            raise ValueError(f"no unmonitored key {key!r} (see sync.py unmonitored list)")
+        if self.dry:
+            self.log(f"dry unmonitored forget: {key}")
+            return
+        del state[key]
+        self.save_json("unmonitored.json", state)
+        self.log(f"unmonitored: {key} forgotten")
+
+
+def recording_type(t):
+    """A recording type as an unmonitored key names it: every kind of chat line is "Chat::Lines"."""
+    return "Chat::Lines" if (t or "").startswith("Chat::Lines") else t
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def is_due(q, now):

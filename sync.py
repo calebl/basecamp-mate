@@ -9,7 +9,8 @@ and that compose the tools: the card mirror ("tables", "repos"; off with "cards"
 false), the chat inbox ("chats"), chat asks ("ask_chat"), check-in answering
 ("checkins"), release announcements ("releases"), decision to-dos ("todos"),
 reports ("message_board"), inbox delivery ("inbox") and the owner-event listener
-("listen", run by `sync.py listen` as a service beside the timer). prompts/base.md is
+("listen", run by `sync.py listen` as a service beside the timer, which also records
+the owner's unmonitored events; `sync.py unmonitored` keeps their keys). prompts/base.md is
 the agent's side of each behavior.
 
 Deterministic, no model calls. Safety bounds, enforced here:
@@ -35,10 +36,11 @@ Usage: sync.py --home <home> --config <config.json> [--dry-run] [--include-prere
        sync.py todo complete --home <home> --config <config.json> --todo <key or id> [--dry-run]
        sync.py post-message --home <home> --config <config.json> --subject <text> --body-file <file> [--dry-run]
        sync.py listen --home <home> --config <config.json> [--once] [--dry-run]
+       sync.py unmonitored list|handle|forget --home <home> --config <config.json> [--key <key>] [--decision <text>] [--dry-run]
        sync.py behaviors --home <home> --config <config.json>
        sync.py init <project URL> --login <profile> --home <home> [--captain <id or email>] [--repo-map TABLE=REPO] [--dry-run]
 """
-import argparse, subprocess, sys
+import argparse, json, subprocess, sys
 from datetime import datetime, timezone  # noqa: F401  (kept importable from sync)
 
 import behaviors
@@ -186,6 +188,28 @@ def todo_cli(argv, runner):
     return command(a, f"todo {sub}", calls[sub], runner)
 
 
+def unmonitored_cli(argv, runner):
+    sub = argv[:1][0] if argv else None
+    descs = {"list": "List the unmonitored-event keys recorded, with each one's decision once handled.",
+             "handle": "Mark an unmonitored-event key handled with the owner's decision; it stays quiet.",
+             "forget": "Drop an unmonitored-event key, so the next such event is recorded again."}
+    if sub not in descs:
+        print("usage: sync.py unmonitored {list,handle,forget} --home <home> --config <config.json> ...", file=sys.stderr)
+        return 2
+    ap = common(f"sync.py unmonitored {sub}", descs[sub])
+    if sub != "list":
+        ap.add_argument("--key", required=True, help='e.g. "comment.created/Document", as the record names it')
+        ap.add_argument("--dry-run", action="store_true")
+    if sub == "handle":
+        ap.add_argument("--decision", required=True, help="what the owner decided, e.g. ignore them")
+    a = ap.parse_args(argv[1:])
+    if sub == "list":
+        print(json.dumps(Sync(a.home, a.config, runner=runner).load("unmonitored.json", {}), indent=1, sort_keys=True))
+        return 0
+    return command(a, f"unmonitored {sub}", lambda s: s.unmonitored_handle(a.key, a.decision) if sub == "handle"
+                   else s.unmonitored_forget(a.key), runner)
+
+
 def cli(argv=None, runner=subprocess.run):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["init"]:
@@ -193,6 +217,8 @@ def cli(argv=None, runner=subprocess.run):
         return init_home.cli(argv[1:])
     if argv[:1] == ["todo"]:
         return todo_cli(argv[1:], runner)
+    if argv[:1] == ["unmonitored"]:
+        return unmonitored_cli(argv[1:], runner)
     if argv[:1] == ["reply"]:
         ap = common("sync.py reply", "Answer a captain question where it was asked, then remove the 👀.")
         ap.add_argument("--recording", required=True, type=int, help="the question comment's or chat line's id")

@@ -1,6 +1,6 @@
 ---
 name: basecamp-sync
-description: Operating contract for a firstmate or second mate whose home mirrors its backlog into a Basecamp project with firstmate-basecamp-sync. Use when told to "use this Basecamp project", when setting a home up with `sync.py init`, when the basecamp-sync wake check fires, when handling data/basecamp-sync/pending-comments.jsonl, when putting a decision to the owner as a Basecamp to-do (`sync.py todo`), when posting a report to the Message Board (`sync.py post-message`), or when editing figuring.json, not-now.json, decisions.json, boards.json, extra-repos.json or skip.json.
+description: Operating contract for a firstmate or second mate whose home mirrors its backlog into a Basecamp project with firstmate-basecamp-sync. Use when told to "use this Basecamp project", when setting a home up with `sync.py init`, when the basecamp-sync wake check fires, when handling data/basecamp-sync/pending-comments.jsonl, when putting a decision to the owner as a Basecamp to-do (`sync.py todo`), when posting a report to the Message Board (`sync.py post-message`), when handling an `unmonitored` record (`sync.py unmonitored`), or when editing figuring.json, not-now.json, decisions.json, boards.json, extra-repos.json or skip.json.
 ---
 
 # Basecamp sync
@@ -14,7 +14,8 @@ check-in answering (`checkins`), release announcements (`releases`), decision to
 (`todos`), reports (`message_board`), inbox delivery (`inbox`) and the owner-event
 listener (`listen`: a `sync.py listen` service beside the timer that polls Basecamp's event
 feed and runs the same readers within about a minute of the captain posting; the records
-are the same). `python3 $SYNC/sync.py behaviors --home <home>
+are the same, plus an `unmonitored` record when the captain does something nothing
+monitors). `python3 $SYNC/sync.py behaviors --home <home>
 --config <config>` lists which are on. Sections below about cards and the side files apply
 only when the card mirror is on. Mechanics (column rules, file formats, record fields,
 safety bounds) are in the repo's README: `firstmate-basecamp-sync/README.md`. `SYNC` below
@@ -112,6 +113,14 @@ Handle each new record by its `kind` (missing `kind` = `comment`):
   can carry short text. It is an answer to what was boosted, like a comment there: on a
   decision to-do or a comment under it, a decision or feedback as above; elsewhere a reply
   to that line, answer or post. Relay it like a comment outside the main firstmate's home.
+- `unmonitored`: the captain did something in the project that no enabled behavior handles
+  (`event_type` on `recording_type`, e.g. `todo.created` on `Todo` or `comment.created` on
+  a `Document`; one record per kind, `key`). Put it to the owner as a decision to-do (see
+  "Decisions as to-dos") asking how such events should be handled: start monitoring them
+  and how, ignore them, or something else. Act on the answer (monitoring needs a change to
+  the sync: relay it to the main firstmate), then record it with
+  `python3 $SYNC/sync.py unmonitored handle --home <home> --config <config> --key '<key>' --decision <text>`
+  so that kind stays quiet; `unmonitored forget --key '<key>'` raises it again next time.
 - `checkin`: a check-in question came due today. Work out the answer within this home's
   scope and post it once with
   `python3 $SYNC/sync.py answer --home <home> --config <home>/data/basecamp-sync/config.json --question <question id> --body-file <file>`.
@@ -133,7 +142,7 @@ The main firstmate's own home answers its questions itself rather than relaying.
 
 - Post, comment, complete, delete, archive or trash anything in Basecamp outside `sync.py`
   and its commands (`reply`, `ask`, `answer`, `todo create|track|comment|complete`,
-  `post-message`), or hand-edit `todos.json` or `feed.json`.
+  `post-message`), or hand-edit `todos.json`, `feed.json` or `unmonitored.json`.
   The sync's one automatic post is a release announcement: releases only (GitHub releases
   of the repos in `releases`, never merges or PRs), Message Board only. Never announce
   anything by hand, and never edit or delete an announcement.
