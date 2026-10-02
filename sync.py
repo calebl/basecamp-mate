@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Connect a firstmate home to one Basecamp project: a set of independent, opt-in tools.
+"""Connect an agent home to one Basecamp project: a set of independent, opt-in tools.
 
 Each runs only when its config keys are set: the card mirror ("tables", "repos";
 off with "cards": false), the chat relay ("chats"), chat asks ("ask_chat"),

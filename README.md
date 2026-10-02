@@ -1,6 +1,6 @@
 # firstmate-basecamp-sync
 
-A set of independent, opt-in tools that connect a firstmate home to one Basecamp
+A set of independent, opt-in tools that connect an agent home to one Basecamp
 project through the `basecamp` CLI. No model calls. Each tool runs only when its config
 keys are present; a home picks just the pieces it needs:
 
