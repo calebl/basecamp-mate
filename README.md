@@ -14,6 +14,7 @@ policy. Each does one thing to the configured account and project:
 | chat reader | reader | records the captain's chat lines (questions and mentions, or every line) as `chat-question` |
 | check-in reader | reader | records each check-in question due today as `checkin` |
 | to-do comment reader | reader | records the owner's new comments on tracked open to-dos as `todo-comment` |
+| message comment reader | reader | records the owner's new comments on the agent's own recent Message Board posts as `message-comment` |
 | boost readers | reader | record the owner's new boosts, with their text, on every monitored surface as `boost` (below) |
 | event-feed reader | reader | polls Basecamp's account event feed (`/events.json`) for this project from a saved position and hands each page of thin events to a behavior; records nothing itself |
 | `sync.py reply` | command | answers a recorded comment, chat line or to-do comment where it was made, then removes the 👀 |
@@ -45,7 +46,7 @@ listener service; the others are carried out by the agent with the commands. The
 | `release-announcements` | `releases` | default, when the dock has one message board | post one message per new GitHub release | none |
 | `checkin-answering` | `checkins` | `--checkins <time zone>` | check-in reader | `answer` |
 | `decision-todos` | `todos` | `--todos` | to-do comment reader | `todo create`, `reply`/`todo comment`, `todo complete` |
-| `reports` | `message_board` | `--reports` | boost reader on the agent's messages | `post-message` |
+| `reports` | `message_board` | `--reports` | comment and boost readers on the agent's messages | `post-message`; `reply` to feedback |
 | `inbox-delivery` | `inbox` | `--inbox` | deliver each new pending record as a firstmate inbox note | handle the note, then `fm-inbox.sh drain --ack` |
 | `owner-events` | `listen` | `--listen` | none: runs in the listener service (`sync.py listen`, below) | none; records arrive sooner |
 
@@ -101,7 +102,7 @@ reader for the surface each event points at:
 | Event | Reader run |
 | --- | --- |
 | an owner chat line | the chat reader, for the configured chats |
-| an owner comment | refetches the comment for its parent, then that mirrored card's comment and 👍 readers, that tracked to-do's reader, or the message boost reader |
+| an owner comment | refetches the comment for its parent, then that mirrored card's comment and 👍 readers, that tracked to-do's reader, or the reader for the agent's messages |
 | an owner boost | the reader whose state already knows the boosted recording (a card, a to-do, a chat line, a check-in answer, a message); for a recording none has seen yet, every reader that reads boosts except the card mirror's |
 
 Then it runs inbox delivery, when that is on. An event is a thin pointer and only says
@@ -210,7 +211,13 @@ listener cycle that comes due during a timer run waits for it.
   `sync.py post-message --home <home> --config <config.json> --subject <text> --body-file <file>`
   posts one message on that board (Markdown body, rendered by the CLI) as the acting user,
   under the same refusal rules as `reply`. Each run of the command posts a new message;
-  messages are never edited or deleted.
+  messages are never edited or deleted. Each run reads the board's newest messages and,
+  for each one the acting user posted in the last 14 days that has comments, records
+  every owner comment newer than that message's cursor as a `message-comment`, once,
+  acknowledged like a card comment (👀 with `?`, 👍 otherwise). A message has no cursor
+  until its first read, so feedback already on a recent post is relayed. `sync.py reply
+  --recording <comment id>` answers one with a comment on the message (Markdown) and
+  removes the 👀.
 - Boosts are answers: a boost can carry short text, and the owner's boost on anything a
   behavior monitors is recorded once as a `boost` with its text, the boosted recording and
   the surface. The reads stay bounded: a recording's boosts are read only when its
@@ -390,7 +397,7 @@ Everything else lives beside the config, never in this repo:
 | `chats.json` | the script | chat id -> line cursor, captured question lines, acknowledgement boosts queued and done, questions replied to |
 | `checkins.json` | the script | check-in question id -> dates recorded as due (`recorded`) and dates answered (`answered`) |
 | `inbox.json` | the script | the line cursor of `pending-comments.jsonl` delivered to the inbox, and request ids whose failure was logged |
-| `messages.json` | the script | boost counts and boosts seen on the agent's recent messages and their comments |
+| `messages.json` | the script | per agent message: comment cursor, owner comments recorded, acknowledgement boosts queued and done, comments replied to; boost counts and boosts seen on the messages and their comments |
 | `feed.json` | the listener | the event feed's position, the last event id handled and the filters they belong to |
 | `sync.lock` | the script | the shared state lock held by a timer run, a listener cycle or a command |
 | `todos.json` | the script | to-do key -> to-do id, title, URL, created and completed times, comment cursor, owner comments recorded, acknowledgement boosts queued and done, comments replied to |
@@ -509,6 +516,9 @@ before `kind` existed have none; treat a missing `kind` as `"comment"`.
 - `todo-comment`: `key`, `todo` (id), `comment` (id), `question` (true when it contains
   `?`), `url` (the comment), `text`, `at`. The owner commented on a tracked to-do; answer
   with `sync.py reply --recording <comment>`.
+- `message-comment`: `message` (id), `subject`, `comment` (id), `question`, `url` (the
+  comment), `text`, `at`. The owner commented on a post the agent made, usually feedback
+  or an instruction on a report; act on it and answer with `sync.py reply --recording <comment>`.
 - `boost`: `surface` (`chat`, `card`, `card-comment`, `todo`, `todo-comment`,
   `checkin-answer`, `message`, `message-comment`), the surface's ids (`chat`; `task`,
   `repo`, `card`; `key`, `todo`; `question`; `message`, `subject`), `recording` (the

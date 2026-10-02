@@ -254,6 +254,17 @@ class Dispatch(ListenBase):
         self.assertEqual([c[2].split("?")[0] for c in self.stub.calls], ["/events.json", f"/buckets/{PROJECT}/comments/9.json"])
         self.assertIn("nothing to read", self.log())
 
+    def test_comment_on_the_agents_message_runs_the_message_reader(self):
+        recent = sync.datetime.now(sync.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.stub.boosts["99"] = [{"id": 20, "creator": {"id": ACTING}, "subject": "Report", "created_at": recent,
+                                   "boosts_count": 0, "comments_count": 1, "app_url": "https://x/m/20"}]
+        self.stub.comments["20"] = [comment(25, content="<p>dig deeper?</p>")]
+        self.stub.parents[25] = {"id": 20, "type": "Message"}
+        self.stub.page(event(10, "comment.created", rid=25))
+        self.listen()
+        self.assertEqual([(r["kind"], r["message"], r["comment"]) for r in self.pending()], [("message-comment", 20, 25)])
+        self.assertIn(("25", "\U0001F440"), self.stub.posted())
+
     def test_boost_on_a_known_todo_runs_its_reader(self):
         tid = self.create()
         self.poll()  # seeds the to-do's boosts

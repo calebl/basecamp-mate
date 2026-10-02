@@ -542,6 +542,59 @@ class Boosts(ToolBase):
         self.assertFalse([c for c in self.stub.calls if "/message_boards/" in " ".join(c)])
 
 
+class MessageComments(ToolBase):
+    """The owner's comments on the agent's own recent Message Board posts are relayed like card comments."""
+
+    def setUp(self):
+        super().setUp()
+        recent = sync.datetime.now(sync.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.msgs = [{"id": 20, "creator": {"id": ACTING}, "subject": "Report: deploy", "created_at": recent,
+                      "comments_count": 2, "app_url": "https://x/m/20"},
+                     {"id": 21, "creator": {"id": CAPTAIN}, "subject": "His own", "created_at": recent, "comments_count": 1},
+                     {"id": 22, "creator": {"id": ACTING}, "subject": "Old", "created_at": "2020-01-01T00:00:00Z", "comments_count": 1}]
+        self.stub.boosts["99"] = self.msgs  # the stub answers the board's messages read from its boosts table
+        self.stub.comments = {"20": [comment(30, content="<p>Rerun it with the new flag</p>"), comment(31, who=ACTING)],
+                              "21": [comment(32)], "22": [comment(33)]}
+
+    def test_feedback_already_on_a_recent_post_is_relayed_once(self):
+        self.poll()
+        self.poll()
+        [rec] = [r for r in self.pending() if r["kind"] == "message-comment"]
+        self.assertEqual(rec, {"kind": "message-comment", "message": 20, "subject": "Report: deploy", "comment": 30,
+                               "question": False, "url": "https://x/todos/c30", "text": "Rerun it with the new flag", "at": "t"})
+        self.assertEqual(self.stub.posted(), [("30", "👍")])
+        self.assertFalse([c for c in self.stub.calls if c[:3] in (["comments", "list", "21"], ["comments", "list", "22"])])
+
+    def test_new_question_gets_eyes_and_reply_comments_on_the_post(self):
+        self.poll()
+        self.stub.comments["20"].append(comment(40, content="Why only one run?"))
+        self.poll()
+        self.assertEqual([r["comment"] for r in self.pending() if r["kind"] == "message-comment"], [30, 40])
+        self.assertIn(("40", "👀"), self.stub.posted())
+        self.assertTrue(self.sync().reply(40, "Because the second one was a dry run."))
+        self.assertEqual(self.stub.made("comments create"), [["comments", "create", "20", "-"]])
+        self.assertEqual(self.stub.boosts["40"], [])
+        self.assertFalse(self.sync().reply(40, "again"))
+        self.poll()
+        self.assertEqual(len([r for r in self.pending() if r["kind"] == "message-comment"]), 2)
+
+    def test_dry_run_and_owner_profile_record_nothing(self):
+        self.poll(dry=True)
+        self.assertEqual(self.pending(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.cfgdir, "messages.json")))
+        self.stub.me = CAPTAIN
+        self.poll()
+        self.assertEqual(self.pending(), [])
+
+    def test_delivered_to_the_inbox(self):
+        self.cfg(inbox={})
+        self.poll()
+        [(rid, body, _, _)] = self.stub.notes
+        self.assertEqual(rid, "basecamp-message-comment-30")
+        self.assertEqual(body.splitlines()[:3], ["Basecamp comment from the captain on your message 'Report: deploy':",
+                                                 "Rerun it with the new flag", "https://x/todos/c30"])
+
+
 class Layers(unittest.TestCase):
     def test_behaviors_never_call_a_cli_directly(self):
         src = open(os.path.join(ROOT, "behaviors.py")).read()

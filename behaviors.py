@@ -332,7 +332,7 @@ class DecisionTodos(Behavior):
 
 
 class Reports(Behavior):
-    """The agent posts reports to the Message Board with `sync.py post-message`; the timer relays the owner's boosts on them."""
+    """The agent posts reports to the Message Board with `sync.py post-message`; the timer relays the owner's comments and boosts on them."""
     name, keys = "reports", ("message_board",)
 
     def __init__(self, t, cfg):
@@ -341,7 +341,7 @@ class Reports(Behavior):
         self.board = str(cfg.get("message_board"))
 
     def run(self, items=None):
-        self.t.read_message_boosts(self.board)
+        self.t.read_messages(self.board)
 
 
 class InboxDelivery(Behavior):
@@ -462,7 +462,7 @@ class OwnerEvents(Behavior):
             t.read_answer_boosts(b["checkin-answering"].checkins["questionnaires"])
             ran.append("checkin answers")
         if want["messages"] and b["reports"].on:
-            t.read_message_boosts(b["reports"].board)
+            t.read_messages(b["reports"].board)
             ran.append("messages")
         if b["inbox-delivery"].on:
             b["inbox-delivery"].deliver()
@@ -532,6 +532,11 @@ def inbox_note(rec, account, project):
     elif kind == "chat-question":
         rid = rec.get("line")
         what, handle, url = "Basecamp chat line from the captain", f"answer: sync.py reply --recording {rid}", rec.get("url")
+    elif kind == "message-comment":
+        rid = rec.get("comment")
+        what = f"Basecamp comment from the captain on your message {rec.get('subject')!r}"
+        handle = f"feedback or an instruction on your post: act on it, then sync.py reply --recording {rid}"
+        url = rec.get("url")
     elif kind == "todo-comment":
         rid = rec.get("comment")
         what = f"Basecamp comment from the captain on decision to-do {rec.get('key')}"

@@ -74,6 +74,7 @@ still fires on a FAILED line in `sync.log`. By `kind`:
   `python3 SYNC/sync.py reply C --recording <line> --body-file <file>`.
   Answer every line, even if only to say what you did or that you are on it.
 - `checkin`: a check-in question came due today (section 4).
+- `message-comment`: the captain commented on a report you posted (section 5).
 - `boost`: the captain boosted something you are watching; a boost can carry short text
   (e.g. "a", "yes", "later"). It is an answer to what was boosted, exactly like a comment
   there: on a decision to-do or a comment under it (including yours) it is their decision
@@ -135,7 +136,10 @@ second answer the same day is refused; that is expected.
 Post each investigation report on the Message Board:
 `python3 SYNC/sync.py post-message C --subject "<what it is about>" --body-file <file>`.
 The body is Markdown: lead with the finding and what you recommend, then the evidence,
-with full links. Each run posts a new message, so post a report once. If it asks the captain to
+with full links. Each run posts a new message, so post a report once. The captain's
+comments on your recent reports come back as `message-comment` records: feedback or an
+instruction on the report. Act on it, then answer on the report with
+`python3 SYNC/sync.py reply C --recording <comment> --body-file <file>`. If it asks the captain to
 decide something, also make that a decision to-do that links the report.
 
 ## 6. Bounds
