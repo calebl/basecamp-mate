@@ -64,6 +64,15 @@ Handle each new record by its `kind` (missing `kind` = `comment`):
   `python3 $SYNC/sync.py reply --home <home> --config <home>/data/basecamp-sync/config.json --recording <comment or line id> --body-file <file>`.
   If it asks for a decision or gives an instruction, relay it to the main firstmate first,
   like a comment.
+  A `chat-question` from a chat set to `every_line` may be any line the owner wrote there;
+  treat each as addressed to you.
+- `checkin`: a check-in question came due today. Work out the answer within this home's
+  scope and post it once with
+  `python3 $SYNC/sync.py answer --home <home> --config <home>/data/basecamp-sync/config.json --question <question id> --body-file <file>`.
+- To put a question or decision to the owner in chat (only when `ask_chat` is set), post
+  one per line with
+  `python3 $SYNC/sync.py ask --home <home> --config <home>/data/basecamp-sync/config.json --body-file <file>`;
+  it @mentions the owner.
 - A FAILED run: read `sync.log`; a token failure needs `basecamp auth login -P <profile>`,
   which only the captain can do, so relay it.
 
@@ -71,7 +80,7 @@ The main firstmate's own home answers its questions itself rather than relaying.
 
 ## Never
 
-- Post, delete, archive or trash anything in Basecamp outside `sync.py` and `sync.py reply`.
+- Post, delete, archive or trash anything in Basecamp outside `sync.py`, `sync.py reply`, `sync.py ask` and `sync.py answer`.
   The sync's one automatic post is a release announcement: releases only (GitHub releases
   of the repos in `releases`, never merges or PRs), Message Board only. Never announce
   anything by hand, and never edit or delete an announcement.
