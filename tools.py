@@ -524,38 +524,67 @@ class Tools:
         if not self.dry:
             self.save_json("checkins.json", state)
 
-    def read_message_boosts(self, board, days=14):
-        """The owner's boosts on messages the acting user posted on `board` in the last `days` days, and on their comments.
+    def read_messages(self, board, days=14):
+        """The owner's comments and boosts on messages the acting user posted on `board` in the last `days` days.
 
         One read of the board's newest messages; a boosts read per message whose
         boosts_count changed; a comments read per such message that has comments, and a
-        boosts read per comment whose count changed. State is messages.json.
+        boosts read per comment whose count changed. Each owner comment newer than the
+        message's cursor is recorded once as a `message-comment`, acknowledged like a card
+        comment (👀 when it contains "?", 👍 otherwise). A message has no cursor until its
+        first read, so feedback already on a recent post is relayed, not skipped. State is
+        messages.json. A dry run reads and logs only.
         """
         me = self.agent()
         if me is None:
             return
         since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
-        state = self.load("messages.json", {})
         try:
             msgs = self.bc("api", "get", f"/buckets/{self.project}/message_boards/{board}/messages.json") or []
         except RuntimeError as e:
-            self.log(f"message boosts {board}: {e}")
+            self.log(f"messages {board}: {e}")
             return
         mine = [m for m in msgs if (m.get("creator") or {}).get("id") == me and (m.get("created_at") or "") >= since]
-        for m in mine:
-            ctx = {"message": m["id"], "subject": m.get("subject")}
-            self.read_boosts(state.setdefault("messages", {}), "message", ctx, counted=[(m["id"], m.get("app_url"), m.get("boosts_count") or 0)])
-            if not m.get("comments_count"):
-                continue
-            try:
-                comments = self.bc("comments", "list", str(m["id"])) or []
-            except RuntimeError as e:
-                self.log(f"message {m['id']} comments: {e}")
-                continue
-            self.read_boosts(state.setdefault("comments", {}), "message-comment", ctx,
-                             counted=[(c["id"], c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
-        if not self.dry:
-            self.save_json("messages.json", state)
+        with self.locked("messages.json"):
+            state = self.load("messages.json", {})
+            for m in mine:
+                ctx = {"message": m["id"], "subject": m.get("subject")}
+                self.read_boosts(state.setdefault("messages", {}), "message", ctx,
+                                 counted=[(m["id"], m.get("app_url"), m.get("boosts_count") or 0)])
+                if not m.get("comments_count"):
+                    continue
+                try:
+                    comments = self.bc("comments", "list", str(m["id"])) or []
+                except RuntimeError as e:
+                    self.log(f"message {m['id']} comments: {e}")
+                    continue
+                post = state.setdefault("posts", {}).setdefault(str(m["id"]), {"cursor": 0})
+                cursor = post["cursor"]
+                for c in sorted(comments, key=lambda c: c.get("id", 0)):
+                    cid = c.get("id", 0)
+                    if cid <= cursor:
+                        continue
+                    cursor = cid
+                    if (c.get("creator") or {}).get("id") != self.captain:
+                        continue
+                    text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", c.get("content", "")))).strip()
+                    question = "?" in text
+                    if self.dry:
+                        self.log(f"dry message {m['id']}: owner comment {cid}")
+                        continue
+                    self.record({"kind": "message-comment", "message": m["id"], "subject": m.get("subject"),
+                                 "comment": cid, "question": question, "url": c.get("app_url") or m.get("app_url"),
+                                 "text": text, "at": c.get("created_at")})
+                    post.setdefault("comments", []).append(cid)
+                    post.setdefault("ack", []).append([cid, EYES if question else THUMBS])
+                    self.log(f"new owner comment on message {m['id']}: {cid}")
+                self.acknowledge(f"message {m['id']}", post)
+                if not self.dry:
+                    post["cursor"] = cursor
+                self.read_boosts(state.setdefault("comments", {}), "message-comment", ctx,
+                                 counted=[(c["id"], c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
+            if not self.dry:
+                self.save_json("messages.json", state)
 
     def answered_today(self, qid, me, date):
         """True when `me` already answered question `qid` for `date` in Basecamp."""
@@ -626,8 +655,8 @@ class Tools:
         """Answer the captain's comment or line `rid` where it was made, then take the acting user's 👀 off it.
 
         A card comment is answered with a comment on that card, a chat line with a
-        new line in that chat, and a to-do comment with a comment on that to-do (as
-        Markdown, rendered by the CLI). Run only by the relaying agent; the sync
+        new line in that chat, and a to-do or message comment with a comment on that to-do
+        or message (as Markdown, rendered by the CLI). Run only by the relaying agent; the sync
         itself never posts comments. A reply is recorded in the "replied" list and a
         second one is refused unless `again`. A failed post removes nothing, so the
         👀 stays.
@@ -639,6 +668,11 @@ class Tools:
             todo_key = next((k for k, r in self.load("todos.json", {}).items() if rid in r.get("comments", [])), None)
         if todo_key is not None:
             return self.reply_todo(todo_key, rid, text, again)
+        post = None
+        if chat is None:
+            post = next((k for k, r in self.load("messages.json", {}).get("posts", {}).items() if rid in r.get("comments", [])), None)
+        if post is not None:
+            return self.reply_message(post, rid, text, again)
         if chat is not None:
             store, rec = ("chats.json", chats), chats[chat]
             target = f"/buckets/{self.project}/chats/{chat}/lines.json"
@@ -646,7 +680,7 @@ class Tools:
             cards = self.load("map.json", {})
             rec = next((r for r in cards.values() if rid in r.get("comments", [])), None)
             if rec is None:
-                raise RuntimeError(f"no card in map.json, chat in chats.json or to-do in todos.json has {rid}")
+                raise RuntimeError(f"no card in map.json, chat in chats.json, to-do in todos.json or message in messages.json has {rid}")
             store = ("map.json", cards)
             target = f"/buckets/{self.project}/recordings/{rec['card']}/comments.json"
         where = f"chat {chat}" if chat is not None else f"card {rec['card']}"
@@ -684,6 +718,27 @@ class Tools:
             state[key].setdefault("replied", []).append(rid)
             self.save_json("todos.json", state)
         self.log(f"reply {rid}: posted on todo {key}")
+        self.remove_eyes(rid)
+        return True
+
+    def reply_message(self, mid, rid, text, again):
+        """Answer the owner's comment `rid` on message `mid` with a comment there (Markdown)."""
+        with self.locked("messages.json"):
+            rec = self.load("messages.json", {})["posts"][mid]
+        if rid in rec.get("replied", []) and not again:
+            self.log(f"reply {rid}: already replied, pass --again to post another")
+            return False
+        if self.refused(f"reply {rid}"):
+            return False
+        if self.dry:
+            self.log(f"dry reply {rid}: comment on message {mid}, then remove {EYES}")
+            return False
+        self.bc("comments", "create", mid, "-", input=text)
+        with self.locked("messages.json"):
+            state = self.load("messages.json", {})
+            state["posts"][mid].setdefault("replied", []).append(rid)
+            self.save_json("messages.json", state)
+        self.log(f"reply {rid}: posted on message {mid}")
         self.remove_eyes(rid)
         return True
 

@@ -101,6 +101,9 @@ Handle each new record by its `kind` (missing `kind` = `comment`):
   A `chat-question` from a chat set to `every_line` may be any line the owner wrote there;
   treat each as addressed to you.
 - `todo-comment`: the captain commented on a tracked to-do; see "Decisions as to-dos".
+- `message-comment`: the captain commented on a Message Board post this home made (a
+  report); it is feedback or an instruction on it. Act on it (relaying first outside the
+  main firstmate's home), then answer with `sync.py reply --recording <comment id>`.
 - `boost`: the captain boosted something being watched (`surface`: chat, card,
   card-comment, todo, todo-comment, checkin-answer, message, message-comment); a boost
   can carry short text. It is an answer to what was boosted, like a comment there: on a
