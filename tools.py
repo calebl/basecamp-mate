@@ -5,7 +5,8 @@ A tool does one explicit thing to the configured account and project, through th
 
   - readers poll Basecamp and append what they find to pending-comments.jsonl, once
     each, with a cursor or seen-list kept beside the config: card comments and
-    approvals, chat lines, due check-in questions, comments on tracked to-dos;
+    approvals, chat lines, due check-in questions, comments on tracked to-dos; the
+    event-feed reader hands pages of the account event feed to a behavior instead;
   - commands post exactly what the agent hands them: `reply`, `ask`, `answer`,
     `todo create|track|comment|complete`, `post-message`;
   - primitives the behaviors compose: card create/update/move/assign/unassign, a
@@ -22,9 +23,18 @@ config.
 """
 import contextlib, csv, fcntl, html, json, os, re, subprocess, time, tomllib
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 THUMBS, EYES = "\U0001F44D", "\U0001F440"
+
+
+class BasecampError(RuntimeError):
+    """A failed basecamp CLI call, keeping the CLI's error `code` and text."""
+
+    def __init__(self, msg, code=None, error=None):
+        super().__init__(msg)
+        self.code, self.error = code, error or ""
 
 
 class Tools:
@@ -62,7 +72,11 @@ class Tools:
 
     @contextlib.contextmanager
     def locked(self, name):
-        """Hold an exclusive lock on state file `name` while it is read, changed and saved; a dry run writes no lock file."""
+        """Hold an exclusive lock on state file `name` while it is read, changed and saved; a dry run writes no lock file.
+
+        locked("sync") is the shared state lock: a timer run, each listener cycle and
+        each command hold it throughout, so two of them never write state at once.
+        """
         if self.dry:
             yield
             return
@@ -102,7 +116,7 @@ class Tools:
             if out.get("ok"):
                 return out.get("data")
             if not out.get("retryable") or attempt == 2:
-                raise RuntimeError(f"basecamp {' '.join(args[:3])}: {out.get('error')}")
+                raise BasecampError(f"basecamp {' '.join(args[:3])}: {out.get('error')}", out.get("code"), out.get("error"))
             time.sleep(3)
 
     def gh(self, *args):
@@ -565,8 +579,8 @@ class Tools:
         return any((a.get("creator") or {}).get("id") == me and (a.get("group_on") or (a.get("created_at") or "")[:10]) == date
                    for a in answers)
 
-    def read_todo_comments(self):
-        """Record the owner's new comments on each open tracked to-do as `todo-comment` records.
+    def read_todo_comments(self, keys=None):
+        """Record the owner's new comments on each open tracked to-do (or only those in `keys`) as `todo-comment` records.
 
         todos.json keeps, per key, the to-do id and a cursor (the newest comment id
         seen). Each owner comment newer than the cursor is recorded once and queued
@@ -575,6 +589,8 @@ class Tools:
         A dry run reads and logs only.
         """
         for key in sorted(self.load("todos.json", {})):
+            if keys is not None and key not in keys:
+                continue
             with self.locked("todos.json"):
                 state = self.load("todos.json", {})
                 rec = state.get(key)
@@ -619,6 +635,69 @@ class Tools:
         self.read_boosts(rec, "todo", ctx, always=[(rec["todo"], rec.get("url"))])
         self.read_boosts(rec, "todo-comment", ctx,
                          counted=[(c.get("id"), c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
+
+    # --- the account event feed: wake-ups for the readers, never records ---
+
+    def comment_parent(self, cid):
+        """(type, id) of what comment `cid` is on, refetched from Basecamp, e.g. ("Kanban::Card", 5)."""
+        parent = (self.bc("api", "get", f"/buckets/{self.project}/comments/{cid}.json") or {}).get("parent") or {}
+        return parent.get("type"), parent.get("id")
+
+    def read_feed(self, types, creators, on_page, max_pages=20):
+        """Hand each page of the account event feed, filtered to this project, `types` and `creators`, to `on_page`.
+
+        An event is a thin pointer (id, event_type, bucket_id, creator_id,
+        recording_id, details), never content: it only says which reader to run.
+        feed.json keeps the position, the last event id handed over and the filters
+        they belong to. The first poll enters at the present (since=now), so history is
+        not replayed. A page's position is saved only after `on_page` returns, so a
+        failure re-reads that page next time; events at or below the last id are
+        dropped. `next` is followed up to `max_pages` pages.
+
+        Re-entry when Basecamp refuses where the poll starts: a position from before
+        the feed's epoch (410) re-enters at the epoch (since=0); one bound to other
+        filters (409) or unrecognized (400) re-enters after the last event handed over
+        (since=<id>), else at the present. Changed filters re-enter the same way without
+        waiting for the 409. The CLI passes on neither the HTTP status nor the body's
+        `reason`, so the error text tells them apart; an invalid filter is never retried.
+        A dry run hands pages over but saves nothing. Returns the number of events handed over.
+        """
+        filters = {"types": ",".join(sorted(types)), "buckets": self.project}
+        if creators:
+            filters["creators"] = ",".join(str(c) for c in sorted(creators))
+        key = urlencode(filters, safe=",", quote_via=quote)
+        state = self.load("feed.json", {})
+        last = state.get("last_event") or 0
+        if state.get("filters") == key and state.get("position"):
+            start = {"position": state["position"]}
+        else:
+            start = {"since": last if last and state.get("filters") else "now"}
+            self.log(f"feed: entering with since={start['since']}" + (" (filters changed)" if state.get("filters") else ""))
+        handed, reentries = 0, 0
+        for _ in range(max_pages):
+            try:
+                page = self.bc("api", "get", "/events.json?" + urlencode({**filters, **start}, safe=",", quote_via=quote)) or {}
+            except BasecampError as e:
+                again = feed_reentry(e.error, start, last)
+                if again is None or reentries == 2:
+                    raise
+                reentries += 1
+                self.log(f"feed: {e.error.strip()} Re-entering with since={again['since']}.")
+                start = again
+                continue
+            events = sorted((ev for ev in page.get("events") or [] if (ev.get("id") or 0) > last), key=lambda ev: ev["id"])
+            if events:
+                on_page(events)
+                handed += len(events)
+                last = events[-1]["id"]
+            if not page.get("position"):
+                raise RuntimeError("feed: a page without a position")
+            start = {"position": page["position"]}
+            if not self.dry:
+                self.save_json("feed.json", {"filters": key, "position": page["position"], "last_event": last})
+            if not page.get("next"):
+                break
+        return handed
 
     # --- commands: explicit posts, run by the agent ---
 
@@ -893,6 +972,24 @@ def is_due(q, now):
     if end and end < now.strftime("%Y-%m-%d"):
         return False
     return (now.hour, now.minute) >= (int(sch.get("hour", 0)), int(sch.get("minute", 0)))
+
+
+def feed_reentry(error, start, last):
+    """Where to re-enter the event feed after Basecamp refused `start` with `error`, or None to fail.
+
+    The texts are Basecamp's: 410 "predates this feed's epoch", 409 "bound to the filter
+    set", 400 "Unrecognized position"; an invalid filter says "Fix the filters".
+    """
+    text = (error or "").lower()
+    if "fix the filters" in text:
+        return None
+    if "epoch" in text:
+        return None if start.get("since") == 0 else {"since": 0}
+    if "position" in text and "since" not in start:
+        return {"since": last or "now"}
+    if "position" in text and start.get("since") not in ("now", 0):
+        return {"since": "now"}
+    return None
 
 
 def render_reply(text):

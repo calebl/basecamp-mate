@@ -7,8 +7,10 @@ the agent hands them (`reply`, `ask`, `answer`, `todo ...`, `post-message`).
 behaviors.py is the behaviors layer: opt-in workflows a home turns on in its config
 and that compose the tools: the card mirror ("tables", "repos"; off with "cards":
 false), the chat inbox ("chats"), chat asks ("ask_chat"), check-in answering
-("checkins"), release announcements ("releases"), decision to-dos ("todos") and
-reports ("message_board"). prompts/base.md is the agent's side of each behavior.
+("checkins"), release announcements ("releases"), decision to-dos ("todos"),
+reports ("message_board"), inbox delivery ("inbox") and the owner-event listener
+("listen", run by `sync.py listen` as a service beside the timer). prompts/base.md is
+the agent's side of each behavior.
 
 Deterministic, no model calls. Safety bounds, enforced here:
   - only the configured account, project, card tables, chats, check-ins, to-do set
@@ -32,6 +34,7 @@ Usage: sync.py --home <home> --config <config.json> [--dry-run] [--include-prere
        sync.py todo comment --home <home> --config <config.json> --todo <key or id> --body-file <file> [--dry-run]
        sync.py todo complete --home <home> --config <config.json> --todo <key or id> [--dry-run]
        sync.py post-message --home <home> --config <config.json> --subject <text> --body-file <file> [--dry-run]
+       sync.py listen --home <home> --config <config.json> [--once] [--dry-run]
        sync.py behaviors --home <home> --config <config.json>
        sync.py init <project URL> --login <profile> --home <home> [--captain <id or email>] [--repo-map TABLE=REPO] [--dry-run]
 """
@@ -74,15 +77,58 @@ class Sync(Tools):
         return self.card_mirror.body_for(*args, **kw)
 
     def main(self, items=None):
-        """One run: each behavior that is on, in order; a behavior left out of the config makes no calls."""
+        """One run: each behavior that is on, in order; a behavior left out of the config makes no calls.
+
+        It holds the shared state lock throughout, so a listener cycle waits for it.
+        """
         plan = None
-        for b in self.behaviors.values():
-            if b.on and b.timer:
-                out = b.run(items)
-                plan = out if b is self.card_mirror else plan
+        with self.locked("sync"):
+            for b in self.behaviors.values():
+                if b.on and b.timer:
+                    out = b.run(items)
+                    plan = out if b is self.card_mirror else plan
         if not self.cards:
             self.log("cards off" + (" (dry run)" if self.dry else ""))
         return plan
+
+    def listen_once(self):
+        """One listener cycle under the shared state lock: the owner's new events, each dispatched to its reader."""
+        with self.locked("sync"):
+            return self.behaviors["owner-events"].run()
+
+
+def listen(a, runner, sleep=None, cycles=None):
+    """`sync.py listen`: a listener cycle every "interval" seconds until the config turns "listen" off.
+
+    The config is re-read each cycle. A failed cycle is retried on the next; the third
+    failure in a row is logged once as FAILED (so the wake check sees it) and recovery
+    is logged too. Exits 0 when "listen" is off, so a Restart=on-failure service stays down.
+    """
+    import time
+    sleep = sleep or time.sleep
+    failures, n = 0, 0
+    while cycles is None or n < cycles:
+        n += 1
+        s = Sync(a.home, a.config, dry=a.dry_run, runner=runner)
+        ev = s.behaviors["owner-events"]
+        if not ev.on:
+            s.log('listen: "listen" is not set in the config; stopping')
+            return 0
+        try:
+            s.listen_once()
+            if failures >= 3:
+                s.log(f"listen: recovered after {failures} failed cycles")
+            failures = 0
+        except Exception as e:
+            failures += 1
+            if failures == 3:
+                s.log(f"FAILED listen {type(e).__name__}: {e} (3 cycles in a row; retrying every {ev.interval}s)")
+            elif failures < 3:
+                s.log(f"listen: cycle failed, retrying: {type(e).__name__}: {e}")
+        if a.once:
+            return 1 if failures else 0
+        sleep(ev.interval)
+    return 0
 
 
 def common(prog, description):
@@ -100,7 +146,8 @@ def read(path):
 def command(a, what, call, runner):
     s = Sync(a.home, a.config, dry=getattr(a, "dry_run", False), runner=runner)
     try:
-        call(s)
+        with s.locked("sync"):
+            call(s)
     except Exception as e:
         s.log(f"FAILED {what} {type(e).__name__}: {e}")
         return 1
@@ -172,11 +219,16 @@ def cli(argv=None, runner=subprocess.run):
         ap.add_argument("--dry-run", action="store_true")
         a = ap.parse_args(argv[1:])
         return command(a, "post-message", lambda s: s.post_message(a.subject, read(a.body_file)), runner)
+    if argv[:1] == ["listen"]:
+        ap = common("sync.py listen", "Poll the Basecamp event feed for the owner's events and run the matching readers.")
+        ap.add_argument("--once", action="store_true", help="one cycle, then exit (non-zero when it failed)")
+        ap.add_argument("--dry-run", action="store_true", help="read and log; record, boost and save nothing")
+        return listen(ap.parse_args(argv[1:]), runner)
     if argv[:1] == ["behaviors"]:
         a = common("sync.py behaviors", "List the behaviors and whether this config turns each on.").parse_args(argv[1:])
         s = Sync(a.home, a.config, runner=runner)
         for b in s.behaviors.values():
-            print(f"{b.name:22} {'on ' if b.on else 'off'}  {'timer' if b.timer else 'agent'}  ({', '.join(b.keys)})")
+            print(f"{b.name:22} {'on ' if b.on else 'off'}  {b.runs:8}  ({', '.join(b.keys)})")
         return 0
     ap = argparse.ArgumentParser(description="One timer run: every behavior the config turns on.")
     ap.add_argument("--home", required=True, help="firstmate home (holds data/backlog.md and state/)")
