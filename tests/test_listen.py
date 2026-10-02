@@ -32,6 +32,7 @@ class FeedStub(TodoStub):
     def __init__(self):
         super().__init__()
         self.feed, self.queries, self.parents = [], [], {}  # queued responses; each poll's query; comment id -> parent
+        self.recordings = {}  # recording id -> its generic JSON (/recordings/<id>.json)
         self.on_feed = None  # called on each poll, e.g. to block a thread
 
     def __call__(self, cmd, **kw):
@@ -54,8 +55,12 @@ class FeedStub(TodoStub):
             if core[:2] == ["api", "get"] and "/comments/" in core[2]:
                 self.calls.append(core)
                 cid = int(core[2].split("/")[-1].split(".")[0])
-                return SimpleNamespace(stdout=json.dumps({"ok": True, "data": {"id": cid, "parent": self.parents.get(cid, {})}}),
-                                       stderr="", returncode=0)
+                data = {"id": cid, "parent": self.parents.get(cid, {}), **self.recordings.get(cid, {})}
+                return SimpleNamespace(stdout=json.dumps({"ok": True, "data": data}), stderr="", returncode=0)
+            if core[:2] == ["api", "get"] and "/recordings/" in core[2] and not core[2].endswith("/boosts.json"):
+                self.calls.append(core)
+                rid = int(core[2].split("/")[-1].split(".")[0])
+                return SimpleNamespace(stdout=json.dumps({"ok": True, "data": self.recordings.get(rid, {})}), stderr="", returncode=0)
         return super().__call__(cmd, **kw)
 
     def page(self, *events, position=None, more=False):
@@ -95,8 +100,8 @@ class FeedReader(ListenBase):
         self.stub.page(position="p2")
         self.listen()
         first, second = self.stub.queries
-        self.assertEqual(first, {"since": "now", "types": "boost.created,chat.line.created,comment.created",
-                                 "buckets": str(PROJECT), "creators": str(CAPTAIN)})
+        # Every type in the catalog (unmonitored events are on), still only the owner's in this project.
+        self.assertEqual(first, {"since": "now", "buckets": str(PROJECT), "creators": str(CAPTAIN)})
         self.assertEqual(second["position"], "p1")
         self.assertNotIn("since", second)
         self.assertEqual(self.feed_state()["position"], "p2")
@@ -199,8 +204,7 @@ class Reentry(ListenBase):
         self.cfg(captain=CAPTAIN + 1)
         self.stub.page(position="p2")
         self.listen()
-        self.assertEqual(self.stub.queries[-1], {"since": "10", "types": "boost.created,chat.line.created,comment.created",
-                                                 "buckets": str(PROJECT), "creators": str(CAPTAIN + 1)})
+        self.assertEqual(self.stub.queries[-1], {"since": "10", "buckets": str(PROJECT), "creators": str(CAPTAIN + 1)})
         self.assertIn("(filters changed)", self.log())
 
 
@@ -251,8 +255,10 @@ class Dispatch(ListenBase):
         self.stub.parents[9] = {"id": 4, "type": "Upload"}
         self.stub.page(event(10, "comment.created", rid=9))
         self.listen()
-        self.assertEqual([c[2].split("?")[0] for c in self.stub.calls], ["/events.json", f"/buckets/{PROJECT}/comments/9.json"])
-        self.assertIn("nothing to read", self.log())
+        self.assertEqual([c[2].split("?")[0] for c in self.stub.calls],
+                         ["/events.json", f"/buckets/{PROJECT}/comments/9.json", "/my/profile.json"])
+        self.assertEqual(self.kinds(), ["unmonitored"])  # no reader ran; the comment itself is the record's source
+        self.assertIn("-> unmonitored 1", self.log())
 
     def test_comment_on_the_agents_message_runs_the_message_reader(self):
         recent = sync.datetime.now(sync.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -282,6 +288,7 @@ class Dispatch(ListenBase):
         self.assertFalse([c for c in self.stub.calls if "/message_boards/" in c[2]])
 
     def test_boost_on_an_unseen_recording_runs_every_cheap_boost_reader(self):
+        self.cfg(listen={"unmonitored": False})  # the first boost's recording stays unknown to every reader
         recent = sync.datetime.now(sync.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self.stub.page(event(10, "boost.created", rid=20, boost_id=50))
         self.stub.boosts["99"] = []
@@ -297,10 +304,162 @@ class Dispatch(ListenBase):
         self.assertEqual(self.pending(), [])
 
     def test_off_behaviors_are_never_read(self):
-        self.cfg(drop=("chats", "todos", "message_board"))
+        self.cfg(drop=("chats", "todos", "message_board"), listen={"unmonitored": False})
         self.stub.page(event(10, rid=1), event(11, "boost.created", rid=5))
         self.listen()
         self.assertEqual([c[2].split("?")[0] for c in self.stub.calls], ["/events.json"])
+
+    def test_off_behaviors_are_never_read_and_their_events_are_unmonitored(self):
+        self.cfg(drop=("chats", "todos", "message_board"))
+        self.stub.page(event(10, rid=1), event(11, "boost.created", rid=5))
+        self.listen()
+        read = [c[2].split("?")[0] for c in self.stub.calls]
+        self.assertFalse([r for r in read if "/chats/" in r or "/message_boards/" in r or r.endswith("/boosts.json")])
+        self.assertEqual([r["key"] for r in self.pending()], ["chat.line.created/Chat::Lines", "boost.created/unknown"])
+
+
+class Unmonitored(ListenBase):
+    """An owner event no enabled behavior handles is recorded once per (event type, recording type)."""
+
+    DOC = {"id": 4, "type": "Document", "title": "Roadmap", "app_url": "https://x/docs/4"}
+
+    def setUp(self):
+        super().setUp()
+        self.cfg(inbox={})
+        self.poll()  # inbox delivery starts after the existing records
+        self.stub.calls.clear()
+
+    def todo(self, rid, title="Buy paint"):
+        self.stub.recordings[rid] = {"id": rid, "type": "Todo", "title": title, "content": title,
+                                     "description": "<div>for the <b>porch</b></div>", "app_url": f"https://x/todos/{rid}",
+                                     "creator": {"id": CAPTAIN, "name": "Cap"}}
+
+    def state(self):
+        p = os.path.join(self.cfgdir, "unmonitored.json")
+        return json.load(open(p)) if os.path.exists(p) else {}
+
+    def recording_reads(self):
+        return [c[2] for c in self.stub.calls if c[:2] == ["api", "get"] and "/recordings/" in c[2] and "/boosts" not in c[2]]
+
+    def test_unhandled_type_is_recorded_with_what_it_is_and_delivered(self):
+        self.todo(40)
+        self.stub.page(event(10, "todo.created", rid=40))
+        self.listen()
+        [rec] = self.pending()[-1:]
+        self.assertEqual(rec, {"kind": "unmonitored", "key": "todo.created/Todo", "event_type": "todo.created",
+                               "recording_type": "Todo", "event": 10, "recording": 40, "title": "Buy paint",
+                               "text": "for the porch", "creator": {"id": CAPTAIN, "name": "Cap"},
+                               "url": "https://x/todos/40", "at": "te"})
+        [(rid, body, *_)] = self.stub.notes
+        self.assertEqual(rid, "basecamp-unmonitored-todo.created-Todo-10")
+        self.assertIn("nothing monitors: todo.created on Todo 'Buy paint'", body)
+        self.assertIn("sync.py todo create", body)
+        self.assertIn("sync.py unmonitored handle --key 'todo.created/Todo'", body)
+
+    def test_one_record_per_kind_of_thing_until_forgotten(self):
+        self.todo(40)
+        self.todo(41)
+        self.stub.page(event(10, "todo.created", rid=40), event(11, "todo.created", rid=41), event(12, "todo.completed", rid=41))
+        self.listen()
+        self.assertEqual([r["key"] for r in self.pending()], ["todo.created/Todo", "todo.completed/Todo"])
+        self.assertEqual(self.recording_reads(), [f"/buckets/{PROJECT}/recordings/40.json", f"/buckets/{PROJECT}/recordings/41.json"])
+        self.assertEqual(self.state()["todo.created/Todo"]["seen"], 2)
+        self.sync().unmonitored_handle("todo.created/Todo", "ignore them")
+        self.stub.page(event(13, "todo.created", rid=41))
+        self.listen()
+        self.assertEqual(len(self.pending()), 2)  # handled: still quiet
+        self.assertEqual(self.state()["todo.created/Todo"]["handled"]["decision"], "ignore them")
+        self.sync().unmonitored_forget("todo.created/Todo")
+        self.stub.page(event(14, "todo.created", rid=41))
+        self.listen()
+        self.assertEqual([r["event"] for r in self.pending()], [10, 12, 14])
+        self.assertEqual(len(self.stub.notes), 3)
+
+    def test_comments_are_keyed_on_what_they_are_on(self):
+        tid = self.create()
+        self.create(key="done")
+        self.sync().todo_complete("done")
+        done = self.todos()["done"]["todo"]
+        self.stub.calls.clear()
+        self.stub.comments[str(tid)] = [comment(9)]
+        self.stub.parents.update({9: {"id": tid, "type": "Todo"}, 20: self.DOC, 21: {"id": done, "type": "Todo"},
+                                  22: self.DOC})
+        self.stub.recordings[20] = {"content": "<p>tighten the intro</p>", "app_url": "https://x/docs/4#c20"}
+        self.stub.page(event(10, "comment.created", rid=9), event(11, "comment.created", rid=20),
+                       event(12, "comment.created", rid=21), event(13, "comment.content_changed", rid=22))
+        self.listen()
+        self.assertEqual([r["kind"] for r in self.pending()], ["todo-comment", "unmonitored", "unmonitored", "unmonitored"])
+        doc, closed, edit = self.pending()[1:]
+        self.assertEqual((doc["key"], doc["title"], doc["text"], doc["url"]),
+                         ("comment.created/Document", "Roadmap", "tighten the intro", "https://x/docs/4#c20"))
+        self.assertEqual(closed["key"], "comment.created/Todo")  # a completed to-do's comments are no longer read
+        self.assertEqual(edit["key"], "comment.content_changed/Document")
+
+    def test_boosts_on_untracked_things(self):
+        self.sync().main([item("a")])  # card 501
+        self.stub.calls.clear()
+        self.todo(40)
+        self.stub.recordings[30] = {"id": 30, "type": "Comment", "parent": {"id": 501, "type": "Kanban::Card"}}
+        self.stub.recordings[31] = {"id": 31, "type": "Comment", "parent": self.DOC, "content": "ok"}
+        self.stub.page(event(10, "boost.created", rid=40), event(11, "boost.created", rid=30), event(12, "boost.created", rid=31))
+        self.listen()
+        # A boost on a new comment under a mirrored card waits for the timer's sweep; the others are unmonitored.
+        self.assertEqual([r["key"] for r in self.pending()], ["boost.created/Todo", "boost.created/Comment on Document"])
+        self.assertEqual(self.pending()[1]["title"], "Roadmap")
+
+    def test_handled_events_record_nothing_unmonitored(self):
+        tid = self.create()
+        self.poll()  # seeds the to-do's boosts
+        self.stub.calls.clear()
+        self.stub.lines["77"].append(line(2, content="ship it?"))
+        self.stub.comments[str(tid)] = [comment(9)]
+        self.stub.parents[9] = {"id": tid, "type": "Todo"}
+        self.stub.boosts[str(tid)] = [boost(70, content="yes")]
+        self.stub.page(event(10, rid=2), event(11, rid=1), event(12, "comment.created", rid=9),
+                       event(13, "boost.created", rid=tid, boost_id=70))
+        self.listen()
+        self.assertEqual(self.kinds(), ["chat-question", "todo-comment", "boost"])
+        self.assertEqual(self.recording_reads(), [])
+        self.assertEqual(self.state(), {})
+
+    def test_not_told_apart_when_the_acting_user_is_the_owner_or_in_a_dry_run(self):
+        self.todo(40)
+        self.stub.page(event(10, "todo.created", rid=40))
+        self.listen(dry=True)
+        self.stub.me = CAPTAIN
+        self.stub.page(event(10, "todo.created", rid=40))
+        self.listen()
+        self.assertEqual((self.pending(), self.state()), ([], {}))
+        self.assertIn("dry run, so the readers saved nothing", self.log())
+        self.assertIn("the acting user is the owner or unknown", self.log())
+
+    def test_off_or_without_a_profile_keeps_the_narrow_feed(self):
+        for cfg in ({"listen": {"unmonitored": False}}, {"profile": None}):
+            self.cfg(**cfg)
+            self.stub.queries.clear()
+            self.todo(40)
+            self.stub.page(event(10, "todo.created", rid=40))
+            self.listen()
+            self.assertEqual(self.stub.queries[0]["types"], "boost.created,chat.line.created,comment.created")
+            self.assertEqual(self.pending(), [])
+            self.cfg(listen={}, profile="agent")
+        with self.assertRaises(ValueError):
+            self.cfg(listen={"unmonitored": "no"})
+            self.sync()
+
+    def test_cli_list_handle_forget(self):
+        self.todo(40)
+        self.stub.page(event(10, "todo.created", rid=40))
+        self.listen()
+        cfg = ["--home", self.home, "--config", os.path.join(self.cfgdir, "config.json")]
+        self.assertEqual(sync.cli(["unmonitored", "handle", *cfg, "--key", "todo.created/Todo", "--decision", "ignore"],
+                                  runner=self.stub), 0)
+        self.assertEqual(sync.cli(["unmonitored", "handle", *cfg, "--key", "nope/Todo", "--decision", "x"], runner=self.stub), 1)
+        self.assertIn("no unmonitored key 'nope/Todo'", self.log())
+        self.assertEqual(sync.cli(["unmonitored", "list", *cfg], runner=self.stub), 0)
+        self.assertEqual(sync.cli(["unmonitored", "forget", *cfg, "--key", "todo.created/Todo"], runner=self.stub), 0)
+        self.assertEqual(self.state(), {})
+        self.assertEqual(sync.cli(["unmonitored", "bogus"], runner=self.stub), 2)
 
 
 class SharedLock(ListenBase):

@@ -17,6 +17,7 @@ policy. Each does one thing to the configured account and project:
 | message comment reader | reader | records the owner's new comments on the agent's own recent Message Board posts as `message-comment` |
 | boost readers | reader | record the owner's new boosts, with their text, on every monitored surface as `boost` (below) |
 | event-feed reader | reader | polls Basecamp's account event feed (`/events.json`) for this project from a saved position and hands each page of thin events to a behavior; records nothing itself |
+| unmonitored-event recorder | reader | records an owner event that no behavior handles as `unmonitored`, once per kind of thing (below) |
 | `sync.py reply` | command | answers a recorded comment, chat line or to-do comment where it was made, then removes the 👀 |
 | `sync.py ask` | command | posts a new chat line @mentioning the owner |
 | `sync.py answer` | command | answers a check-in question, once per question per day |
@@ -25,6 +26,7 @@ policy. Each does one thing to the configured account and project:
 | `sync.py todo comment` | command | comments on a tracked to-do |
 | `sync.py todo complete` | command | completes a tracked to-do |
 | `sync.py post-message` | command | posts a message (subject and body) on the configured message board |
+| `sync.py unmonitored list\|handle\|forget` | command | lists the unmonitored-event keys, marks one handled with the owner's decision, or drops one so it is raised again |
 | inbox note | primitive | queues a note in a firstmate home's inbox through its `bin/fm-inbox.sh note --request-id` |
 | card, Message Board and boost primitives | primitive | create, update, move, assign and unassign a card; post a board message; add an acknowledgement boost |
 
@@ -48,7 +50,7 @@ listener service; the others are carried out by the agent with the commands. The
 | `decision-todos` | `todos` | `--todos` | to-do comment reader | `todo create`, `reply`/`todo comment`, `todo complete` |
 | `reports` | `message_board` | `--reports` | comment and boost readers on the agent's messages | `post-message`; `reply` to feedback |
 | `inbox-delivery` | `inbox` | `--inbox` | deliver each new pending record as a firstmate inbox note | handle the note, then `fm-inbox.sh drain --ack` |
-| `owner-events` | `listen` | `--listen` | none: runs in the listener service (`sync.py listen`, below) | none; records arrive sooner |
+| `owner-events` | `listen` | `--listen` | none: runs in the listener service (`sync.py listen`, below) | records arrive sooner; an `unmonitored` record becomes a decision to-do |
 
 The boundary: behaviors never run a CLI themselves (every Basecamp, GitHub, backlog or
 Lavish call goes through a tool), and tools never decide whether to run or what to do
@@ -105,7 +107,7 @@ reader for the surface each event points at:
 | an owner comment | refetches the comment for its parent, then that mirrored card's comment and 👍 readers, that tracked to-do's reader, or the reader for the agent's messages |
 | an owner boost | the reader whose state already knows the boosted recording (a card, a to-do, a chat line, a check-in answer, a message); for a recording none has seen yet, every reader that reads boosts except the card mirror's |
 
-Then it runs inbox delivery, when that is on. An event is a thin pointer and only says
+Then it records unmonitored events (below) and runs inbox delivery, when that is on. An event is a thin pointer and only says
 which reader to run: records, 👀/👍 acknowledgements, seen-lists and inbox notes are the
 readers' own, exactly as on the timer, so the agent sees the same records, typically within
 about a minute instead of up to five. The feed is best effort by Basecamp's own contract
@@ -128,6 +130,36 @@ cycle; `--dry-run` reads and logs, and records, boosts and saves nothing. After 
 this checkout, restart the service (`systemctl --user restart basecamp-sync-<home
 path>-listen.service`), or re-run `init`.
 
+### Unmonitored events
+
+Unless `listen` has `"unmonitored": false`, the listener also notices the owner doing
+something in the project that no enabled behavior handles, so the agent can ask the owner
+what to do about it. For that it reads the feed for every event type in Basecamp's catalog
+(no `types` filter, so types Basecamp adds later arrive too), still only the owner's
+(`creators`) and only this project (`buckets`), at most 20 pages a cycle. After the page's
+readers have run, each owner event is checked against what they saw:
+
+| Event | Handled when |
+| --- | --- |
+| a chat line | `chat-inbox` is on and its reader saw the line (it is in a relayed chat) |
+| a comment | it is on a mirrored card, an open tracked to-do, or one of the agent's posts the reports reader knows |
+| a boost | a reader's state knows the boosted recording (the same check that picks the reader), or it is on a comment under a mirrored card, which the timer's sweep reads |
+| any other type | never: `todo.created`, `todo.completed`, `card.moved`, `message.created`, `question.answer.created`, a comment edit, ... |
+
+Anything else is recorded as an `unmonitored` record (fields below) and delivered like any
+other record. It is keyed on the event type and the recording type, e.g.
+`todo.created/Todo`, `comment.created/Document` (for a comment, the type of what it is on),
+`boost.created/Comment on Upload` or `chat.line.created/Chat::Lines`, and each key is
+recorded once: `unmonitored.json` beside the config keeps the keys seen, the first event,
+a count of later ones and, once the agent runs `sync.py unmonitored handle --key <key>
+--decision <text>`, the owner's decision; the key then stays quiet. `sync.py unmonitored
+forget --key <key>` drops it, so the next such event is recorded (and put to the owner)
+again; `sync.py unmonitored list` prints the file. The recording is refetched
+(`/buckets/<project>/recordings/<id>.json`, or the comment) only for a new key, for the
+record's title, excerpt and link. Without a `profile`, or with one that signs in as the
+owner, the sync's own writes would be owner events, so nothing is checked (and the feed
+stays on the three handled types); a dry run checks nothing either.
+
 The timer run, each listener cycle and each command hold one shared lock (`sync.lock`
 beside the config) throughout, so two of them never read and write the state at once; a
 listener cycle that comes due during a timer run waits for it.
@@ -135,8 +167,9 @@ listener cycle that comes due during a timer run waits for it.
 ## Safety bounds
 
 - Only the configured account, project, card tables, chats, check-ins, to-do set and
-  message board are touched. The listener only reads (the feed, a comment's parent) and
-  runs the same readers; it posts nothing beyond their 👀/👍 acknowledgements.
+  message board are touched. The listener only reads (the feed, a comment's parent, an
+  unmonitored event's recording) and runs the same readers; it posts nothing beyond their
+  👀/👍 acknowledgements.
 - Cards are never deleted, trashed or archived. Cards whose task left the backlog are
   left as they are (the run logs how many).
 - The sync never posts to chat or as a comment. Its one automatic post is a release
@@ -372,6 +405,8 @@ or by hand from
   record as a note in that home's inbox (default: the `--home`).
 - `listen` (optional): `{}` or `{"interval": <seconds>}`: run the owner-event listener
   (`sync.py listen`), polling the event feed every `interval` seconds (default 30).
+  `"unmonitored": false` turns off unmonitored-event records and keeps the feed on the
+  three handled types.
 - `chats` (optional): chat (Campfire) ids whose captain questions are relayed.
   An entry may be `{"chat": <id>, "every_line": true}` to relay every owner line in that chat.
 - `ask_chat` (optional): the chat id `sync.py ask` posts in.
@@ -399,6 +434,7 @@ Everything else lives beside the config, never in this repo:
 | `inbox.json` | the script | the line cursor of `pending-comments.jsonl` delivered to the inbox, and request ids whose failure was logged |
 | `messages.json` | the script | per agent message: comment cursor, owner comments recorded, acknowledgement boosts queued and done, comments replied to; boost counts and boosts seen on the messages and their comments |
 | `feed.json` | the listener | the event feed's position, the last event id handled and the filters they belong to |
+| `unmonitored.json` | the listener | unmonitored-event key -> the first event and recording recorded, when, how many were seen, and the owner's decision once handled |
 | `sync.lock` | the script | the shared state lock held by a timer run, a listener cycle or a command |
 | `todos.json` | the script | to-do key -> to-do id, title, URL, created and completed times, comment cursor, owner comments recorded, acknowledgement boosts queued and done, comments replied to |
 | `sync.log` | the script | one line per action, plus a counts line per run |
@@ -497,8 +533,10 @@ python3 -m unittest discover -s tests -v
 boost readers on every surface, inbox delivery (with `fm-inbox.sh` stubbed), the
 new commands and the layer boundary; `tests/test_listen.py` covers the listener with
 stubbed `/events.json` pages: entry and resume, `next`, position saved only after a page
-is handled, 409/410/400 re-entry, dispatch to each reader, and no duplicate record when a
-timer sweep runs during a listener cycle. The `basecamp`, `gh` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
+is handled, 409/410/400 re-entry, dispatch to each reader, no duplicate record when a
+timer sweep runs during a listener cycle, and unmonitored events: detection per event
+kind, one record per key until forgotten, handled events recording nothing, and the
+narrow feed when it is off. The `basecamp`, `gh` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
 registration sit behind a fake; tests make no network calls and touch no real home.
 
 ## Pending records
@@ -524,6 +562,11 @@ before `kind` existed have none; treat a missing `kind` as `"comment"`.
   `repo`, `card`; `key`, `todo`; `question`; `message`, `subject`), `recording` (the
   boosted recording), `boost` (id), `text` (the boost's text), `url`, `at`. The owner's
   boost is an answer to what was boosted, like a comment.
+- `unmonitored`: `key` (`<event type>/<recording type>`), `event_type`, `recording_type`,
+  `event` (id), `recording` (id), `title` (for a comment, of what it is on), `text` (an
+  excerpt), `creator` (`id`, `name`), `url`, `at`. The owner did something no enabled
+  behavior handles; put it to them as a decision to-do asking how events like it should be
+  handled, act on the answer, then `sync.py unmonitored handle --key <key> --decision <text>`.
 
 ## License
 
