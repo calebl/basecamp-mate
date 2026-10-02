@@ -11,7 +11,10 @@ to append pending records, and commands you run to post (`reply`, `ask`, `answer
 config turns on, each composed from tools: the card mirror (`tables`, `repos`; off with
 `"cards": false` or without `tables`), the chat inbox (`chats`), chat asks (`ask_chat`),
 check-in answering (`checkins`), release announcements (`releases`), decision to-dos
-(`todos`) and reports (`message_board`). `python3 $SYNC/sync.py behaviors --home <home>
+(`todos`), reports (`message_board`), inbox delivery (`inbox`) and the owner-event
+listener (`listen`: a `sync.py listen` service beside the timer that polls Basecamp's event
+feed and runs the same readers within about a minute of the captain posting; the records
+are the same). `python3 $SYNC/sync.py behaviors --home <home>
 --config <config>` lists which are on. Sections below about cards and the side files apply
 only when the card mirror is on. Mechanics (column rules, file formats, record fields,
 safety bounds) are in the repo's README: `firstmate-basecamp-sync/README.md`. `SYNC` below
@@ -36,8 +39,8 @@ is not a registered project's name). A card table matching no registered project
 skipped and printed, not refused; check the skipped list and pass `--repo-map` for any
 board that is really a repo's. When the owner wants only chat, check-ins or release
 announcements, or the project has no card tables, pass `--no-cards`. `--todos`,
-`--reports`, `--every-line`, `--inbox` and `--checkins <time zone>` turn on decision
-to-dos, reports, every-line chat, inbox delivery and check-in answering; `--no-releases` leaves announcements out. Never pass `--force` or `--create-missing-columns`
+`--reports`, `--every-line`, `--inbox`, `--listen` and `--checkins <time zone>` turn on decision
+to-dos, reports, every-line chat, inbox delivery, the listener service and check-in answering; `--no-releases` leaves announcements out. Never pass `--force` or `--create-missing-columns`
 without the main firstmate's go-ahead.
 
 ## The backlog is the source of truth
@@ -121,7 +124,7 @@ Handle each new record by its `kind` (missing `kind` = `comment`):
   one per line with
   `python3 $SYNC/sync.py ask --home <home> --config <home>/data/basecamp-sync/config.json --body-file <file>`;
   it @mentions the owner.
-- A FAILED run: read `sync.log`; a token failure needs `basecamp auth login -P <profile>`,
+- A FAILED run (or `FAILED listen`, three listener cycles in a row): read `sync.log`; a token failure needs `basecamp auth login -P <profile>`,
   which only the captain can do, so relay it.
 
 The main firstmate's own home answers its questions itself rather than relaying.
@@ -130,7 +133,7 @@ The main firstmate's own home answers its questions itself rather than relaying.
 
 - Post, comment, complete, delete, archive or trash anything in Basecamp outside `sync.py`
   and its commands (`reply`, `ask`, `answer`, `todo create|track|comment|complete`,
-  `post-message`), or hand-edit `todos.json`.
+  `post-message`), or hand-edit `todos.json` or `feed.json`.
   The sync's one automatic post is a release announcement: releases only (GitHub releases
   of the repos in `releases`, never merges or PRs), Message Board only. Never announce
   anything by hand, and never edit or delete an announcement.

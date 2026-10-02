@@ -80,6 +80,14 @@ class FakeSystem:
             self.units[name] = (service, timer)
         return [f"install {name}"]
 
+    def install_service(self, name, service, dry):
+        self.calls.append(("service", name, dry))
+        if self.units.get(name) == service:
+            return []
+        if not dry:
+            self.units[name] = service
+        return [f"install {name}.service"]
+
     def register_check(self, home, cid, script, dry):
         self.calls.append(("check", cid, dry))
         if self.checks.get(cid) == script:
@@ -319,6 +327,21 @@ class InitTest(unittest.TestCase):
         self.assertEqual(self.system.checks["basecamp-sync"], init_home.CHECK_INBOX)
         self.assertNotIn("pending-comments", init_home.CHECK_INBOX.split("Pending records")[1])
 
+    def test_listen_installs_the_listener_service_only_when_set(self):
+        self.init().main()
+        self.assertFalse([c for c in self.system.calls if c[0] == "service"])
+        cfg, _ = self.init(listen=True).discover()
+        self.assertEqual(cfg, EXPECTED | {"listen": {}})
+        self.assertIn("install basecamp-sync-", " ".join(self.init(listen=True, force=True, dry=True).main()))
+        self.assertFalse([n for n in self.system.units if n.endswith("-listen")])
+        self.init(listen=True, force=True).main()
+        [name] = [n for n in self.system.units if n.endswith("-listen")]
+        unit = self.system.units[name]
+        self.assertIn("Type=simple", unit)
+        self.assertIn("Restart=on-failure", unit)
+        self.assertIn(f"sync.py listen --home {self.home} --config {os.path.join(self.dir, 'config.json')}", unit)
+        self.assertEqual(self.init(listen=True).main(), [])  # re-run: nothing to change
+
     def test_no_releases_reads_no_origins(self):
         self.stub.origins = {"Engine": "https://github.com/acme/engine.git"}
         cfg, _ = self.init(cards=False, repo_map=[], releases=False).discover()
@@ -380,6 +403,14 @@ class SystemTest(unittest.TestCase):
         changed = self.sys.install_timer("u", "S", "T", dry=False)
         self.assertIn("systemctl --user enable --now u.timer", changed)
         self.assertEqual(self.sys.install_timer("u", "S", "T", dry=False), [])
+
+    def test_service_installed_started_then_restarted_on_change(self):
+        changed = self.sys.install_service("u-listen", "S", dry=False)
+        self.assertEqual(changed[1:], ["systemctl --user daemon-reload", "systemctl --user enable --now u-listen.service"])
+        self.assertEqual(self.sys.install_service("u-listen", "S", dry=False), [])
+        self.assertEqual(self.sys.install_service("u-listen", "S2", dry=False)[1:],
+                         ["systemctl --user daemon-reload", "systemctl --user restart u-listen.service"])
+        self.assertIn(["systemctl", "--user", "restart", "u-listen.service"], self.cmds)
 
     def test_check_registered_then_nothing(self):
         self.assertTrue(self.sys.register_check(self.home, "basecamp-sync", init_home.CHECK, dry=True))

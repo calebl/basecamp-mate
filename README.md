@@ -16,6 +16,7 @@ policy. Each does one thing to the configured account and project:
 | to-do comment reader | reader | records the owner's new comments on tracked open to-dos as `todo-comment` |
 | message comment reader | reader | records the owner's new comments on the agent's own recent Message Board posts as `message-comment` |
 | boost readers | reader | record the owner's new boosts, with their text, on every monitored surface as `boost` (below) |
+| event-feed reader | reader | polls Basecamp's account event feed (`/events.json`) for this project from a saved position and hands each page of thin events to a behavior; records nothing itself |
 | `sync.py reply` | command | answers a recorded comment, chat line or to-do comment where it was made, then removes the 👀 |
 | `sync.py ask` | command | posts a new chat line @mentioning the owner |
 | `sync.py answer` | command | answers a check-in question, once per question per day |
@@ -33,8 +34,8 @@ exactly what the agent hands it, and only when the agent runs it.
 
 **Behaviors** ([`behaviors.py`](behaviors.py)) are opt-in workflows a home turns on in its
 config, each composed from tools. A behavior whose keys are absent makes no calls at all.
-Some have a timer step (run every 5 minutes by `run.sh`); the others are carried out by
-the agent with the commands. The agent's side of each is in
+Some have a timer step (run every 5 minutes by `run.sh`); `owner-events` runs in its own
+listener service; the others are carried out by the agent with the commands. The agent's side of each is in
 [`prompts/base.md`](prompts/base.md).
 
 | Behavior | Config keys | `init` flag | Timer step | Agent side |
@@ -47,6 +48,7 @@ the agent with the commands. The agent's side of each is in
 | `decision-todos` | `todos` | `--todos` | to-do comment reader | `todo create`, `reply`/`todo comment`, `todo complete` |
 | `reports` | `message_board` | `--reports` | comment and boost readers on the agent's messages | `post-message`; `reply` to feedback |
 | `inbox-delivery` | `inbox` | `--inbox` | deliver each new pending record as a firstmate inbox note | handle the note, then `fm-inbox.sh drain --ack` |
+| `owner-events` | `listen` | `--listen` | none: runs in the listener service (`sync.py listen`, below) | none; records arrive sooner |
 
 The boundary: behaviors never run a CLI themselves (every Basecamp, GitHub, backlog or
 Lavish call goes through a tool), and tools never decide whether to run or what to do
@@ -87,10 +89,54 @@ each card keeps the links it had.
 
 Card notes are HTML blocks (`<div>`, `<ol>`/`<ul>`) with no raw newlines between them. When the captain hold is released the card is unassigned on the next run.
 
+## The owner-event listener
+
+With `"listen": {}` (or `{"interval": <seconds>}`, at least 10; default 30), `sync.py
+listen --home <home> --config <config.json>` runs beside the timer as a systemd user
+service that `init --listen` installs. Every interval it polls Basecamp's account event
+feed (`GET /events.json`, outbound only, through the same CLI login) for the owner's
+`chat.line.created`, `comment.created` and `boost.created` events in this project
+(filtered by `buckets`, `creators` and `types`), and for each page runs the existing
+reader for the surface each event points at:
+
+| Event | Reader run |
+| --- | --- |
+| an owner chat line | the chat reader, for the configured chats |
+| an owner comment | refetches the comment for its parent, then that mirrored card's comment and 👍 readers, that tracked to-do's reader, or the reader for the agent's messages |
+| an owner boost | the reader whose state already knows the boosted recording (a card, a to-do, a chat line, a check-in answer, a message); for a recording none has seen yet, every reader that reads boosts except the card mirror's |
+
+Then it runs inbox delivery, when that is on. An event is a thin pointer and only says
+which reader to run: records, 👀/👍 acknowledgements, seen-lists and inbox notes are the
+readers' own, exactly as on the timer, so the agent sees the same records, typically within
+about a minute instead of up to five. The feed is best effort by Basecamp's own contract
+(polls lag about 30 seconds, and events can be late, duplicated or missed), so the timer
+keeps running everything: the card mirror, check-ins, release announcements and its full
+read of every surface, which is the repair sweep for anything the feed missed.
+
+The position is kept in `feed.json` and saved only after a page's readers and delivery
+have finished; a failed cycle reads the same page again, and the readers' seen-lists make
+that harmless. The first poll enters at the present, so no history is replayed. When
+Basecamp refuses the saved position it re-enters on its own: a position from before the
+feed's epoch (410) at the epoch, and one bound to other filters (409, e.g. after the
+`captain` changed) or unrecognized (400) right after the last event it handled. An
+invalid filter is never retried. The CLI passes on neither the HTTP status nor the
+response's `reason`, so these are told apart by Basecamp's error text. A failed cycle is
+retried on the next; the third in a row logs `FAILED listen` once (the wake check sees
+it) and recovery is logged. The listener reads the config each cycle and exits cleanly
+when `listen` is removed; the service restarts it only after a failure. `--once` runs one
+cycle; `--dry-run` reads and logs, and records, boosts and saves nothing. After updating
+this checkout, restart the service (`systemctl --user restart basecamp-sync-<home
+path>-listen.service`), or re-run `init`.
+
+The timer run, each listener cycle and each command hold one shared lock (`sync.lock`
+beside the config) throughout, so two of them never read and write the state at once; a
+listener cycle that comes due during a timer run waits for it.
+
 ## Safety bounds
 
 - Only the configured account, project, card tables, chats, check-ins, to-do set and
-  message board are touched.
+  message board are touched. The listener only reads (the feed, a comment's parent) and
+  runs the same readers; it posts nothing beyond their 👀/👍 acknowledgements.
 - Cards are never deleted, trashed or archived. Cards whose task left the backlog are
   left as they are (the run logs how many).
 - The sync never posts to chat or as a comment. Its one automatic post is a release
@@ -274,7 +320,10 @@ discovered chat as `{"chat": <id>, "every_line": true}`) and `--checkins <IANA t
 (`checkins` with the one enabled Automatic Check-ins questionnaire). Without them the
 config is the same as before they existed, so re-running `init` on an older home changes
 nothing. `--no-releases` leaves `releases` out. `--inbox` adds `"inbox": {}` and installs
-the failures-only wake check.
+the failures-only wake check. `--listen` adds `"listen": {}` and installs, enables and
+starts `basecamp-sync-<home path>-listen.service` (`Type=simple`, `Restart=on-failure`
+after 30s, running this checkout's `sync.py listen`), restarting it when its unit
+changed; without `listen` in the config no service is installed.
 
 `--no-cards` sets a home up without the card mirror: it reads no card tables (the project
 need not have any), writes a config without `tables` or `repos`, creates only
@@ -321,6 +370,8 @@ or by hand from
   owner's boosts on the agent's messages there are relayed.
 - `inbox` (optional): `{}` or `{"fm_home": "<firstmate home>"}`: deliver each new pending
   record as a note in that home's inbox (default: the `--home`).
+- `listen` (optional): `{}` or `{"interval": <seconds>}`: run the owner-event listener
+  (`sync.py listen`), polling the event feed every `interval` seconds (default 30).
 - `chats` (optional): chat (Campfire) ids whose captain questions are relayed.
   An entry may be `{"chat": <id>, "every_line": true}` to relay every owner line in that chat.
 - `ask_chat` (optional): the chat id `sync.py ask` posts in.
@@ -347,6 +398,8 @@ Everything else lives beside the config, never in this repo:
 | `checkins.json` | the script | check-in question id -> dates recorded as due (`recorded`) and dates answered (`answered`) |
 | `inbox.json` | the script | the line cursor of `pending-comments.jsonl` delivered to the inbox, and request ids whose failure was logged |
 | `messages.json` | the script | per agent message: comment cursor, owner comments recorded, acknowledgement boosts queued and done, comments replied to; boost counts and boosts seen on the messages and their comments |
+| `feed.json` | the listener | the event feed's position, the last event id handled and the filters they belong to |
+| `sync.lock` | the script | the shared state lock held by a timer run, a listener cycle or a command |
 | `todos.json` | the script | to-do key -> to-do id, title, URL, created and completed times, comment cursor, owner comments recorded, acknowledgement boosts queued and done, comments replied to |
 | `sync.log` | the script | one line per action, plus a counts line per run |
 | `pending-comments.jsonl` | the script | captain comments and approvals waiting to be relayed, one JSON record per line (see below) |
@@ -442,7 +495,10 @@ python3 -m unittest discover -s tests -v
 `tests/test_sync.py` covers the existing behaviors and is unchanged by the layer split;
 `tests/test_tools.py` covers the to-do and message tools, the to-do comment reader, the
 boost readers on every surface, inbox delivery (with `fm-inbox.sh` stubbed), the
-new commands and the layer boundary. The `basecamp`, `gh` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
+new commands and the layer boundary; `tests/test_listen.py` covers the listener with
+stubbed `/events.json` pages: entry and resume, `next`, position saved only after a page
+is handled, 409/410/400 re-entry, dispatch to each reader, and no duplicate record when a
+timer sweep runs during a listener cycle. The `basecamp`, `gh` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
 registration sit behind a fake; tests make no network calls and touch no real home.
 
 ## Pending records

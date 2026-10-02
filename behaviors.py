@@ -23,6 +23,11 @@ class Behavior:
     def __init__(self, t, cfg):
         self.t, self.on = t, False
 
+    @property
+    def runs(self):
+        """Where it runs, as `sync.py behaviors` prints it."""
+        return "timer" if self.timer else "agent"
+
     def run(self, items=None):
         pass
 
@@ -165,10 +170,7 @@ class CardMirror(Behavior):
                             t.card_unassign(rec["card"])
                         rec["assigned"] = waiting
                         t.log(f"{'assigned' if waiting else 'unassigned'} {key}")
-                t.read_card_comments(it["id"], repo, key, rec)
-                if rec.get("assigned"):
-                    t.read_card_boosts(it["id"], repo, key, rec)
-                t.acknowledge(key, rec)
+                self.read_card(it["id"], repo, key, rec)
                 counts[repo] = counts.get(repo, 0) + 1
                 t.save_json("map.json", cards)
         stale = sorted(k for k in cards if k not in wanted)
@@ -176,6 +178,33 @@ class CardMirror(Behavior):
               + "counts " + json.dumps(counts, sort_keys=True) + (f" unplaced {unplaced}" if unplaced else "")
               + (f" left-as-is {len(stale)} cards no longer in the backlog" if stale else ""))
         return plan
+
+    def read_card(self, task, repo, key, rec):
+        """The card readers for one mirrored card: the captain's comments, and boosts when it is assigned."""
+        self.t.read_card_comments(task, repo, key, rec)
+        if rec.get("assigned"):
+            self.t.read_card_boosts(task, repo, key, rec)
+        self.t.acknowledge(key, rec)
+
+    def relay(self, keys):
+        """Run the card readers for the mirrored cards `keys` (task|board) alone, without touching the cards.
+
+        A dry run reads only the boosts of an assigned card, as the mirror's does.
+        """
+        t = self.t
+        cards = t.load("map.json", {})
+        for key in sorted(keys):
+            rec = cards.get(key)
+            if rec is None:
+                continue
+            task, repo = key.split("|", 1)
+            if t.dry:
+                if rec.get("assigned"):
+                    t.read_card_boosts(task, repo, key, rec)
+                t.acknowledge(key, rec)
+                continue
+            self.read_card(task, repo, key, rec)
+            t.save_json("map.json", cards)
 
 
 class ChatInbox(Behavior):
@@ -338,6 +367,9 @@ class InboxDelivery(Behavior):
         self.start = len(t.pending_lines()) if self.on else 0
 
     def run(self, items=None):
+        self.deliver()
+
+    def deliver(self):
         t = self.t
         state = t.load("inbox.json", None)
         if state is None:
@@ -370,8 +402,113 @@ class InboxDelivery(Behavior):
             t.save_json("inbox.json", state)
 
 
+class OwnerEvents(Behavior):
+    """Listen to the account event feed for the owner's events and run the reader each one names: a faster wake.
+
+    Run by `sync.py listen` (a systemd user service beside the timer), not by the timer.
+    Each cycle polls the feed for the owner's chat lines, comments and boosts in this
+    project and, per page, runs the existing reader for the surface each event points
+    at, then inbox delivery. An event's own fields are never recorded; the readers
+    refetch, record, acknowledge and dedupe exactly as on the timer, whose full run stays
+    the repair sweep for anything the best-effort feed misses.
+    """
+    name, keys, timer = "owner-events", ("listen",), False
+    runs = "listener"
+    TYPES = ("boost.created", "chat.line.created", "comment.created")
+
+    def __init__(self, t, cfg):
+        super().__init__(t, cfg)
+        listen = cfg.get("listen")
+        if listen is not None and not isinstance(listen, (bool, dict)):
+            raise ValueError('config "listen" must be {} or {"interval": <seconds>}')
+        self.on = listen is not None and listen is not False
+        self.interval = int((listen if isinstance(listen, dict) else {}).get("interval") or 30)
+        if self.interval < 10:
+            raise ValueError('config "listen" "interval" must be at least 10 seconds')
+        self.others = {}  # every behavior by name, set by configure()
+
+    def run(self, items=None):
+        """One listener cycle: every page of new owner events, each dispatched once handled. Returns the events seen."""
+        return self.t.read_feed(self.TYPES, [self.t.captain], self.dispatch)
+
+    def dispatch(self, events):
+        """Run, once each, the readers the page's events point at, then deliver what they recorded."""
+        b, t = self.others, self.t
+        want = {"cards": set(), "todos": set(), "chats": False, "checkins": False, "messages": False}
+        for ev in events:
+            if str(ev.get("bucket_id")) != t.project or ev.get("creator_id") != t.captain:
+                continue  # the filters already say so; a stray event is never acted on
+            kind, rid = ev.get("event_type"), ev.get("recording_id")
+            if kind == "chat.line.created":
+                want["chats"] = True
+            elif kind == "comment.created":
+                self.comment_target(rid, want)
+            elif kind == "boost.created" and not self.boost_target(rid, want):
+                # A boost on something not yet seen (the agent's newest line, answer or post):
+                # every cheap boost reader; a card's waits for the timer's sweep.
+                want.update(chats=True, checkins=True, messages=True)
+                want["todos"].update(t.load("todos.json", {}))
+        ran = []
+        if want["cards"] and b["card-mirror"].on:
+            b["card-mirror"].relay(want["cards"])
+            ran.append("cards " + ",".join(sorted(want["cards"])))
+        if want["chats"] and b["chat-inbox"].on:
+            t.read_chats(b["chat-inbox"].chats, b["chat-inbox"].every_line)
+            ran.append("chats")
+        if want["todos"] and b["decision-todos"].on:
+            t.read_todo_comments(want["todos"])
+            ran.append("todos " + ",".join(sorted(want["todos"])))
+        if want["checkins"] and b["checkin-answering"].on:
+            t.read_answer_boosts(b["checkin-answering"].checkins["questionnaires"])
+            ran.append("checkin answers")
+        if want["messages"] and b["reports"].on:
+            t.read_messages(b["reports"].board)
+            ran.append("messages")
+        if b["inbox-delivery"].on:
+            b["inbox-delivery"].deliver()
+        t.log(f"listen: {len(events)} event(s) -> {'; '.join(ran) or 'nothing to read'}")
+
+    def comment_target(self, cid, want):
+        """A new owner comment: the reader for the mirrored card, tracked to-do or message it is on."""
+        try:
+            ptype, pid = self.t.comment_parent(cid)
+        except RuntimeError as e:
+            self.t.log(f"listen: comment {cid}: {e}")
+            return
+        if ptype == "Kanban::Card":
+            want["cards"].update(k for k, r in self.t.load("map.json", {}).items() if r.get("card") == pid)
+        elif ptype == "Todo":
+            want["todos"].update(k for k, r in self.t.load("todos.json", {}).items() if r.get("todo") == pid)
+        elif ptype == "Message":
+            want["messages"] = True
+
+    def boost_target(self, rid, want):
+        """Add the reader whose state already knows boosted recording `rid`; False when none does."""
+        t, srid, found = self.t, str(rid), False
+
+        def seen(rec, *ids):
+            return rid in ids or srid in (rec.get("boost_counts") or {}) or any(rid in (rec.get(n) or []) for n in ("comments", "lines"))
+        for key, rec in t.load("map.json", {}).items():
+            if seen(rec, rec.get("card")):
+                want["cards"].add(key)
+                found = True
+        for key, rec in t.load("todos.json", {}).items():
+            if seen(rec, rec.get("todo")):
+                want["todos"].add(key)
+                found = True
+        if any(seen(rec) for rec in t.load("chats.json", {}).values()):
+            want["chats"] = found = True
+        if any(srid in (rec.get("boost_counts") or {}) for rec in t.load("checkins.json", {}).values()):
+            want["checkins"] = found = True
+        msgs = t.load("messages.json", {})
+        if any(srid in (msgs.get(n) or {}).get("boost_counts", {}) for n in ("messages", "comments")):
+            want["messages"] = found = True
+        return found
+
+
 # The timer runs the "on" behaviors in this order; inbox delivery last, after every reader.
-ALL = (CardMirror, ChatInbox, ChatAsks, ReleaseAnnouncements, CheckinAnswering, DecisionTodos, Reports, InboxDelivery)
+ALL = (CardMirror, ChatInbox, ChatAsks, ReleaseAnnouncements, CheckinAnswering, DecisionTodos, Reports, InboxDelivery,
+       OwnerEvents)
 
 
 def inbox_note(rec, account, project):
@@ -433,7 +570,9 @@ def inbox_note(rec, account, project):
 
 def configure(t, cfg, prereleases=False):
     """Every behavior, configured from `cfg` (on or off); a malformed config raises ValueError."""
-    return {b.name: (b(t, cfg, prereleases=prereleases) if b is ReleaseAnnouncements else b(t, cfg)) for b in ALL}
+    out = {b.name: (b(t, cfg, prereleases=prereleases) if b is ReleaseAnnouncements else b(t, cfg)) for b in ALL}
+    out["owner-events"].others = out
+    return out
 
 
 def render_decision(d):

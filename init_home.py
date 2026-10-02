@@ -25,7 +25,10 @@ has none or several of what it needs: --todos (decision to-dos on the one to-do 
 --reports (posting to the one message board), --every-line (relay every owner line
 in the chats) and --checkins <time zone> (the one Automatic Check-ins questionnaire).
 --no-releases leaves release announcements out. --inbox delivers each pending record
-as a firstmate inbox note, and the wake check then watches only failures.
+as a firstmate inbox note, and the wake check then watches only failures. --listen
+turns on the owner-event listener and installs and enables its systemd user service
+(`sync.py listen`, restarted on failure), beside the timer; without "listen" in the
+config no service is installed.
 
 The only Basecamp write is creating a missing regular column, and only with
 --create-missing-columns.
@@ -153,6 +156,32 @@ class System:
                         raise RuntimeError(f"{step}: {(r.stdout + r.stderr)[:300]}")
         return changed
 
+    def install_service(self, name, service, dry):
+        """Install and start a long-running user service; restart it when its unit changed while running."""
+        path = os.path.join(self.unit_dir, f"{name}.service")
+        changed = []
+        if not (os.path.exists(path) and open(path).read() == service):
+            changed.append(f"write {path}")
+            if not dry:
+                os.makedirs(self.unit_dir, exist_ok=True)
+                with open(path, "w") as f:
+                    f.write(service)
+        enabled = self.systemctl("is-enabled", f"{name}.service").stdout.strip() == "enabled"
+        active = self.systemctl("is-active", f"{name}.service").stdout.strip() == "active"
+        if changed:
+            changed.append("systemctl --user daemon-reload")
+        if not (enabled and active):
+            changed.append(f"systemctl --user enable --now {name}.service")
+        elif changed:
+            changed.append(f"systemctl --user restart {name}.service")
+        if not dry:
+            for step in changed:
+                if step.startswith("systemctl"):
+                    r = self.systemctl(*step.split()[2:])
+                    if r.returncode != 0:
+                        raise RuntimeError(f"{step}: {(r.stdout + r.stderr)[:300]}")
+        return changed
+
     def register_check(self, home, cid, script, dry):
         state = os.path.join(home, "state")
         path = os.path.join(state, f"{cid}.check.sh")
@@ -186,7 +215,7 @@ class System:
 class Init:
     def __init__(self, url, login, home, captain=None, repo_map=(), create_missing=False, dry=False,
                  force=False, cards=True, todos=False, reports=False, every_line=False, checkins=None, releases=True, inbox=False,
-                 runner=subprocess.run, system=None, sync_dir=HERE, out=print):
+                 listen=False, runner=subprocess.run, system=None, sync_dir=HERE, out=print):
         self.account, self.project = parse_url(url)
         self.login, self.home = login, os.path.abspath(home)
         self.captain_arg = captain
@@ -200,7 +229,7 @@ class Init:
         if not cards and (self.repo_map or create_missing):
             raise Refuse("--no-cards cannot be combined with --repo-map or --create-missing-columns")
         self.todos, self.reports, self.every_line, self.checkins = todos, reports, every_line, checkins
-        self.releases, self.inbox = releases, inbox
+        self.releases, self.inbox, self.listen = releases, inbox, listen
         if checkins is not None:
             try:
                 ZoneInfo(checkins)
@@ -322,6 +351,8 @@ class Init:
                 cfg[key] = {"questionnaires": ids, "timezone": self.checkins}
         if self.inbox:
             cfg["inbox"] = {}
+        if self.listen:
+            cfg["listen"] = {}
         if problems:
             raise Refuse("init refused, nothing was written:\n  - " + "\n  - ".join(problems))
         gh_repos = {}
@@ -394,6 +425,17 @@ class Init:
                  "[Install]\nWantedBy=timers.target\n")
         return name, service, timer
 
+    def listen_unit(self, config_path):
+        """The listener's service: `sync.py listen`, restarted 30s after a failure; it exits cleanly once "listen" is off."""
+        name = unit_name(self.home) + "-listen"
+        service = ("[Unit]\n"
+                   f"Description=Listen to Basecamp project {self.project}'s event feed for the firstmate home at {self.home}\n\n"
+                   "[Service]\nType=simple\nRestart=on-failure\nRestartSec=30\n"
+                   f"ExecStart=/usr/bin/env python3 {sd_quote(os.path.join(self.sync_dir, 'sync.py'))} listen "
+                   f"--home {sd_quote(self.home)} --config {sd_quote(config_path)}\n\n"
+                   "[Install]\nWantedBy=default.target\n")
+        return name, service
+
     def main(self):
         for sub in ("data", "state"):
             if not os.path.isdir(os.path.join(self.home, sub)):
@@ -428,6 +470,8 @@ class Init:
         self.out(json.dumps(cfg, indent=1))
         if self.dry:
             plan += self.system.install_timer(*self.units(config_path), dry=True)
+            if cfg.get("listen") not in (None, False):
+                plan += self.system.install_service(*self.listen_unit(config_path), dry=True)
             plan += self.system.register_check(self.home, CHECK_ID, CHECK_INBOX if self.inbox else CHECK, dry=True)
             self.out("dry run, nothing written. Would:" if plan else "dry run: nothing to change")
             for p in plan:
@@ -453,6 +497,8 @@ class Init:
                     f.write("" if empty is None else json.dumps(empty) + "\n")
         done = [p for p in plan if not p.startswith("create column")]
         done += self.system.install_timer(*self.units(config_path), dry=False)
+        if cfg.get("listen") not in (None, False):
+            done += self.system.install_service(*self.listen_unit(config_path), dry=False)
         done += self.system.register_check(self.home, CHECK_ID, CHECK_INBOX if self.inbox else CHECK, dry=False)
         self.out("done:" if done else "nothing to change")
         for p in done:
@@ -480,6 +526,8 @@ def cli(argv, **kw):
                     help="record due Automatic Check-ins questions, scheduled in this IANA time zone")
     ap.add_argument("--inbox", action="store_true",
                     help="deliver each new pending record as a note in this home's firstmate inbox (the wake)")
+    ap.add_argument("--listen", action="store_true",
+                    help="listen to the Basecamp event feed for the owner's events (a user service beside the timer)")
     ap.add_argument("--no-releases", action="store_true", help="leave release announcements out of the config")
     ap.add_argument("--force", action="store_true", help="replace an existing config.json that differs")
     ap.add_argument("--dry-run", action="store_true", help="print the discovered config and planned installs; write nothing")
@@ -488,7 +536,7 @@ def cli(argv, **kw):
         Init(a.url, a.login, a.home, captain=a.captain, repo_map=a.repo_map,
              create_missing=a.create_missing_columns, dry=a.dry_run, force=a.force,
              cards=not a.no_cards, todos=a.todos, reports=a.reports, every_line=a.every_line,
-             checkins=a.checkins, releases=not a.no_releases, inbox=a.inbox, **kw).main()
+             checkins=a.checkins, releases=not a.no_releases, inbox=a.inbox, listen=a.listen, **kw).main()
     except Refuse as e:
         print(e, file=sys.stderr)
         return 2
