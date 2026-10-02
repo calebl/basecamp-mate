@@ -17,6 +17,9 @@ registers the comment wake check through the home's own bin/fm-check-register.sh
 Re-running with the same inputs changes nothing; --dry-run prints the discovered config
 and the planned installs and writes nothing, locally or in Basecamp.
 
+With --no-cards no card table is read and the config has no "tables" or "repos"; every
+registered repo with a GitHub origin becomes a release source.
+
 The only Basecamp write is creating a missing regular column, and only with
 --create-missing-columns.
 """
@@ -157,7 +160,7 @@ class System:
 
 class Init:
     def __init__(self, url, login, home, captain=None, repo_map=(), create_missing=False, dry=False,
-                 force=False, runner=subprocess.run, system=None, sync_dir=HERE, out=print):
+                 force=False, cards=True, runner=subprocess.run, system=None, sync_dir=HERE, out=print):
         self.account, self.project = parse_url(url)
         self.login, self.home = login, os.path.abspath(home)
         self.captain_arg = captain
@@ -167,7 +170,9 @@ class Init:
             if not sep or not name.strip() or not repo.strip():
                 raise Refuse(f"--repo-map takes <table name>=<repo>, got {pair!r}")
             self.repo_map[name.strip().lower()] = repo.strip()
-        self.create_missing, self.dry, self.force = create_missing, dry, force
+        self.create_missing, self.dry, self.force, self.cards = create_missing, dry, force, cards
+        if not cards and (self.repo_map or create_missing):
+            raise Refuse("--no-cards cannot be combined with --repo-map or --create-missing-columns")
         self.run = runner
         self.system = system or System()
         self.sync_dir = sync_dir
@@ -191,15 +196,15 @@ class Init:
         proj = self.bc("api", "get", f"/projects/{self.project}.json") or {}
         dock = [d for d in proj.get("dock", []) if d.get("enabled")]
         tables = {}
-        for d in dock:
+        for d in dock if self.cards else ():
             if d.get("name") != "kanban_board":
                 continue
             board = (d.get("title") or "").strip().lower()
             if board in tables:
                 problems.append(f"two card tables are titled {board!r}; rename one")
             tables[board] = str(d["id"])
-        if not tables:
-            problems.append("the project has no card tables in its dock")
+        if self.cards and not tables:
+            problems.append("the project has no card tables in its dock (pass --no-cards to set up without the card mirror)")
         for name in self.repo_map:
             if name not in tables:
                 problems.append(f"--repo-map names {name!r}, but the project has no card table titled that "
@@ -258,20 +263,27 @@ class Init:
         captain = self.find_captain(people, acting, problems)
         if problems:
             raise Refuse("init refused, nothing was written:\n  - " + "\n  - ".join(problems))
-        cfg = {"account": self.account, "project": self.project, "captain": captain, "profile": self.login,
-               "repos": dict(sorted(repos.items())), "tables": cfg_tables}
+        cfg = {"account": self.account, "project": self.project, "captain": captain, "profile": self.login}
+        if self.cards:
+            cfg.update(repos=dict(sorted(repos.items())), tables=cfg_tables)
         chats = [d["id"] for d in dock if d.get("name") == "chat"]
         if chats:
             cfg["chats"] = chats
         boards = [d["id"] for d in dock if d.get("name") == "message_board"]
         gh_repos = {}
-        for repo, board in sorted(repos.items()):
+        # Without cards, every registered repo is a release source, named after itself.
+        sources = repos if self.cards else {r: r for r in registered}
+        for repo, board in sorted(sources.items()):
             full = self.github_repo(repo)
             if full:
                 gh_repos[full] = board
         if len(boards) == 1 and gh_repos:
             cfg["releases"] = {"board": str(boards[0]), "repos": gh_repos}
         return cfg, to_create
+
+    def side_files(self):
+        """The hand-kept files to create; without cards only the pending file applies."""
+        return SIDE_FILES if self.cards else {"pending-comments.jsonl": None}
 
     def github_repo(self, repo):
         """owner/name of <home>/projects/<repo>'s GitHub origin, following renames through gh; None if not GitHub."""
@@ -356,7 +368,7 @@ class Init:
                 plan.append("REFUSE: " + msg)
             else:
                 plan.append(f"replace {config_path} (differs in: {', '.join(fields)})")
-        for name in SIDE_FILES:
+        for name in self.side_files():
             if not os.path.exists(os.path.join(self.dir, name)):
                 plan.append(f"create empty {os.path.join(self.dir, name)}")
         self.out(json.dumps(cfg, indent=1))
@@ -380,7 +392,7 @@ class Init:
             with open(tmp, "w") as f:
                 json.dump(cfg, f, indent=1)
             os.replace(tmp, config_path)
-        for name, empty in SIDE_FILES.items():
+        for name, empty in self.side_files().items():
             path = os.path.join(self.dir, name)
             if not os.path.exists(path):
                 with open(path, "w") as f:
@@ -404,12 +416,15 @@ def cli(argv, **kw):
                     help="map a card table to a backlog repo when their names differ (repeatable)")
     ap.add_argument("--create-missing-columns", action="store_true",
                     help="create a missing Figuring it out, In progress or Ready for QA column")
+    ap.add_argument("--no-cards", action="store_true",
+                    help="set up without the card-table mirror: no card tables are read or written")
     ap.add_argument("--force", action="store_true", help="replace an existing config.json that differs")
     ap.add_argument("--dry-run", action="store_true", help="print the discovered config and planned installs; write nothing")
     a = ap.parse_args(argv)
     try:
         Init(a.url, a.login, a.home, captain=a.captain, repo_map=a.repo_map,
-             create_missing=a.create_missing_columns, dry=a.dry_run, force=a.force, **kw).main()
+             create_missing=a.create_missing_columns, dry=a.dry_run, force=a.force,
+             cards=not a.no_cards, **kw).main()
     except Refuse as e:
         print(e, file=sys.stderr)
         return 2

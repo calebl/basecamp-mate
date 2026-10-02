@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Mirror a firstmate home's backlog onto Basecamp card tables.
+"""Connect a firstmate home to one Basecamp project: a set of independent, opt-in tools.
+
+Each runs only when its config keys are set: the card mirror ("tables", "repos";
+off with "cards": false), the chat relay ("chats"), chat asks ("ask_chat"),
+check-ins ("checkins") and release announcements ("releases"). The card mirror
+mirrors the backlog onto Basecamp card tables.
 
 Deterministic, no model calls. The backlog is the source of truth; Basecamp is a
 view of it. Safety bounds, enforced here:
@@ -66,8 +71,12 @@ class Sync:
         self.checkins = cfg.get("checkins")
         if self.checkins is not None and not isinstance(self.checkins.get("questionnaires"), list):
             raise ValueError('config "checkins" needs "questionnaires" (a list of questionnaire ids)')
-        self.tables = cfg["tables"]
-        self.repo_map = cfg["repos"]
+        # The card mirror is on when the config has card tables, unless "cards" is false.
+        self.cards = cfg.get("cards", bool(cfg.get("tables")))
+        if self.cards and not cfg.get("tables"):
+            raise ValueError('config "cards" is on but there are no "tables"')
+        self.tables = cfg.get("tables", {}) if self.cards else {}
+        self.repo_map = cfg.get("repos", {}) if self.cards else {}
         self.releases = cfg.get("releases")
         if self.releases is not None:
             if not self.releases.get("board") or not isinstance(self.releases.get("repos"), dict):
@@ -203,6 +212,19 @@ class Sync:
         self.save_json("map.json", cards)
 
     def main(self, items=None):
+        """One run: each configured piece in turn; a piece left out of the config makes no calls."""
+        plan = self.mirror_cards(items) if self.cards else None
+        if self.chats:
+            self.relay_chats()
+        if self.releases:
+            self.announce_releases()
+        if self.checkins:
+            self.relay_checkins()
+        if not self.cards:
+            self.log("cards off" + (" (dry run)" if self.dry else ""))
+        return plan
+
+    def mirror_cards(self, items=None):
         cards = self.load("map.json", {})
         extra = self.load("extra-repos.json", {})
         notnow = self.load("not-now.json", {})
@@ -291,12 +313,6 @@ class Sync:
                 self.acknowledge(key, rec)
                 counts[repo] = counts.get(repo, 0) + 1
                 self.save(cards)
-        if self.chats:
-            self.relay_chats()
-        if self.releases:
-            self.announce_releases()
-        if self.checkins:
-            self.relay_checkins()
         stale = sorted(k for k in cards if k not in wanted)
         self.log(("dry plan " + json.dumps(plan, sort_keys=True) + " " if self.dry else "")
                  + "counts " + json.dumps(counts, sort_keys=True) + (f" unplaced {unplaced}" if unplaced else "")
@@ -886,7 +902,7 @@ def cli(argv=None):
             s.log(f"FAILED {what} {type(e).__name__}: {e}")
             return 1
         return 0
-    ap = argparse.ArgumentParser(description="Mirror a firstmate backlog onto Basecamp card tables.")
+    ap = argparse.ArgumentParser(description="Run the configured Basecamp tools: card mirror, chat relay, check-ins, release announcements.")
     ap.add_argument("--home", required=True, help="firstmate home (holds data/backlog.md and state/)")
     ap.add_argument("--config", required=True, help="config.json; its directory holds all runtime state")
     ap.add_argument("--dry-run", action="store_true", help="plan only: no Basecamp calls, map.json untouched")

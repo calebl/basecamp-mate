@@ -955,3 +955,68 @@ class Releases(Base):
         self.assertEqual(self.messages, [])
         self.run_sync()
         self.assertEqual(len(self.messages), 1)
+
+
+class CardsOff(Releases):
+    """A config without the card mirror runs every other piece and never reads the backlog or touches cards."""
+    pending = Acknowledge.pending
+
+    def setUp(self):
+        super().setUp()
+        self.cfg(drop=("cards", "tables", "repos"), profile="agent", chats=[77], ask_chat=77,
+                 checkins={"questionnaires": [55], "timezone": "UTC"})
+        self.stub.lines = {"77": [line(1, content="old?")]}
+        self.stub.questions = [Checkins.q(self, 1)]
+        self.now = sync.datetime(2026, 10, 2, 9, 30, tzinfo=sync.timezone.utc)
+
+    def cfg(self, drop=(), **kw):
+        p = os.path.join(self.cfgdir, "config.json")
+        cfg = json.load(open(p))
+        for k in drop:
+            cfg.pop(k)
+        cfg.update(kw)
+        json.dump(cfg, open(p, "w"))
+
+    def make(self, dry=False):
+        s = sync.Sync(self.home, os.path.join(self.cfgdir, "config.json"), dry=dry, runner=self.runner)
+        s.today = lambda: self.now
+        return s
+
+    def card_calls(self):
+        return [a for a in self.stub.calls if a[0] in ("cards", "comments", "unassign")
+                or "/card_tables/" in " ".join(a) or "/recordings/" in " ".join(a) and "/boosts.json" not in a[2]]
+
+    def test_every_other_piece_runs_without_cards(self):
+        self.make().main()  # no items passed: tasks-axi would raise in the stub if it were called
+        self.stub.lines["77"].append(line(2))
+        self.rels.insert(0, self.rel("v0.2.0", "2999-01-01T00:00:00Z"))
+        self.make().main()
+        self.assertEqual(sorted(r["kind"] for r in self.pending()), ["chat-question", "checkin"])
+        self.assertEqual(self.stub.posted(), [("2", "👀")])
+        self.assertEqual([m["subject"] for _, m in self.messages], ["Terminal v0.2.0 released"])
+        self.assertTrue(self.make().reply(2, "Here."))
+        self.assertTrue(self.make().ask("Ship it?"))
+        self.assertTrue(self.make().answer(1, "None today."))
+        self.assertEqual(self.card_calls(), [])
+        self.assertEqual(self.stub.lavish_calls, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.cfgdir, "map.json")))
+
+    def test_cards_false_ignores_configured_tables(self):
+        self.cfg(cards=False, tables={"server": {"table": "100"}}, repos={"srv": "server"})
+        s = self.make()
+        self.assertEqual((s.cards, s.tables, s.repo_map), (False, {}, {}))
+        self.make().main()
+        self.make(dry=True).main()
+        self.assertEqual(self.card_calls(), [])
+
+    def test_cards_on_without_tables_refused(self):
+        self.cfg(cards=True)
+        with self.assertRaises(ValueError):
+            self.make()
+
+    def test_tables_mean_cards_on_by_default(self):
+        self.cfg(tables={"server": {"table": "100", **{c: str(101 + n) for n, c in enumerate(sync.COLUMNS)}}},
+                 repos={"srv": "server"})
+        self.assertTrue(self.make().cards)
+        self.make().main([item("a")])
+        self.assertIn(["cards", "create"], [a[:2] for a in self.stub.calls])
