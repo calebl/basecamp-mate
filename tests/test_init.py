@@ -271,6 +271,30 @@ class InitTest(unittest.TestCase):
         self.init(force=True).main()
         self.assertEqual(json.load(open(path)), EXPECTED)
 
+    def test_no_cards_reads_no_card_tables(self):
+        self.stub.origins = {"Engine": "https://github.com/acme/engine.git"}
+        cfg, create = self.init(cards=False, repo_map=[]).discover()
+        self.assertEqual(cfg, {k: v for k, v in EXPECTED.items() if k not in ("repos", "tables")}
+                         | {"releases": {"board": "9", "repos": {"acme/engine": "Engine"}}})
+        self.assertEqual(create, [])
+        self.assertFalse([a for a in self.stub.calls if "/card_tables/" in a[2]])
+
+    def test_no_cards_works_without_tables_and_writes_only_pending(self):
+        self.stub.project["dock"] = [d for d in self.stub.project["dock"] if d["name"] != "kanban_board"]
+        with self.assertRaises(init_home.Refuse):
+            self.init().discover()
+        self.init(cards=False, repo_map=[]).main()
+        self.assertNotIn("tables", json.load(open(os.path.join(self.dir, "config.json"))))
+        self.assertEqual(sorted(os.listdir(self.dir)), ["config.json", "pending-comments.jsonl"])
+        self.assertEqual(list(self.system.checks), ["basecamp-sync"])
+        self.assertEqual(self.stub.writes(), [])
+
+    def test_no_cards_refuses_card_options(self):
+        with self.assertRaises(init_home.Refuse):
+            self.init(cards=False)
+        with self.assertRaises(init_home.Refuse):
+            self.init(cards=False, repo_map=[], create_missing=True)
+
     def test_dry_run_writes_nothing(self):
         plan = self.init(dry=True).main()
         self.assertFalse(os.path.exists(self.dir))

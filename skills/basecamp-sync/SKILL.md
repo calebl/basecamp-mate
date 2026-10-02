@@ -5,8 +5,11 @@ description: Operating contract for a firstmate or second mate whose home mirror
 
 # Basecamp sync
 
-The sync mirrors this home's backlog onto the project's card tables every 5 minutes.
-Mechanics (column rules, file formats, record fields, safety bounds) are in the repo's
+The sync runs every 5 minutes and does only what the config turns on: the card mirror
+(`tables`, `repos`; off with `"cards": false` or without `tables`), the chat relay
+(`chats`), chat asks (`ask_chat`), check-ins (`checkins`) and release announcements
+(`releases`). Sections below about cards and the side files apply only when the card
+mirror is on. Mechanics (column rules, file formats, record fields, safety bounds) are in the repo's
 README: `firstmate-basecamp-sync/README.md`. `SYNC` below means that checkout.
 
 ## Set up
@@ -21,7 +24,8 @@ Read the printed config, then run it again without `--dry-run`. It refuses rathe
 guesses; fix what it names (usually `--repo-map <table>=<repo>` when a card table's title
 is not a registered project's name). A card table matching no registered project is
 skipped and printed, not refused; check the skipped list and pass `--repo-map` for any
-board that is really a repo's. Never pass `--force` or `--create-missing-columns`
+board that is really a repo's. When the owner wants only chat, check-ins or release
+announcements, or the project has no card tables, pass `--no-cards`. Never pass `--force` or `--create-missing-columns`
 without the main firstmate's go-ahead.
 
 ## The backlog is the source of truth

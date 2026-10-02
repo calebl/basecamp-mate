@@ -1,11 +1,28 @@
 # firstmate-basecamp-sync
 
-Mirror a firstmate home's backlog and captain decisions onto Basecamp card tables.
+A set of independent, opt-in tools that connect an agent home to one Basecamp
+project through the `basecamp` CLI. No model calls. Each tool runs only when its config
+keys are present; a home picks just the pieces it needs:
+
+| Tool | Config keys | What it does |
+| --- | --- | --- |
+| Card mirror | `tables`, `repos` (off with `"cards": false`) | mirrors the backlog onto card tables; relays the owner's card comments and 👍 approvals |
+| Chat relay | `chats` | records the owner's chat questions (or every line) for the agent |
+| Chat asks | `ask_chat` | `sync.py ask` posts a question to the owner in chat |
+| Check-ins | `checkins` | records due check-in questions; `sync.py answer` answers them |
+| Release announcements | `releases` | posts a Message Board message per new GitHub release |
+| Replies | (any of the above) | `sync.py reply` answers a recorded card or chat question |
+
+Every tool shares `account`, `project`, `captain` (the owner's person id) and the optional
+`profile`. A config without `tables` (or with `"cards": false`) never reads the backlog,
+never calls a card or card-table endpoint, and never writes `map.json`; the other tools
+run the same either way. Set such a home up with `sync.py init --no-cards`.
+
+## Card mirror
 
 The backlog is the source of truth; Basecamp is a one-way view of it. Each run reads
 every backlog task, picks its board from the task's repo, picks a column, and then
-creates, updates, moves, assigns or unassigns cards through the `basecamp` CLI.
-No model calls.
+creates, updates, moves, assigns or unassigns cards.
 
 Column rules:
 
@@ -152,6 +169,13 @@ Without `--dry-run` it then:
 - writes `<home>/state/basecamp-sync.check.sh` and registers it with the home's own
   `bin/fm-check-register.sh`, so the home wakes on new pending records and failed runs.
 
+`--no-cards` sets a home up without the card mirror: it reads no card tables (the project
+need not have any), writes a config without `tables` or `repos`, creates only
+`pending-comments.jsonl`, and takes every registered repo with a GitHub origin as a
+`releases` source, named after the repo. It cannot be combined with `--repo-map` or
+`--create-missing-columns`. Chats, the Message Board, the timer and the wake check are set
+up as usual.
+
 Re-running with the same inputs changes nothing. `--dry-run` prints the discovered config
 and what it would write, install or refuse, and writes nothing.
 
@@ -187,15 +211,17 @@ or by hand from
   or {"name": "<name>", "note": "<text>"}}, "prereleases": false}`. The name is the
   subject's first word (capitalized; `init` uses the mapped board name) and the note is
   appended to the body, e.g. `` "note": "Run `ta upgrade` to install." ``.
-- `repos`: backlog repo name -> board name.
-- `tables`: per board, the card table id (`table`) and a column id for each of
+- `cards` (optional): the card mirror's switch. Absent means on when `tables` is set and
+  off otherwise; `false` turns it off even with `tables` present.
+- `repos` (card mirror): backlog repo name -> board name.
+- `tables` (card mirror): per board, the card table id (`table`) and a column id for each of
   `Triage`, `Not now`, `Figuring it out`, `In progress`, `Ready for QA`, `Done`.
 
 Everything else lives beside the config, never in this repo:
 
 | File | Kept by | Purpose |
 | --- | --- | --- |
-| `map.json` | the script | task/board -> card id, column, assignment, content digest, linked boards, seen comments and boosts, acknowledgement boosts queued and done, questions replied to |
+| `map.json` | the script (card mirror) | task/board -> card id, column, assignment, content digest, linked boards, seen comments and boosts, acknowledgement boosts queued and done, questions replied to |
 | `releases.json` | the script | GitHub repo -> when the watch started (`since`), the tags seeded then, and the tags announced (tag -> message id) |
 | `chats.json` | the script | chat id -> line cursor, captured question lines, acknowledgement boosts queued and done, questions replied to |
 | `checkins.json` | the script | check-in question id -> dates recorded as due (`recorded`) and dates answered (`answered`) |

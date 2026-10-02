@@ -5,6 +5,7 @@
  "chats": [77777777, {"chat": 88888888, "every_line": true}],
  "ask_chat": 88888888,
  "checkins": {"questionnaires": ["99999999"], "timezone": "America/Chicago"},
+ "cards": true,
  "repos": {"my-server-repo": "server", "my-engine-repo": "engine"},
  "tables": {
   "server": {"table": "100", "Triage": "101", "Not now": "102", "Figuring it out": "103",
