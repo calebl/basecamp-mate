@@ -25,7 +25,9 @@ has none or several of what it needs: --todos (decision to-dos on the one to-do 
 --reports (posting to the one message board), --every-line (relay every owner line
 in the chats) and --checkins <time zone> (the one Automatic Check-ins questionnaire).
 --no-releases leaves release announcements out. --inbox delivers each pending record
-as a firstmate inbox note, and the wake check then watches only failures. --listen
+as a firstmate inbox note, and the wake check then watches only failures. --pings
+relays the owner's Pings (direct messages) to the --login, which live outside the
+project. --listen
 turns on the owner-event listener and installs and enables its systemd user service
 (`sync.py listen`, restarted on failure), beside the timer; without "listen" in the
 config no service is installed.
@@ -215,7 +217,7 @@ class System:
 class Init:
     def __init__(self, url, login, home, captain=None, repo_map=(), create_missing=False, dry=False,
                  force=False, cards=True, todos=False, reports=False, every_line=False, checkins=None, releases=True, inbox=False,
-                 listen=False, runner=subprocess.run, system=None, sync_dir=HERE, out=print):
+                 listen=False, pings=False, runner=subprocess.run, system=None, sync_dir=HERE, out=print):
         self.account, self.project = parse_url(url)
         self.login, self.home = login, os.path.abspath(home)
         self.captain_arg = captain
@@ -229,7 +231,7 @@ class Init:
         if not cards and (self.repo_map or create_missing):
             raise Refuse("--no-cards cannot be combined with --repo-map or --create-missing-columns")
         self.todos, self.reports, self.every_line, self.checkins = todos, reports, every_line, checkins
-        self.releases, self.inbox, self.listen = releases, inbox, listen
+        self.releases, self.inbox, self.listen, self.pings = releases, inbox, listen, pings
         if checkins is not None:
             try:
                 ZoneInfo(checkins)
@@ -351,6 +353,8 @@ class Init:
                 cfg[key] = {"questionnaires": ids, "timezone": self.checkins}
         if self.inbox:
             cfg["inbox"] = {}
+        if self.pings:
+            cfg["pings"] = {}
         if self.listen:
             cfg["listen"] = {}
         if problems:
@@ -528,6 +532,8 @@ def cli(argv, **kw):
                     help="deliver each new pending record as a note in this home's firstmate inbox (the wake)")
     ap.add_argument("--listen", action="store_true",
                     help="listen to the Basecamp event feed for the owner's events (a user service beside the timer)")
+    ap.add_argument("--pings", action="store_true",
+                    help="relay the owner's Pings (direct messages) to the --login; the agent answers with sync.py reply")
     ap.add_argument("--no-releases", action="store_true", help="leave release announcements out of the config")
     ap.add_argument("--force", action="store_true", help="replace an existing config.json that differs")
     ap.add_argument("--dry-run", action="store_true", help="print the discovered config and planned installs; write nothing")
@@ -536,7 +542,7 @@ def cli(argv, **kw):
         Init(a.url, a.login, a.home, captain=a.captain, repo_map=a.repo_map,
              create_missing=a.create_missing_columns, dry=a.dry_run, force=a.force,
              cards=not a.no_cards, todos=a.todos, reports=a.reports, every_line=a.every_line,
-             checkins=a.checkins, releases=not a.no_releases, inbox=a.inbox, listen=a.listen, **kw).main()
+             checkins=a.checkins, releases=not a.no_releases, inbox=a.inbox, listen=a.listen, pings=a.pings, **kw).main()
     except Refuse as e:
         print(e, file=sys.stderr)
         return 2

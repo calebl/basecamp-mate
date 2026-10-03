@@ -24,11 +24,12 @@ policy. Each does one thing to the configured account and project:
 | chat reader | reader | records the captain's chat lines (questions and mentions, or every line) as `chat-question` |
 | check-in reader | reader | records each check-in question due today as `checkin` |
 | to-do comment reader | reader | records the owner's new comments on tracked open to-dos as `todo-comment` |
+| Ping reader | reader | finds the Pings (direct messages) the agent's login is in with the owner through `/my/readings.json` and records each new line the owner writes there as `ping` |
 | message comment reader | reader | records the owner's new comments on the agent's own recent Message Board posts as `message-comment` |
 | boost readers | reader | record the owner's new boosts, with their text, on every monitored surface as `boost` (below) |
-| event-feed reader | reader | polls Basecamp's account event feed (`/events.json`) for this project from a saved position and hands each page of thin events to a behavior; records nothing itself |
+| event-feed reader | reader | polls Basecamp's account event feed (`/events.json`) for this project (or every bucket, for Pings) from a saved position and hands each page of thin events to a behavior; records nothing itself |
 | unmonitored-event recorder | reader | records an owner event that no behavior handles as `unmonitored`, once per kind of thing (below) |
-| `sync.py reply` | command | answers a recorded comment, chat line or to-do comment where it was made, then removes the 👀 |
+| `sync.py reply` | command | answers a recorded comment, chat line, Ping line or to-do comment where it was made, then removes the 👀 |
 | `sync.py ask` | command | posts a new chat line @mentioning the owner |
 | `sync.py answer` | command | answers a check-in question, once per question per day |
 | `sync.py todo create` | command | creates a to-do assigned to the owner, with a description, and tracks it under a key |
@@ -59,6 +60,7 @@ listener service; the others are carried out by the agent with the commands. The
 | `checkin-answering` | `checkins` | `--checkins <time zone>` | check-in reader | `answer` |
 | `decision-todos` | `todos` | `--todos` | to-do comment reader | `todo create`, `reply`/`todo comment`, `todo complete` |
 | `reports` | `message_board` | `--reports` | comment and boost readers on the agent's messages | `post-message`; `reply` to feedback |
+| `pings` | `pings` | `--pings` | Ping reader | `reply` to each line, in the Ping |
 | `inbox-delivery` | `inbox` | `--inbox` | deliver each new pending record as a firstmate inbox note | handle the note, then `fm-inbox.sh drain --ack` |
 | `owner-events` | `listen` | `--listen` | none: runs in the listener service (`sync.py listen`, below) | records arrive sooner; an `unmonitored` record becomes a decision to-do |
 
@@ -140,6 +142,16 @@ cycle; `--dry-run` reads and logs, and records, boosts and saves nothing. After 
 this checkout, restart the service (`systemctl --user restart basecamp-sync-<home
 path>-listen.service`), or re-run `init`.
 
+### Pings
+
+A Ping (a direct message) is a chat in a bucket of its own (a "circle"), not in the
+project, so neither the project's chats nor the project-filtered feed see it. With
+`"pings"` on, the listener makes a second poll each cycle, of the owner's
+`chat.line.created` and `boost.created` events in every bucket (no `buckets` filter,
+its own position in `pings-feed.json`), and runs the Ping reader whenever one of them is
+outside the project (see Pings below). The project poll and its unmonitored events are
+unchanged.
+
 ### Unmonitored events
 
 Unless `listen` has `"unmonitored": false`, the listener also notices the owner doing
@@ -174,10 +186,29 @@ The timer run, each listener cycle and each command hold one shared lock (`sync.
 beside the config) throughout, so two of them never read and write the state at once; a
 listener cycle that comes due during a timer run waits for it.
 
+## Pings
+
+With `"pings": {}` (`init --pings`), each timer run reads `GET /my/readings.json` as the
+acting login: its `pings` section lists each recently active Ping (read or unread) with
+the bucket and chat ids in its `subscription_url`. Only Pings whose participants or
+creator include the owner are read, at most `limit` a run (`{"limit": <n>}`, default 10),
+the most recently active first; a quiet Ping drops out of the readings and a new line
+brings it back. For each, the chat's lines are read
+(`/buckets/<circle>/chats/<chat>/lines.json`) and every new owner line is recorded once
+as a `ping` record and acknowledged with a 👀, like a chat question; the owner's boosts
+on lines there are `boost` records with surface `ping`. `pings.json` keeps `since` (the
+first run) and a line cursor per Ping chat: history from before `since` is never relayed,
+while a Ping that starts later is relayed from its first line. The agent answers with
+`sync.py reply --recording <line>`, which posts a new line in that Ping (the `basecamp
+chat` commands refuse circle buckets, so it posts to the lines endpoint) and removes the
+👀, under the same refusal rules as every reply. Without a `profile`, or with one that
+signs in as the owner, nothing is read: the readings would be the owner's own.
+
 ## Safety bounds
 
 - Only the configured account, project, card tables, chats, check-ins, to-do set and
-  message board are touched. The listener only reads (the feed, a comment's parent, an
+  message board are touched, and, with `pings` on, the Pings the acting login is in with
+  the owner. The listener only reads (the feed, a comment's parent, an
   unmonitored event's recording) and runs the same readers; it posts nothing beyond their
   👀/👍 acknowledgements.
 - Cards are never deleted, trashed or archived. Cards whose task left the backlog are
@@ -366,7 +397,8 @@ nothing. `--no-releases` leaves `releases` out. `--inbox` adds `"inbox": {}` and
 the failures-only wake check. `--listen` adds `"listen": {}` and installs, enables and
 starts `basecamp-sync-<home path>-listen.service` (`Type=simple`, `Restart=on-failure`
 after 30s, running this checkout's `sync.py listen`), restarting it when its unit
-changed; without `listen` in the config no service is installed.
+changed; without `listen` in the config no service is installed. `--pings` adds
+`"pings": {}`: the owner's Pings to the `--login` are relayed (see Pings).
 
 `--no-cards` sets a home up without the card mirror: it reads no card tables (the project
 need not have any), writes a config without `tables` or `repos`, creates only
@@ -417,6 +449,8 @@ or by hand from
   (`sync.py listen`), polling the event feed every `interval` seconds (default 30).
   `"unmonitored": false` turns off unmonitored-event records and keeps the feed on the
   three handled types.
+- `pings` (optional): `{}` or `{"limit": <n>}`: relay the owner's Pings (direct messages)
+  to the acting login, reading at most `n` Pings a run (default 10).
 - `chats` (optional): chat (Campfire) ids whose captain questions are relayed.
   An entry may be `{"chat": <id>, "every_line": true}` to relay every owner line in that chat.
 - `ask_chat` (optional): the chat id `sync.py ask` posts in.
@@ -444,6 +478,8 @@ Everything else lives beside the config, never in this repo:
 | `inbox.json` | the script | the line cursor of `pending-comments.jsonl` delivered to the inbox, and request ids whose failure was logged |
 | `messages.json` | the script | per agent message: comment cursor, owner comments recorded, acknowledgement boosts queued and done, comments replied to; boost counts and boosts seen on the messages and their comments |
 | `feed.json` | the listener | the event feed's position, the last event id handled and the filters they belong to |
+| `pings.json` | the script | `since` (the Ping reader's first run) and, per Ping chat id, its bucket, title, URL, line cursor, owner lines recorded, acknowledgement boosts queued and done, boost counts and boosts seen, lines replied to |
+| `pings-feed.json` | the listener | the every-bucket Ping poll's position, last event id and filters |
 | `unmonitored.json` | the listener | unmonitored-event key -> the first event and recording recorded, when, how many were seen, and the owner's decision once handled |
 | `sync.lock` | the script | the shared state lock held by a timer run, a listener cycle or a command |
 | `todos.json` | the script | to-do key -> to-do id, title, URL, created and completed times, comment cursor, owner comments recorded, acknowledgement boosts queued and done, comments replied to |
@@ -546,7 +582,8 @@ stubbed `/events.json` pages: entry and resume, `next`, position saved only afte
 is handled, 409/410/400 re-entry, dispatch to each reader, no duplicate record when a
 timer sweep runs during a listener cycle, and unmonitored events: detection per event
 kind, one record per key until forgotten, handled events recording nothing, and the
-narrow feed when it is off. The `basecamp`, `gh` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
+narrow feed when it is off; `tests/test_pings.py` covers the Ping reader with a stubbed
+`/my/readings.json`, the reply in a Ping, and the listener's every-bucket poll. The `basecamp`, `gh` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
 registration sit behind a fake; tests make no network calls and touch no real home.
 
 ## Pending records
@@ -557,6 +594,9 @@ before `kind` existed have none; treat a missing `kind` as `"comment"`.
 - `comment`: `task`, `repo`, `card`, `comment` (id), `at`, `text`.
 - `question`: the same fields as `comment`, for a comment containing `?`.
 - `chat-question`: `chat` (id), `line` (id), `url`, `text`, `at`.
+- `ping`: `bucket` (the Ping's circle), `chat`, `line` (ids), `title` (the Ping's name),
+  `url`, `text`, `at`. The owner wrote to the agent's login in a Ping; answer there with
+  `sync.py reply --recording <line>`.
 - `checkin`: `questionnaire`, `question` (ids), `date` (local, `YYYY-MM-DD`), `title`,
   `url`, `at`. A check-in question came due today; answer it with `sync.py answer`.
 - `approval`: `task`, `repo`, `card`, `url` (card URL), `boost` (id), `text`, `at`. The captain
@@ -567,8 +607,8 @@ before `kind` existed have none; treat a missing `kind` as `"comment"`.
 - `message-comment`: `message` (id), `subject`, `comment` (id), `question`, `url` (the
   comment), `text`, `at`. The owner commented on a post the agent made, usually feedback
   or an instruction on a report; act on it and answer with `sync.py reply --recording <comment>`.
-- `boost`: `surface` (`chat`, `card`, `card-comment`, `todo`, `todo-comment`,
-  `checkin-answer`, `message`, `message-comment`), the surface's ids (`chat`; `task`,
+- `boost`: `surface` (`chat`, `ping`, `card`, `card-comment`, `todo`, `todo-comment`,
+  `checkin-answer`, `message`, `message-comment`), the surface's ids (`chat`; `bucket`, `chat`; `task`,
   `repo`, `card`; `key`, `todo`; `question`; `message`, `subject`), `recording` (the
   boosted recording), `boost` (id), `text` (the boost's text), `url`, `at`. The owner's
   boost is an answer to what was boosted, like a comment.

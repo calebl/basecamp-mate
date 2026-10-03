@@ -346,6 +346,29 @@ class Reports(Behavior):
         self.t.read_messages(self.board)
 
 
+class Pings(Behavior):
+    """Relay every line the owner writes in a Ping (a direct message) with the agent's login; the agent answers with `sync.py reply`.
+
+    "pings": {} turns it on; {"limit": n} reads at most n Pings a run (default 10), the
+    most recently active first. A Ping is not in the project, so the listener finds its
+    lines through a second, every-bucket poll of the event feed.
+    """
+    name, keys = "pings", ("pings",)
+
+    def __init__(self, t, cfg):
+        super().__init__(t, cfg)
+        pings = cfg.get("pings")
+        if pings is not None and not isinstance(pings, (bool, dict)):
+            raise ValueError('config "pings" must be {} or {"limit": <Pings read per run>}')
+        self.on = pings is not None and pings is not False
+        self.limit = int((pings if isinstance(pings, dict) else {}).get("limit", 10))
+        if self.limit < 1:
+            raise ValueError('config "pings" "limit" must be at least 1')
+
+    def run(self, items=None):
+        self.t.read_pings(self.limit)
+
+
 class InboxDelivery(Behavior):
     """Deliver each new pending record to the firstmate inbox as a note: the wake for the agent.
 
@@ -420,6 +443,10 @@ class OwnerEvents(Behavior):
     behavior handles (a type outside TYPES, or one of TYPES on something nothing
     monitors) is recorded once per kind of thing as an `unmonitored` record for the agent
     to put to the owner.
+
+    Pings (with the "pings" behavior on): a second poll, of the owner's chat lines and
+    boosts in every bucket with its own position in pings-feed.json, runs the Ping reader
+    whenever one of them is outside the project; a Ping is a bucket of its own.
     """
     name, keys, timer = "owner-events", ("listen",), False
     runs = "listener"
@@ -445,7 +472,22 @@ class OwnerEvents(Behavior):
 
     def run(self, items=None):
         """One listener cycle: every page of new owner events, each dispatched once handled. Returns the events seen."""
-        return self.t.read_feed(() if self.unmonitored else self.TYPES, [self.t.captain], self.dispatch)
+        seen = self.t.read_feed(() if self.unmonitored else self.TYPES, [self.t.captain], self.dispatch)
+        if self.others.get("pings") and self.others["pings"].on:
+            seen += self.t.read_feed(("boost.created", "chat.line.created"), [self.t.captain], self.dispatch_pings,
+                                     every_bucket=True, store="pings-feed.json")
+        return seen
+
+    def dispatch_pings(self, events):
+        """Run the Ping reader when the page has an owner line or boost outside the project, then deliver."""
+        t = self.t
+        outside = [ev for ev in events if str(ev.get("bucket_id")) != t.project and ev.get("creator_id") == t.captain]
+        if not outside:
+            return
+        t.read_pings(self.others["pings"].limit)
+        if self.others["inbox-delivery"].on:
+            self.others["inbox-delivery"].deliver()
+        t.log(f"listen: {len(outside)} event(s) outside the project -> pings")
 
     def dispatch(self, events):
         """Run, once each, the readers the page's events point at, then deliver what they recorded."""
@@ -601,8 +643,8 @@ class OwnerEvents(Behavior):
 
 
 # The timer runs the "on" behaviors in this order; inbox delivery last, after every reader.
-ALL = (CardMirror, ChatInbox, ChatAsks, ReleaseAnnouncements, CheckinAnswering, DecisionTodos, Reports, InboxDelivery,
-       OwnerEvents)
+ALL = (CardMirror, ChatInbox, ChatAsks, ReleaseAnnouncements, CheckinAnswering, DecisionTodos, Reports, Pings,
+       InboxDelivery, OwnerEvents)
 
 
 def inbox_note(rec, account, project):
@@ -626,6 +668,10 @@ def inbox_note(rec, account, project):
     elif kind == "chat-question":
         rid = rec.get("line")
         what, handle, url = "Basecamp chat line from the captain", f"answer: sync.py reply --recording {rid}", rec.get("url")
+    elif kind == "ping":
+        rid = rec.get("line")
+        what = "Basecamp Ping (a direct message) from the captain" + (f" in {rec.get('title')!r}" if rec.get("title") else "")
+        handle, url = f"answer in the Ping: sync.py reply --recording {rid}", rec.get("url")
     elif kind == "message-comment":
         rid = rec.get("comment")
         what = f"Basecamp comment from the captain on your message {rec.get('subject')!r}"
@@ -642,6 +688,7 @@ def inbox_note(rec, account, project):
         where = {"todo": f"decision to-do {rec.get('key')}", "todo-comment": f"a comment on decision to-do {rec.get('key')}",
                  "card": f"the card for task {rec.get('task')}",
                  "card-comment": f"a comment on the card for task {rec.get('task')}", "chat": "a chat line",
+                 "ping": "a line in a Ping",
                  "checkin-answer": f"your check-in answer to question {rec.get('question')}",
                  "message": f"your message {rec.get('subject')!r}",
                  "message-comment": f"a comment on your message {rec.get('subject')!r}"}.get(rec.get("surface"), rec.get("surface"))
