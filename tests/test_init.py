@@ -327,6 +327,11 @@ class InitTest(unittest.TestCase):
         self.assertEqual(self.system.checks["basecamp-sync"], init_home.CHECK_INBOX)
         self.assertNotIn("pending-comments", init_home.CHECK_INBOX.split("Pending records")[1])
 
+    def test_pings_flag_turns_the_pings_behavior_on(self):
+        cfg, _ = self.init(pings=True).discover()
+        self.assertEqual(cfg, EXPECTED | {"pings": {}})
+        self.assertNotIn("pings", self.init().discover()[0])
+
     def test_listen_installs_the_listener_service_only_when_set(self):
         self.init().main()
         self.assertFalse([c for c in self.system.calls if c[0] == "service"])

@@ -8,14 +8,16 @@ behaviors.py is the behaviors layer: opt-in workflows a home turns on in its con
 and that compose the tools: the card mirror ("tables", "repos"; off with "cards":
 false), the chat inbox ("chats"), chat asks ("ask_chat"), check-in answering
 ("checkins"), release announcements ("releases"), decision to-dos ("todos"),
-reports ("message_board"), inbox delivery ("inbox") and the owner-event listener
+reports ("message_board"), Pings ("pings": the owner's direct messages to the agent's
+login), inbox delivery ("inbox") and the owner-event listener
 ("listen", run by `sync.py listen` as a service beside the timer, which also records
 the owner's unmonitored events; `sync.py unmonitored` keeps their keys). prompts/base.md is
 the agent's side of each behavior.
 
 Deterministic, no model calls. Safety bounds, enforced here:
   - only the configured account, project, card tables, chats, check-ins, to-do set
-    and message board are touched;
+    and message board are touched, and, with "pings" on, the Pings the agent's login
+    is in with the owner;
   - nothing is ever deleted, trashed or archived, except the acting user's own 👀
     boost once a question is answered; the timer run posts nothing to chat or as a
     comment, and its only writes besides the card mirror are 👀/👍 acknowledgement
@@ -27,7 +29,7 @@ Deterministic, no model calls. Safety bounds, enforced here:
 All runtime state lives in the directory that holds the config file.
 
 Usage: sync.py --home <home> --config <config.json> [--dry-run] [--include-prereleases]
-       sync.py reply --home <home> --config <config.json> --recording <comment or line id> --body-file <file> [--again] [--dry-run]
+       sync.py reply --home <home> --config <config.json> --recording <comment, chat line or Ping line id> --body-file <file> [--again] [--dry-run]
        sync.py ask --home <home> --config <config.json> --body-file <file> [--dry-run]
        sync.py answer --home <home> --config <config.json> --question <check-in question id> --body-file <file> [--dry-run]
        sync.py todo create --home <home> --config <config.json> --key <key> --title <text> [--body-file <file>] [--list <id>] [--due YYYY-MM-DD] [--dry-run]
@@ -221,7 +223,7 @@ def cli(argv=None, runner=subprocess.run):
         return unmonitored_cli(argv[1:], runner)
     if argv[:1] == ["reply"]:
         ap = common("sync.py reply", "Answer a captain question where it was asked, then remove the 👀.")
-        ap.add_argument("--recording", required=True, type=int, help="the question comment's or chat line's id")
+        ap.add_argument("--recording", required=True, type=int, help="the question comment's, chat line's or Ping line's id")
         ap.add_argument("--body-file", required=True, help="plain-text answer (Markdown for a to-do comment)")
         ap.add_argument("--again", action="store_true", help="post even though this question was already answered")
         ap.add_argument("--dry-run", action="store_true")

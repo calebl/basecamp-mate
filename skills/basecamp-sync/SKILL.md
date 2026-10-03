@@ -1,6 +1,6 @@
 ---
 name: basecamp-sync
-description: Operating contract for a firstmate or second mate whose home mirrors its backlog into a Basecamp project with basecamp-mate (formerly firstmate-basecamp-sync). Use when told to "use this Basecamp project", when setting a home up with `sync.py init`, when the basecamp-sync wake check fires, when handling data/basecamp-sync/pending-comments.jsonl, when putting a decision to the owner as a Basecamp to-do (`sync.py todo`), when posting a report to the Message Board (`sync.py post-message`), when handling an `unmonitored` record (`sync.py unmonitored`), or when editing figuring.json, not-now.json, decisions.json, boards.json, extra-repos.json or skip.json.
+description: Operating contract for a firstmate or second mate whose home mirrors its backlog into a Basecamp project with basecamp-mate (formerly firstmate-basecamp-sync). Use when told to "use this Basecamp project", when setting a home up with `sync.py init`, when the basecamp-sync wake check fires, when handling data/basecamp-sync/pending-comments.jsonl, when putting a decision to the owner as a Basecamp to-do (`sync.py todo`), when posting a report to the Message Board (`sync.py post-message`), when handling an `unmonitored` record (`sync.py unmonitored`) or a `ping` record (the owner's direct message), or when editing figuring.json, not-now.json, decisions.json, boards.json, extra-repos.json or skip.json.
 ---
 
 # Basecamp sync
@@ -11,7 +11,8 @@ to append pending records, and commands you run to post (`reply`, `ask`, `answer
 config turns on, each composed from tools: the card mirror (`tables`, `repos`; off with
 `"cards": false` or without `tables`), the chat inbox (`chats`), chat asks (`ask_chat`),
 check-in answering (`checkins`), release announcements (`releases`), decision to-dos
-(`todos`), reports (`message_board`), inbox delivery (`inbox`) and the owner-event
+(`todos`), reports (`message_board`), Pings (`pings`: the owner's direct messages to the
+agent's login, outside the project), inbox delivery (`inbox`) and the owner-event
 listener (`listen`: a `sync.py listen` service beside the timer that polls Basecamp's event
 feed and runs the same readers within about a minute of the captain posting; the records
 are the same, plus an `unmonitored` record when the captain does something nothing
@@ -40,8 +41,8 @@ is not a registered project's name). A card table matching no registered project
 skipped and printed, not refused; check the skipped list and pass `--repo-map` for any
 board that is really a repo's. When the owner wants only chat, check-ins or release
 announcements, or the project has no card tables, pass `--no-cards`. `--todos`,
-`--reports`, `--every-line`, `--inbox`, `--listen` and `--checkins <time zone>` turn on decision
-to-dos, reports, every-line chat, inbox delivery, the listener service and check-in answering; `--no-releases` leaves announcements out. Never pass `--force` or `--create-missing-columns`
+`--reports`, `--every-line`, `--pings`, `--inbox`, `--listen` and `--checkins <time zone>` turn on decision
+to-dos, reports, every-line chat, Ping relaying, inbox delivery, the listener service and check-in answering; `--no-releases` leaves announcements out. Never pass `--force` or `--create-missing-columns`
 without the main firstmate's go-ahead.
 
 ## The backlog is the source of truth
@@ -104,11 +105,14 @@ Handle each new record by its `kind` (missing `kind` = `comment`):
   like a comment.
   A `chat-question` from a chat set to `every_line` may be any line the owner wrote there;
   treat each as addressed to you.
+- `ping`: a line the captain wrote to this home's login in a Ping (a direct message, in a
+  bucket of its own). Treat it like a `chat-question` from an `every_line` chat, and answer
+  in the Ping with `sync.py reply --recording <line id>`; never with the `basecamp` CLI.
 - `todo-comment`: the captain commented on a tracked to-do; see "Decisions as to-dos".
 - `message-comment`: the captain commented on a Message Board post this home made (a
   report); it is feedback or an instruction on it. Act on it (relaying first outside the
   main firstmate's home), then answer with `sync.py reply --recording <comment id>`.
-- `boost`: the captain boosted something being watched (`surface`: chat, card,
+- `boost`: the captain boosted something being watched (`surface`: chat, ping, card,
   card-comment, todo, todo-comment, checkin-answer, message, message-comment); a boost
   can carry short text. It is an answer to what was boosted, like a comment there: on a
   decision to-do or a comment under it, a decision or feedback as above; elsewhere a reply
@@ -142,7 +146,7 @@ The main firstmate's own home answers its questions itself rather than relaying.
 
 - Post, comment, complete, delete, archive or trash anything in Basecamp outside `sync.py`
   and its commands (`reply`, `ask`, `answer`, `todo create|track|comment|complete`,
-  `post-message`), or hand-edit `todos.json`, `feed.json` or `unmonitored.json`.
+  `post-message`), or hand-edit `todos.json`, `feed.json`, `pings.json` or `unmonitored.json`.
   The sync's one automatic post is a release announcement: releases only (GitHub releases
   of the repos in `releases`, never merges or PRs), Message Board only. Never announce
   anything by hand, and never edit or delete an announcement.

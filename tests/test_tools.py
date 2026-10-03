@@ -308,7 +308,7 @@ class Cli(ToolBase):
         on = {ln.split()[0]: ln.split()[1] for ln in out.splitlines()}
         self.assertEqual(on, {"card-mirror": "on", "chat-inbox": "off", "chat-asks": "off", "release-announcements": "off",
                               "checkin-answering": "off", "decision-todos": "on", "reports": "on",
-                              "inbox-delivery": "off", "owner-events": "off"})
+                              "pings": "off", "inbox-delivery": "off", "owner-events": "off"})
 
 
 def boost(id, who=CAPTAIN, content="a"):
