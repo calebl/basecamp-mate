@@ -4,7 +4,7 @@ Hand this to a fresh firstmate once, with the three values below filled in. It s
 home up and re-establishes how the agent works through Basecamp. Mechanics (file formats,
 record fields, every refusal rule) are in `SYNC/README.md`; this prompt is the policy.
 
-- `SYNC`: this checkout of firstmate-basecamp-sync.
+- `SYNC`: this checkout of basecamp-mate (formerly firstmate-basecamp-sync).
 - `HOME`: the firstmate home (it has `data/`, `state/` and `bin/fm-check-register.sh`).
 - `URL`: the Basecamp project, `https://app.basecamp.com/<account>/projects/<project>`.
 
