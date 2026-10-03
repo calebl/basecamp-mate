@@ -3,4 +3,4 @@ Description=Mirror a firstmate backlog into its Basecamp project
 
 [Service]
 Type=oneshot
-ExecStart=%h/src/firstmate-basecamp-sync/run.sh %h/path/to/firstmate-home %h/path/to/firstmate-home/data/basecamp-sync/config.json
+ExecStart=%h/src/basecamp-mate/run.sh %h/path/to/firstmate-home %h/path/to/firstmate-home/data/basecamp-sync/config.json

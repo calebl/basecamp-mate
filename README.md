@@ -1,4 +1,14 @@
-# firstmate-basecamp-sync
+# basecamp-mate
+
+> Formerly `firstmate-basecamp-sync`. GitHub redirects the old repository URL; existing
+> installs keep working unchanged (the `basecamp-sync` skill, config keys and systemd unit
+> names are the same).
+
+Source: <https://github.com/calebl/basecamp-mate>
+
+```sh
+git clone https://github.com/calebl/basecamp-mate.git
+```
 
 Connects an agent home to one Basecamp project through the `basecamp` CLI, in two
 layers. No model calls.
@@ -499,7 +509,7 @@ Description=Mirror a firstmate backlog into its Basecamp project
 
 [Service]
 Type=oneshot
-ExecStart=%h/src/firstmate-basecamp-sync/run.sh %h/path/to/firstmate-home %h/path/to/firstmate-home/data/basecamp-sync/config.json
+ExecStart=%h/src/basecamp-mate/run.sh %h/path/to/firstmate-home %h/path/to/firstmate-home/data/basecamp-sync/config.json
 ```
 
 `~/.config/systemd/user/basecamp-sync.timer`:

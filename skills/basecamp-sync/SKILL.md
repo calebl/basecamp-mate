@@ -1,6 +1,6 @@
 ---
 name: basecamp-sync
-description: Operating contract for a firstmate or second mate whose home mirrors its backlog into a Basecamp project with firstmate-basecamp-sync. Use when told to "use this Basecamp project", when setting a home up with `sync.py init`, when the basecamp-sync wake check fires, when handling data/basecamp-sync/pending-comments.jsonl, when putting a decision to the owner as a Basecamp to-do (`sync.py todo`), when posting a report to the Message Board (`sync.py post-message`), when handling an `unmonitored` record (`sync.py unmonitored`), or when editing figuring.json, not-now.json, decisions.json, boards.json, extra-repos.json or skip.json.
+description: Operating contract for a firstmate or second mate whose home mirrors its backlog into a Basecamp project with basecamp-mate (formerly firstmate-basecamp-sync). Use when told to "use this Basecamp project", when setting a home up with `sync.py init`, when the basecamp-sync wake check fires, when handling data/basecamp-sync/pending-comments.jsonl, when putting a decision to the owner as a Basecamp to-do (`sync.py todo`), when posting a report to the Message Board (`sync.py post-message`), when handling an `unmonitored` record (`sync.py unmonitored`), or when editing figuring.json, not-now.json, decisions.json, boards.json, extra-repos.json or skip.json.
 ---
 
 # Basecamp sync
@@ -18,7 +18,7 @@ are the same, plus an `unmonitored` record when the captain does something nothi
 monitors). `python3 $SYNC/sync.py behaviors --home <home>
 --config <config>` lists which are on. Sections below about cards and the side files apply
 only when the card mirror is on. Mechanics (column rules, file formats, record fields,
-safety bounds) are in the repo's README: `firstmate-basecamp-sync/README.md`. `SYNC` below
+safety bounds) are in the repo's README: `basecamp-mate/README.md` (https://github.com/calebl/basecamp-mate). `SYNC` below
 means that checkout.
 
 `$SYNC/prompts/base.md` is the full policy for a home that runs everything through
