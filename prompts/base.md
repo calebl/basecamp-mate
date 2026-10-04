@@ -36,6 +36,10 @@ a record's `captain` is false.
 
 ## 1. Set up
 
+A person can do all of this with `SYNC/bin/basecamp-mate setup` (guided, plain language);
+`SYNC/bin/basecamp-mate doctor` checks a set-up home and prints each problem with its fix.
+Run `doctor` after setting up, and whenever a run fails. As the agent, follow the steps below.
+
 1. You need your own Basecamp user, signed in as a `basecamp` CLI login separate from the
    captain's. Follow `SYNC/docs/firstmate-account.md`; the login is usually `firstmate`.
    Check it: `basecamp api get /my/profile.json -P firstmate` must show your user, not theirs.

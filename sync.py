@@ -40,6 +40,8 @@ Usage: sync.py --home <home> --config <config.json> [--dry-run] [--include-prere
        sync.py listen --home <home> --config <config.json> [--once] [--dry-run]
        sync.py unmonitored list|handle|forget --home <home> --config <config.json> [--key <key>] [--decision <text>] [--dry-run]
        sync.py behaviors --home <home> --config <config.json>
+       sync.py setup [--answers <file.json>] [--yes]      (guided; also bin/basecamp-mate setup)
+       sync.py doctor [--home <home>] [--config <config.json>]
        sync.py init <project URL> --login <profile> --home <home> [--captain <id or email>] [--listen-to <person>]... [--repo-map TABLE=REPO] [--dry-run]
 """
 import argparse, json, subprocess, sys
@@ -217,6 +219,12 @@ def cli(argv=None, runner=subprocess.run):
     if argv[:1] == ["init"]:
         import init_home
         return init_home.cli(argv[1:])
+    if argv[:1] == ["setup"]:
+        import setup_home
+        return setup_home.cli(argv[1:])
+    if argv[:1] == ["doctor"]:
+        import doctor
+        return doctor.cli(argv[1:])
     if argv[:1] == ["todo"]:
         return todo_cli(argv[1:], runner)
     if argv[:1] == ["unmonitored"]:

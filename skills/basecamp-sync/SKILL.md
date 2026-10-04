@@ -1,6 +1,6 @@
 ---
 name: basecamp-sync
-description: Operating contract for a firstmate or second mate whose home mirrors its backlog into a Basecamp project with basecamp-mate (formerly firstmate-basecamp-sync). Use when told to "use this Basecamp project", when setting a home up with `sync.py init`, when the basecamp-sync wake check fires, when handling data/basecamp-sync/pending-comments.jsonl, when putting a decision to the owner as a Basecamp to-do (`sync.py todo`), when posting a report to the Message Board (`sync.py post-message`), when handling an `unmonitored` record (`sync.py unmonitored`) or a `ping` record (the owner's direct message), or when editing figuring.json, not-now.json, decisions.json, boards.json, extra-repos.json or skip.json.
+description: Operating contract for a firstmate or second mate whose home mirrors its backlog into a Basecamp project with basecamp-mate (formerly firstmate-basecamp-sync). Use when told to "use this Basecamp project", when setting a home up with `sync.py init` or `basecamp-mate setup`, when checking a home with `basecamp-mate doctor`, when the basecamp-sync wake check fires, when handling data/basecamp-sync/pending-comments.jsonl, when putting a decision to the owner as a Basecamp to-do (`sync.py todo`), when posting a report to the Message Board (`sync.py post-message`), when handling an `unmonitored` record (`sync.py unmonitored`) or a `ping` record (the owner's direct message), or when editing figuring.json, not-now.json, decisions.json, boards.json, extra-repos.json or skip.json.
 ---
 
 # Basecamp sync
@@ -28,6 +28,15 @@ the decision to-do lifecycle, and how to handle each record. Follow it in such a
 this skill is the short form.
 
 ## Set up
+
+A person setting a home up by hand runs `$SYNC/bin/basecamp-mate setup`: a guided, plain-language
+setup (sign-in with a link and code, project picker, yes/no questions) that ends in the same
+`init`. To run it yourself without questions, pass `--answers <file.json>` (keys: `home`,
+`login`, `project` id or URL, `captain` person id, `timezone`, and `true`/`false` for `chat`,
+`todos`, `checkins`, `listen`, `cards`, `releases`, `reports`, `pings`, `inbox`); it refuses
+instead of asking when the login is not signed in. `$SYNC/bin/basecamp-mate doctor` checks
+everything (CLI, sign-in, project, card columns, services, last sync, wake check) and prints
+each problem with its fix; it exits non-zero when something is broken.
 
 "Use this Basecamp project with the firstmate login" means:
 
@@ -148,7 +157,9 @@ they wrote is a request.
   one per line with
   `python3 $SYNC/sync.py ask --home <home> --config <home>/data/basecamp-sync/config.json --body-file <file>`;
   it @mentions the owner.
-- A FAILED run (or `FAILED listen`, three listener cycles in a row): read `sync.log`; a token failure needs `basecamp auth login -P <profile>`,
+- A FAILED run (or `FAILED listen`, three listener cycles in a row): read `sync.log` and run
+  `$SYNC/bin/basecamp-mate doctor`, which names the problem and its fix; a token failure needs
+  `BASECAMP_NO_KEYRING=1 basecamp auth login -P <profile> --device-code` (or `basecamp-mate setup`),
   which only the captain can do, so relay it.
 
 The main firstmate's own home answers its questions itself rather than relaying.

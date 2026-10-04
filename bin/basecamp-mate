@@ -1,0 +1,20 @@
+#!/bin/sh
+# basecamp-mate: one command for people, the same as `python3 sync.py <args>`.
+#   basecamp-mate setup     guided setup, step by step
+#   basecamp-mate doctor    check everything and explain any problem with its fix
+# Symlink it onto your PATH (e.g. ~/.local/bin) to run it from anywhere.
+self=$(readlink -f "$0" 2>/dev/null || echo "$0")
+here=$(cd "$(dirname "$self")/.." && pwd)
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "basecamp-mate needs Python 3.11 or newer. Install it from https://www.python.org/downloads/ (or your package manager), then try again." >&2
+  exit 2
+fi
+if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+  echo "basecamp-mate needs Python 3.11 or newer; this computer has $(python3 -V 2>&1). Install a newer Python, then try again." >&2
+  exit 2
+fi
+[ $# -gt 0 ] || set -- --help
+case $1 in
+  -h|--help) echo "usage: basecamp-mate setup | doctor | <any sync.py command>"; exit 0 ;;
+esac
+exec python3 "$here/sync.py" "$@"
