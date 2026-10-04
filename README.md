@@ -74,6 +74,28 @@ Every piece shares `account`, `project`, `captain` (the owner's person id) and t
 never calls a card or card-table endpoint, and never writes `map.json`; the other
 behaviors run the same either way. Set such a home up with `sync.py init --no-cards`.
 
+## People the sync listens to
+
+By default the sync listens only to the captain. The optional `people` list (Basecamp
+person ids, set with `sync.py init --listen-to <person>`) adds others: every reader that
+relays the captain (chat lines, every-line chats, card, to-do and message comments,
+boosts on every surface, Pings, the listener's feed filter and unmonitored-event
+detection) then relays them too. The captain is always on the list, whether or not
+`people` names them, and the acting login never is: its own lines only move cursors.
+"Owner" below means anyone on the list.
+
+Every record says who wrote it (`author`: `id`, `name`) and whether that is the captain
+(`captain`: true or false), and so does its inbox note ("from the captain" or "from
+<name> (not the captain)"). Authority stays with the captain alone:
+
+- only the captain's 👍 on an assigned card is an `approval`; anyone else's is a `boost`;
+- only the captain's comment or boost on a decision to-do is the decision; another
+  person's is input to weigh, and the to-do stays open for the captain;
+- a check-in question's instruction is the captain's only when they wrote it;
+- decision to-dos, assigned cards and `sync.py ask` mentions are still the captain's alone.
+
+A config with only `captain` behaves exactly as before.
+
 ## Card mirror
 
 The backlog is the source of truth; Basecamp is a one-way view of it. Each run reads
@@ -369,7 +391,10 @@ Message Board, `releases`: its id and the GitHub repo behind each mapped repo's
 `<home>/projects/<repo>` origin (renames followed through `gh repo view`), named by its
 board. A repo's `note` is added by hand. `--captain <person id or
 email>` names the captain; by default it is the project's one account owner other than the
-login. `--repo-map <table>=<repo>` (repeatable) maps a table whose title is not a
+login. `--listen-to <person>` (repeatable: a person id, email or exact name on the
+project) adds someone the sync listens to besides the captain, written as `people` (the
+captain first); a name or email matching no one or several people, or the login itself,
+is refused. `--repo-map <table>=<repo>` (repeatable) maps a table whose title is not a
 registered project's name. A table whose title matches no registered project and that
 `--repo-map` does not name (a general "Ideas" board, say) is skipped: `init` prints a line
 for it, leaves it out of the config, never reads its columns, and the sync never touches
@@ -433,11 +458,15 @@ or by hand from
 [`examples/config.example.json`](examples/config.example.json):
 
 - `account`, `project`: Basecamp ids.
-- `captain`: the captain's Basecamp person id (assignee, and whose comments are relayed).
+- `captain`: the captain's Basecamp person id: the assignee, and the only person whose
+  word is a decision or approval.
+- `people` (optional): the Basecamp person ids whose lines, comments and boosts are
+  relayed; the captain is always included. Default: just the captain. See "People the
+  sync listens to".
 - `profile` (optional): the `basecamp` CLI login every call runs as (`-P <profile>`),
   including `run.sh`'s token refresh. Absent means the CLI's default login. It changes
-  only who acts; `captain` stays the assignee and the only person whose comments and 👍
-  are relayed, so the acting user's own comments and boosts are ignored.
+  only who acts; `captain` stays the assignee and the only person whose 👍 approves, and
+  the acting user's own comments and boosts are never relayed.
 - `todos` (optional): `{}`, `{"todoset": "<to-do set id>"}` or `{"list": "<to-do list id>"}`:
   where `sync.py todo create` puts the owner's to-dos (loose on the set, or in the list);
   turns on the to-do comment reader.
@@ -451,7 +480,7 @@ or by hand from
   three handled types.
 - `pings` (optional): `{}` or `{"limit": <n>}`: relay the owner's Pings (direct messages)
   to the acting login, reading at most `n` Pings a run (default 10).
-- `chats` (optional): chat (Campfire) ids whose captain questions are relayed.
+- `chats` (optional): chat (Campfire) ids whose owner questions are relayed.
   An entry may be `{"chat": <id>, "every_line": true}` to relay every owner line in that chat.
 - `ask_chat` (optional): the chat id `sync.py ask` posts in.
 - `checkins` (optional): `{"questionnaires": ["<questionnaire id>", ...], "timezone":
@@ -582,14 +611,20 @@ stubbed `/events.json` pages: entry and resume, `next`, position saved only afte
 is handled, 409/410/400 re-entry, dispatch to each reader, no duplicate record when a
 timer sweep runs during a listener cycle, and unmonitored events: detection per event
 kind, one record per key until forgotten, handled events recording nothing, and the
-narrow feed when it is off; `tests/test_pings.py` covers the Ping reader with a stubbed
+narrow feed when it is off; `tests/test_people.py` covers the `people` list: relaying
+several people with who wrote each record, captain-only approvals and decisions, an
+unchanged single-captain config and `init --listen-to`; `tests/test_pings.py` covers the Ping reader with a stubbed
 `/my/readings.json`, the reply in a Ping, and the listener's every-bucket poll. The `basecamp`, `gh` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
 registration sit behind a fake; tests make no network calls and touch no real home.
 
 ## Pending records
 
 Each line of `pending-comments.jsonl` is one JSON object with a `kind`. Records written
-before `kind` existed have none; treat a missing `kind` as `"comment"`.
+before `kind` existed have none; treat a missing `kind` as `"comment"`. Every record but
+`checkin` is something a listened-to person did, and carries `author` (`id`, `name`) and
+`captain` (true when the captain wrote it); a `checkin` carries the question's writer the
+same way. A record written before the `people` list has neither and is the captain's.
+Only a record with `captain: true` can be a decision or an approval.
 
 - `comment`: `task`, `repo`, `card`, `comment` (id), `at`, `text`.
 - `question`: the same fields as `comment`, for a comment containing `?`.
@@ -598,7 +633,8 @@ before `kind` existed have none; treat a missing `kind` as `"comment"`.
   `url`, `text`, `at`. The owner wrote to the agent's login in a Ping; answer there with
   `sync.py reply --recording <line>`.
 - `checkin`: `questionnaire`, `question` (ids), `date` (local, `YYYY-MM-DD`), `title`,
-  `url`, `at`. A check-in question came due today; answer it with `sync.py answer`.
+  `url`, `at`. A check-in question came due today; answer it with `sync.py answer`. An
+  instruction in it is the captain's only when `captain` is true.
 - `approval`: `task`, `repo`, `card`, `url` (card URL), `boost` (id), `text`, `at`. The captain
   gave the card a 👍: approve every recommendation on it as recommended.
 - `todo-comment`: `key`, `todo` (id), `comment` (id), `question` (true when it contains
@@ -611,7 +647,8 @@ before `kind` existed have none; treat a missing `kind` as `"comment"`.
   `checkin-answer`, `message`, `message-comment`), the surface's ids (`chat`; `bucket`, `chat`; `task`,
   `repo`, `card`; `key`, `todo`; `question`; `message`, `subject`), `recording` (the
   boosted recording), `boost` (id), `text` (the boost's text), `url`, `at`. The owner's
-  boost is an answer to what was boosted, like a comment.
+  boost is an answer to what was boosted, like a comment; a 👍 on an assigned card by
+  anyone but the captain is a `boost`, not an `approval`.
 - `unmonitored`: `key` (`<event type>/<recording type>`), `event_type`, `recording_type`,
   `event` (id), `recording` (id), `title` (for a comment, of what it is on), `text` (an
   excerpt), `creator` (`id`, `name`), `url`, `at`. The owner did something no enabled

@@ -47,7 +47,12 @@ class Tools:
         self.dir = os.path.dirname(os.path.abspath(config_path))
         self.cfg = cfg = json.load(open(config_path))
         self.account, self.project = str(cfg["account"]), str(cfg["project"])
-        self.captain = int(cfg["captain"])  # the owner: assignee, and the only person whose comments are relayed
+        self.captain = int(cfg["captain"])  # the owner: assignee, and the only person whose word is a decision
+        # The people whose lines, comments and boosts are relayed: "people", always with the captain.
+        people = cfg.get("people", [])
+        if not isinstance(people, list):
+            raise ValueError('config "people" must be a list of Basecamp person ids')
+        self.people = {self.captain, *(int(p) for p in people)}
         self.profile = cfg.get("profile")
         self.ask_chat = str(cfg["ask_chat"]) if cfg.get("ask_chat") is not None else None
         self.checkins = cfg.get("checkins")
@@ -321,7 +326,7 @@ class Tools:
                 continue
             for b in sorted(boosts, key=lambda b: b.get("id", 0)):
                 bid = b.get("id")
-                if bid in seen or (b.get("booster") or {}).get("id") != self.captain:
+                if bid in seen or not self.hears(b.get("booster")):
                     continue
                 if self.dry:
                     self.log(f"dry {surface} {rid}: owner boost {bid}")
@@ -331,7 +336,7 @@ class Tools:
                     continue
                 self.record({"kind": "boost", "surface": surface, **context, "recording": rid, "boost": bid,
                              "text": html.unescape(re.sub(r"<[^>]+>", "", b.get("content", ""))).strip(),
-                             "url": url, "at": b.get("created_at")})
+                             "url": url, "at": b.get("created_at"), **self.author(b.get("booster"))})
                 self.log(f"new owner boost on {surface} {rid}: {bid}")
             if count is not None:
                 counts[str(rid)] = count
@@ -341,7 +346,7 @@ class Tools:
             rec["boost_seen"] = seen
 
     def read_card_comments(self, task, repo, key, rec):
-        """Record the captain's new comments on card rec["card"]: "question" when it has "?", else "comment"."""
+        """Record the new comments of the people listened to on card rec["card"]: "question" when it has "?", else "comment"."""
         try:
             comments = self.bc("comments", "list", str(rec["card"])) or []
         except RuntimeError as e:
@@ -352,19 +357,20 @@ class Tools:
             if cid in rec.setdefault("comments", []):
                 continue
             rec["comments"].append(cid)
-            if (c.get("creator") or {}).get("id") == self.captain:
+            if self.hears(c.get("creator")):
                 text = re.sub(r"<[^>]+>", "", c.get("content", ""))
                 kind = "question" if "?" in html.unescape(text) else "comment"
                 self.record({"kind": kind, "task": task, "repo": repo, "card": rec["card"], "comment": cid,
-                             "at": c.get("created_at"), "text": text})
+                             "at": c.get("created_at"), "text": text, **self.author(c.get("creator"))})
                 rec.setdefault("ack", []).append([cid, EYES if kind == "question" else THUMBS])
                 self.log(f"new captain {kind} on {key}: {cid}")
         self.read_boosts(rec, "card-comment", {"task": task, "repo": repo, "card": rec["card"]},
                          counted=[(c.get("id"), c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
 
     def read_card_boosts(self, task, repo, key, rec):
-        """Record the captain's 👍 on card rec["card"] as an approval, and any other owner boost as a `boost`.
+        """Record the captain's 👍 on card rec["card"] as an approval, and any other boost by someone listened to as a `boost`.
 
+        Only the captain approves: another listed person's 👍 is a `boost` like any other.
         A dry run reads and logs only. Other boosts already on the card the first time
         it is read (no rec["card_boost_seen"]) are seeded, not recorded.
         """
@@ -380,9 +386,9 @@ class Tools:
             bid = b.get("id")
             if bid in rec.get("boosts", []) or bid in rec.get("card_boost_seen", []):
                 continue
-            if (b.get("booster") or {}).get("id") != self.captain:
+            if not self.hears(b.get("booster")):
                 continue
-            if not is_thumbs_up(b.get("content", "")):
+            if not is_thumbs_up(b.get("content", "")) or (b.get("booster") or {}).get("id") != self.captain:
                 if self.dry:
                     self.log(f"dry {key}: owner boost {bid}")
                     continue
@@ -391,7 +397,7 @@ class Tools:
                     self.record({"kind": "boost", "surface": "card", "task": task, "repo": repo, "card": rec["card"],
                                  "recording": rec["card"], "boost": bid,
                                  "text": html.unescape(re.sub(r"<[^>]+>", "", b.get("content", ""))).strip(),
-                                 "url": url, "at": b.get("created_at")})
+                                 "url": url, "at": b.get("created_at"), **self.author(b.get("booster"))})
                     self.log(f"new owner boost on {key}: {bid}")
                 continue
             if self.dry:
@@ -400,7 +406,8 @@ class Tools:
                 continue
             rec.setdefault("boosts", []).append(bid)
             self.record({"kind": "approval", "task": task, "repo": repo, "card": rec["card"], "url": url,
-                         "boost": bid, "text": re.sub(r"<[^>]+>", "", b.get("content", "")).strip(), "at": b.get("created_at")})
+                         "boost": bid, "text": re.sub(r"<[^>]+>", "", b.get("content", "")).strip(), "at": b.get("created_at"),
+                         **self.author(b.get("booster"))})
             if [rec["card"], THUMBS] not in rec.setdefault("ack", []):
                 rec["ack"].append([rec["card"], THUMBS])
             self.log(f"captain approval on {key}: boost {bid}")
@@ -408,12 +415,12 @@ class Tools:
             rec.setdefault("card_boost_seen", [])
 
     def read_chats(self, chats, every_line=()):
-        """Record the captain's chat lines in `chats` as chat-question records.
+        """Record the chat lines of the people listened to in `chats` as chat-question records.
 
         Per chat, chats.json keeps a cursor (the newest line id seen). The first run
-        only sets the cursor, so old history is not relayed. A captain line that
+        only sets the cursor, so old history is not relayed. A listened-to line that
         mentions the acting user or contains "?" is recorded and queued for a 👀; every
-        other line is skipped, unless the chat is in `every_line`, where every owner
+        other line is skipped, unless the chat is in `every_line`, where every such
         line is recorded. A dry run reads and logs only.
         """
         state = self.load("chats.json", {})
@@ -432,7 +439,7 @@ class Tools:
                 if lid <= cursor:
                     continue
                 cursor = lid
-                if first or (ln.get("creator") or {}).get("id") != self.captain:
+                if first or not self.hears(ln.get("creator")):
                     continue
                 content = ln.get("content", "")
                 text = html.unescape(re.sub(r"<[^>]+>", "", content)).strip()
@@ -446,7 +453,7 @@ class Tools:
                     continue
                 self.record({"kind": "chat-question", "chat": int(chat), "line": lid,
                              "url": ln.get("app_url") or f"https://3.basecamp.com/{self.account}/buckets/{self.project}/chats/{chat}@{lid}",
-                             "text": text, "at": ln.get("created_at")})
+                             "text": text, "at": ln.get("created_at"), **self.author(ln.get("creator"))})
                 rec.setdefault("lines", []).append(lid)
                 rec.setdefault("ack", []).append([lid, EYES])
                 self.log(f"new captain chat question in {chat}: {lid}")
@@ -472,7 +479,7 @@ class Tools:
         Due: not paused, today's weekday in the schedule's "days" (0 = Sunday), the
         start_date reached, and the schedule's hour:minute passed in the configured
         "timezone" (the machine's local time when unset). Each question is recorded
-        once per day as a `checkin`; nothing is answered here.
+        once per day as a `checkin`, with who wrote the question; nothing is answered here.
         checkins.json keeps question id -> {"recorded": [dates], "answered": [dates]}.
         A dry run reads and logs only.
         """
@@ -503,7 +510,8 @@ class Tools:
                     self.log(f"dry checkin {qid}: due {date}")
                     continue
                 self.record({"kind": "checkin", "questionnaire": int(qn), "question": q["id"], "date": date,
-                             "title": q.get("title"), "url": q.get("app_url"), "at": now.isoformat(timespec="seconds")})
+                             "title": q.get("title"), "url": q.get("app_url"), "at": now.isoformat(timespec="seconds"),
+                             **self.author(q.get("creator"))})
                 rec.setdefault("recorded", []).append(date)
                 state[qid] = rec
                 self.save_json("checkins.json", state)
@@ -513,6 +521,22 @@ class Tools:
         """The acting user's id when it is someone other than the owner, else None."""
         me = self.acting_id()
         return None if me in (None, "retry", self.captain) else me
+
+    def hears(self, person):
+        """True when `person` (a creator or booster object) is someone the sync listens to.
+
+        The captain always is. Another listed person is, unless they are the acting user
+        itself, so the agent's own lines are never relayed back to it even when listed.
+        """
+        pid = (person or {}).get("id")
+        if pid == self.captain:
+            return True
+        return pid in self.people and pid != self.acting_id()
+
+    def author(self, person):
+        """A record's author fields: who wrote it ({"id", "name"}) and whether that is the captain."""
+        person = person or {}
+        return {"author": {"id": person.get("id"), "name": person.get("name")}, "captain": person.get("id") == self.captain}
 
     def read_answer_boosts(self, questionnaires, days=7):
         """The owner's boosts on check-in answers the acting user posted in the last `days` days.
@@ -583,7 +607,7 @@ class Tools:
                     if cid <= cursor:
                         continue
                     cursor = cid
-                    if (c.get("creator") or {}).get("id") != self.captain:
+                    if not self.hears(c.get("creator")):
                         continue
                     text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", c.get("content", "")))).strip()
                     question = "?" in text
@@ -592,7 +616,7 @@ class Tools:
                         continue
                     self.record({"kind": "message-comment", "message": m["id"], "subject": m.get("subject"),
                                  "comment": cid, "question": question, "url": c.get("app_url") or m.get("app_url"),
-                                 "text": text, "at": c.get("created_at")})
+                                 "text": text, "at": c.get("created_at"), **self.author(c.get("creator"))})
                     post.setdefault("comments", []).append(cid)
                     post.setdefault("ack", []).append([cid, EYES if question else THUMBS])
                     self.log(f"new owner comment on message {m['id']}: {cid}")
@@ -616,9 +640,9 @@ class Tools:
         """Record the owner's new comments on each open tracked to-do (or only those in `keys`) as `todo-comment` records.
 
         todos.json keeps, per key, the to-do id and a cursor (the newest comment id
-        seen). Each owner comment newer than the cursor is recorded once and queued
-        for a 👀 when it contains "?", a 👍 otherwise; other people's comments, the
-        agent's own included, only move the cursor. Completed to-dos are not read.
+        seen). Each comment by someone listened to newer than the cursor is recorded once
+        and queued for a 👀 when it contains "?", a 👍 otherwise; other people's comments,
+        the agent's own included, only move the cursor. Completed to-dos are not read.
         A dry run reads and logs only.
         """
         for key in sorted(self.load("todos.json", {})):
@@ -642,7 +666,7 @@ class Tools:
                     if cid <= cursor:
                         continue
                     cursor = cid
-                    if (c.get("creator") or {}).get("id") != self.captain:
+                    if not self.hears(c.get("creator")):
                         continue
                     text = html.unescape(re.sub(r"<[^>]+>", " ", c.get("content", "")))
                     text = re.sub(r"\s+", " ", text).strip()
@@ -653,7 +677,7 @@ class Tools:
                         continue
                     self.record({"kind": "todo-comment", "key": key, "todo": rec["todo"], "comment": cid,
                                  "question": question, "url": c.get("app_url") or rec.get("url"),
-                                 "text": text, "at": c.get("created_at")})
+                                 "text": text, "at": c.get("created_at"), **self.author(c.get("creator"))})
                     rec.setdefault("comments", []).append(cid)
                     self.log(f"new owner comment on todo {key}: {cid}")
                 self.read_todo_boosts(key, rec, comments)
@@ -670,10 +694,10 @@ class Tools:
                          counted=[(c.get("id"), c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
 
     def ping_conversations(self):
-        """The Ping conversations (direct messages, each a chat in its own "circle" bucket) the acting user is in with the owner.
+        """The Ping conversations (direct messages, each a chat in its own "circle" bucket) the acting user is in with someone listened to.
 
         One read of /my/readings.json: its "pings" section, read and unread, lists each
-        recently active Ping with the owner among its participants or as its creator; the
+        recently active Ping with a listened-to person among its participants or as its creator; the
         bucket and chat ids come from its subscription_url. Newest activity first.
         """
         data = self.bc("api", "get", "/my/readings.json") or {}
@@ -681,14 +705,14 @@ class Tools:
         for r in (data.get("unreads") or []) + (data.get("reads") or []):
             m = re.search(r"/buckets/(\d+)/recordings/(\d+)/", r.get("subscription_url") or "")
             people = [p.get("id") for p in r.get("participants") or []] + [(r.get("creator") or {}).get("id")]
-            if r.get("section") != "pings" or r.get("type") != "Chat" or not m or self.captain not in people:
+            if r.get("section") != "pings" or r.get("type") != "Chat" or not m or not self.people & set(people):
                 continue
             found.setdefault(m.group(2), {"bucket": m.group(1), "chat": m.group(2), "title": r.get("bucket_name"),
                                           "url": r.get("app_url"), "updated_at": r.get("updated_at") or ""})
         return sorted(found.values(), key=lambda p: p["updated_at"], reverse=True)
 
     def read_pings(self, limit=10):
-        """Record each new line the owner writes in a Ping with the acting user as a `ping` record, once.
+        """Record each new line someone listened to writes in a Ping with the acting user as a `ping` record, once.
 
         Pings are found with ping_conversations(), at most `limit` per run, newest activity
         first; a Ping drops out of the readings once it goes quiet, and a new line puts it
@@ -726,7 +750,7 @@ class Tools:
                 if lid <= cursor:
                     continue
                 cursor = lid
-                if (ln.get("creator") or {}).get("id") != self.captain or not later(ln.get("created_at"), since):
+                if not self.hears(ln.get("creator")) or not later(ln.get("created_at"), since):
                     continue
                 if self.dry:
                     self.log(f"dry ping {chat}: owner line {lid}")
@@ -734,7 +758,7 @@ class Tools:
                 self.record({"kind": "ping", "bucket": int(bucket), "chat": int(chat), "line": lid, "title": p["title"],
                              "url": ln.get("app_url") or f"https://app.basecamp.com/{self.account}/circles/{bucket}@{lid}",
                              "text": html.unescape(re.sub(r"<[^>]+>", "", ln.get("content", ""))).strip(),
-                             "at": ln.get("created_at")})
+                             "at": ln.get("created_at"), **self.author(ln.get("creator"))})
                 rec.setdefault("lines", []).append(lid)
                 rec.setdefault("ack", []).append([lid, EYES])
                 self.log(f"new owner ping line in {chat}: {lid}")
@@ -798,6 +822,7 @@ class Tools:
                      "event": ev.get("id"), "recording": rid, "title": title,
                      "text": text[:300] + ("..." if len(text) > 300 else ""),
                      "creator": {"id": ev.get("creator_id"), "name": creator.get("name")},
+                     **self.author({"id": ev.get("creator_id"), "name": creator.get("name")}),
                      "url": rec.get("app_url") or (on or {}).get("app_url"), "at": ev.get("created_at")})
         state[key] = {"event": ev.get("id"), "recording": rid, "recorded_at": now_iso(), "seen": 1}
         self.save_json("unmonitored.json", state)

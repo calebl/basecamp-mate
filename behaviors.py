@@ -35,7 +35,7 @@ class Behavior:
 
 
 class CardMirror(Behavior):
-    """Mirror the backlog onto card tables; relay the captain's card comments and 👍 approvals."""
+    """Mirror the backlog onto card tables; relay the listened-to people's card comments and the captain's 👍 approvals."""
     name, keys = "card-mirror", ("tables", "repos", "cards")
 
     def __init__(self, t, cfg):
@@ -182,7 +182,7 @@ class CardMirror(Behavior):
         return plan
 
     def read_card(self, task, repo, key, rec):
-        """The card readers for one mirrored card: the captain's comments, and boosts when it is assigned."""
+        """The card readers for one mirrored card: the listened-to people's comments, and boosts when it is assigned."""
         self.t.read_card_comments(task, repo, key, rec)
         if rec.get("assigned"):
             self.t.read_card_boosts(task, repo, key, rec)
@@ -210,7 +210,7 @@ class CardMirror(Behavior):
 
 
 class ChatInbox(Behavior):
-    """Relay the captain's chat questions, or every line they write in an "every_line" chat."""
+    """Relay the listened-to people's chat questions, or every line they write in an "every_line" chat."""
     name, keys = "chat-inbox", ("chats",)
 
     def __init__(self, t, cfg):
@@ -428,8 +428,9 @@ class InboxDelivery(Behavior):
 
 
 class OwnerEvents(Behavior):
-    """Listen to the account event feed for the owner's events and run the reader each one names: a faster wake.
+    """Listen to the account event feed for the listened-to people's events and run the reader each one names: a faster wake.
 
+    The people are the config's "people" (always with the captain); "owner" below means any of them.
     Run by `sync.py listen` (a systemd user service beside the timer), not by the timer.
     Each cycle polls the feed for the owner's chat lines, comments and boosts in this
     project and, per page, runs the existing reader for the surface each event points
@@ -472,16 +473,16 @@ class OwnerEvents(Behavior):
 
     def run(self, items=None):
         """One listener cycle: every page of new owner events, each dispatched once handled. Returns the events seen."""
-        seen = self.t.read_feed(() if self.unmonitored else self.TYPES, [self.t.captain], self.dispatch)
+        seen = self.t.read_feed(() if self.unmonitored else self.TYPES, self.t.people, self.dispatch)
         if self.others.get("pings") and self.others["pings"].on:
-            seen += self.t.read_feed(("boost.created", "chat.line.created"), [self.t.captain], self.dispatch_pings,
+            seen += self.t.read_feed(("boost.created", "chat.line.created"), self.t.people, self.dispatch_pings,
                                      every_bucket=True, store="pings-feed.json")
         return seen
 
     def dispatch_pings(self, events):
         """Run the Ping reader when the page has an owner line or boost outside the project, then deliver."""
         t = self.t
-        outside = [ev for ev in events if str(ev.get("bucket_id")) != t.project and ev.get("creator_id") == t.captain]
+        outside = [ev for ev in events if str(ev.get("bucket_id")) != t.project and t.hears({"id": ev.get("creator_id")})]
         if not outside:
             return
         t.read_pings(self.others["pings"].limit)
@@ -495,7 +496,7 @@ class OwnerEvents(Behavior):
         want = {"cards": set(), "todos": set(), "chats": False, "checkins": False, "messages": False}
         checks = []  # (event, its comment): each classified once the readers have run
         for ev in events:
-            if str(ev.get("bucket_id")) != t.project or ev.get("creator_id") != t.captain:
+            if str(ev.get("bucket_id")) != t.project or not t.hears({"id": ev.get("creator_id")}):
                 continue  # the filters already say so; a stray event is never acted on
             kind, rid = ev.get("event_type"), ev.get("recording_id")
             checks.append((ev, None))
@@ -654,9 +655,14 @@ def inbox_note(rec, account, project):
     text = " ".join(str(rec.get("text") or "").split())
     if len(text) > 600:
         text = text[:600] + "..."
+    # A record without "captain" predates the people list, when only the captain was relayed.
+    captain = rec.get("captain", True)
+    author = rec.get("author") or {}
+    name = author.get("name") or (f"person {author['id']}" if author.get("id") else "someone")
+    who = "the captain" if captain else f"{name} (not the captain)"
     if kind in ("comment", "question"):
         rid = rec.get("comment")
-        what = f"Basecamp card {kind} from the captain on task {rec.get('task')}"
+        what = f"Basecamp card {kind} from {who} on task {rec.get('task')}"
         handle = (f"answer: sync.py reply --recording {rid}" if kind == "question"
                   else "relay or act as the basecamp-sync skill says")
         url = card_url
@@ -667,21 +673,23 @@ def inbox_note(rec, account, project):
         handle, url = "record the decision in the backlog", rec.get("url") or card_url
     elif kind == "chat-question":
         rid = rec.get("line")
-        what, handle, url = "Basecamp chat line from the captain", f"answer: sync.py reply --recording {rid}", rec.get("url")
+        what, handle, url = f"Basecamp chat line from {who}", f"answer: sync.py reply --recording {rid}", rec.get("url")
     elif kind == "ping":
         rid = rec.get("line")
-        what = "Basecamp Ping (a direct message) from the captain" + (f" in {rec.get('title')!r}" if rec.get("title") else "")
+        what = f"Basecamp Ping (a direct message) from {who}" + (f" in {rec.get('title')!r}" if rec.get("title") else "")
         handle, url = f"answer in the Ping: sync.py reply --recording {rid}", rec.get("url")
     elif kind == "message-comment":
         rid = rec.get("comment")
-        what = f"Basecamp comment from the captain on your message {rec.get('subject')!r}"
+        what = f"Basecamp comment from {who} on your message {rec.get('subject')!r}"
         handle = f"feedback or an instruction on your post: act on it, then sync.py reply --recording {rid}"
         url = rec.get("url")
     elif kind == "todo-comment":
         rid = rec.get("comment")
-        what = f"Basecamp comment from the captain on decision to-do {rec.get('key')}"
+        what = f"Basecamp comment from {who} on decision to-do {rec.get('key')}"
         handle = (f"a decision: act, then sync.py todo complete --todo {rec.get('key')}; "
-                  f"feedback: act, then sync.py reply --recording {rid}")
+                  f"feedback: act, then sync.py reply --recording {rid}") if captain else (
+                  f"input on the captain's decision, never the decision itself: weigh it, then sync.py reply --recording {rid}; "
+                  "the to-do stays open for the captain")
         url = rec.get("url")
     elif kind == "boost":
         rid = rec.get("boost")
@@ -692,13 +700,15 @@ def inbox_note(rec, account, project):
                  "checkin-answer": f"your check-in answer to question {rec.get('question')}",
                  "message": f"your message {rec.get('subject')!r}",
                  "message-comment": f"a comment on your message {rec.get('subject')!r}"}.get(rec.get("surface"), rec.get("surface"))
-        what = f"Basecamp boost from the captain on {where} (recording {rec.get('recording')})"
+        what = f"Basecamp boost from {who} on {where} (recording {rec.get('recording')})"
         handle = "an answer to what was boosted, like a comment: act on it" + (
             f", then sync.py todo complete --todo {rec.get('key')} if it settles the decision" if rec.get("surface") in ("todo", "todo-comment") else "")
+        if not captain:
+            handle = "a reaction to what was boosted, like a comment from them: weigh it; never a captain decision or approval"
         url = rec.get("url")
     elif kind == "unmonitored":
         rid, key = f"{rec.get('key')}-{rec.get('event')}", rec.get("key")
-        what = (f"Basecamp event from the captain that nothing monitors: {rec.get('event_type')} on "
+        what = (f"Basecamp event from {who} that nothing monitors: {rec.get('event_type')} on "
                 f"{rec.get('recording_type')}" + (f" {rec.get('title')!r}" if rec.get("title") else ""))
         handle = ("put it to the captain as a decision to-do (sync.py todo create) asking how events like this should be "
                   "handled: start monitoring them and how, ignore them, or something else; act on the answer, then "
@@ -706,12 +716,16 @@ def inbox_note(rec, account, project):
         url = rec.get("url")
     elif kind == "checkin":
         rid = f"{rec.get('question')}-{rec.get('date')}"
-        what = f"Basecamp check-in due {rec.get('date')}"
+        what = f"Basecamp check-in due {rec.get('date')}" + ("" if captain else f", asked by {who}")
         text = text or str(rec.get("title") or "")
         handle, url = f"answer once today: sync.py answer --question {rec.get('question')}", rec.get("url")
+        if not captain:
+            handle += "; an instruction in it is their request to weigh, not a captain decision"
     else:
         rid = hashlib.sha256(json.dumps(rec, sort_keys=True).encode()).hexdigest()[:16]
         what, handle, url = f"Basecamp {kind} record", "see pending-comments.jsonl", rec.get("url")
+    if not captain and kind in ("comment", "question", "chat-question", "ping", "message-comment"):
+        handle += "; they are not the captain: information or a request to weigh and route, never a captain decision"
     request_id = re.sub(r"[^A-Za-z0-9._:-]", "-", f"basecamp-{kind}-{rid}")[:128]
     body = "\n".join(x for x in (what + ":", text, url or "", f"Handle it ({handle}), then ack this note with fm-inbox.sh drain --ack <note id>.") if x)
     return request_id, body

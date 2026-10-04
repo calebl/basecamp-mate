@@ -116,7 +116,7 @@ class Base(unittest.TestCase):
         shutil.copy(os.path.join(ROOT, "examples", "config.example.json"), os.path.join(self.cfgdir, "config.json"))
         cfg = json.load(open(os.path.join(self.cfgdir, "config.json")))
         cfg["repos"] = {"srv": "server", "eng": "engine"}
-        for opt in ("chats", "ask_chat", "checkins"):  # opt-in features the example shows; off by default here
+        for opt in ("chats", "ask_chat", "checkins", "people"):  # opt-in features the example shows; off by default here
             cfg.pop(opt)
         json.dump(cfg, open(os.path.join(self.cfgdir, "config.json"), "w"))
         self.stub = Stub()

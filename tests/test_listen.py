@@ -349,6 +349,7 @@ class Unmonitored(ListenBase):
         self.assertEqual(rec, {"kind": "unmonitored", "key": "todo.created/Todo", "event_type": "todo.created",
                                "recording_type": "Todo", "event": 10, "recording": 40, "title": "Buy paint",
                                "text": "for the porch", "creator": {"id": CAPTAIN, "name": "Cap"},
+                               "author": {"id": CAPTAIN, "name": "Cap"}, "captain": True,
                                "url": "https://x/todos/40", "at": "te"})
         [(rid, body, *_)] = self.stub.notes
         self.assertEqual(rid, "basecamp-unmonitored-todo.created-Todo-10")

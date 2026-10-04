@@ -166,7 +166,7 @@ class TodoComments(ToolBase):
         self.poll()
         [rec] = self.pending()
         self.assertEqual(rec, {"kind": "todo-comment", "key": "ta-x", "todo": self.tid, "comment": 1, "question": False,
-                               "url": "https://x/todos/c1", "text": "Merge it & ship", "at": "t"})
+                               "url": "https://x/todos/c1", "text": "Merge it & ship", "at": "t", "author": {"id": CAPTAIN, "name": None}, "captain": True})
         self.assertEqual(self.todos()["ta-x"]["cursor"], 3)
         self.assertEqual(self.stub.posted(), [("1", "👍")])
 
@@ -330,7 +330,8 @@ class TodoBoosts(ToolBase):
         self.poll()
         [rec] = self.pending()
         self.assertEqual(rec, {"kind": "boost", "surface": "todo", "key": "ta-x", "todo": self.tid, "boost": 70,
-                               "recording": self.tid, "text": "yes", "url": f"https://x/todos/{self.tid}", "at": "tb"})
+                               "recording": self.tid, "text": "yes", "url": f"https://x/todos/{self.tid}", "at": "tb",
+                               "author": {"id": CAPTAIN, "name": None}, "captain": True})
         self.assertEqual(self.todos()["ta-x"]["boost_seen"], [70])
 
     def test_owner_boost_on_the_agents_own_comment_is_an_answer(self):
@@ -561,7 +562,8 @@ class MessageComments(ToolBase):
         self.poll()
         [rec] = [r for r in self.pending() if r["kind"] == "message-comment"]
         self.assertEqual(rec, {"kind": "message-comment", "message": 20, "subject": "Report: deploy", "comment": 30,
-                               "question": False, "url": "https://x/todos/c30", "text": "Rerun it with the new flag", "at": "t"})
+                               "question": False, "url": "https://x/todos/c30", "text": "Rerun it with the new flag", "at": "t",
+                               "author": {"id": CAPTAIN, "name": None}, "captain": True})
         self.assertEqual(self.stub.posted(), [("30", "👍")])
         self.assertFalse([c for c in self.stub.calls if c[:3] in (["comments", "list", "21"], ["comments", "list", "22"])])
 
