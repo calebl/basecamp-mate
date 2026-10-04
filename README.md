@@ -6,9 +6,45 @@
 
 Source: <https://github.com/calebl/basecamp-mate>
 
+## Getting started
+
+You need a Linux computer where your firstmate agent runs, and a Basecamp project. Open a
+terminal and run:
+
 ```sh
 git clone https://github.com/calebl/basecamp-mate.git
+basecamp-mate/bin/basecamp-mate setup
 ```
+
+Setup walks you through everything, one question at a time:
+
+1. It checks for what it needs and offers to install the Basecamp command-line tool if it
+   is missing.
+2. It asks where your firstmate home is.
+3. It signs the agent in to Basecamp: you open a link and type a code. Sign in as the
+   agent's **own** Basecamp person (invite one to your project first, with an email you
+   control), not as yourself. [More on the agent's account](docs/firstmate-account.md).
+4. It lists your projects; pick one by its number. Then pick yourself from the people on it.
+5. It asks a few yes/no questions. Press Enter to take the suggested answer: the agent
+   reads your chat questions, asks you for decisions as to-dos, answers check-ins and
+   notices your comments within a minute. Card tables, release announcements, Message Board
+   reports and Pings stay off unless you say yes.
+6. It turns on what the project needs, starts the background services, runs one test sync
+   and tells you what is on.
+
+To change your answers later, run `setup` again. If something stops working, run:
+
+```sh
+basecamp-mate/bin/basecamp-mate doctor
+```
+
+It checks each piece (the Basecamp tool, the sign-in, the project, the card tables, the
+background services, the last sync, the agent's wake-up) and prints each problem in plain
+words with the exact fix.
+
+Everything below is the detailed reference.
+
+## What it is
 
 Connects an agent home to one Basecamp project through the `basecamp` CLI, in two
 layers. No model calls.
@@ -432,8 +468,43 @@ need not have any), writes a config without `tables` or `repos`, creates only
 `--create-missing-columns`. Chats, the Message Board, the timer and the wake check are set
 up as usual.
 
+`--no-chats` leaves the dock's chats out (no chat inbox). `--no-keyring` (on by default when
+`BASECAMP_NO_KEYRING` is set in the environment `init` runs in) adds
+`Environment=BASECAMP_NO_KEYRING=1` to both units, so every `basecamp` call they make uses
+the CLI's file credential store and never waits on a locked system keyring.
+
 Re-running with the same inputs changes nothing. `--dry-run` prints the discovered config
 and what it would write, install or refuse, and writes nothing.
+
+### Guided setup and doctor
+
+`bin/basecamp-mate setup` ([`setup_home.py`](setup_home.py), also `sync.py setup`) is the
+guided front end to `init` for people: it checks Python, the `basecamp` CLI (offering its
+installer) and systemd user services; asks for the home; signs the login in with
+`basecamp profile create <login> --device-code` (or `auth login -P <login> --device-code`)
+under `BASECAMP_NO_KEYRING=1`; lists the login's accounts and projects to pick from and the
+project's people to pick the captain from; asks the yes/no questions (chat inbox, decision
+to-dos, check-ins, listener on; card mirror, releases, reports, Pings off by default) and the
+check-in time zone; enables or adds the dock tool each chosen behavior needs (to-do set,
+questionnaire, chat, message board) and, for the card mirror, a card table per registered
+repo that has none; then runs `init` itself (with `--create-missing-columns` only for the card
+mirror, `--force` after asking when the home already has a config, and `--no-keyring`), runs
+`run.sh` once as a test sync, and prints what is on and how to change it.
+`--answers <file.json>` answers by key (`home`, `login`, `account`, `project` (id or URL),
+`captain` (person id), `timezone`, `replace`, `install_cli`, and booleans `chat`, `todos`,
+`checkins`, `listen`, `cards`, `releases`, `reports`, `pings`, `inbox`) and `--yes` takes the
+defaults; without a terminal, anything that needs a person (a sign-in, an unanswered pick)
+refuses with what to do instead of asking.
+
+`bin/basecamp-mate doctor` ([`doctor.py`](doctor.py), also `sync.py doctor`) checks Python
+3.11+, the `basecamp` CLI and its version, systemd user services, then per home (every home
+with installed `basecamp-sync-*` units, or `--home`): the firstmate home, the config, the
+login (`auth status` under a 20-second timeout and `BASECAMP_NO_KEYRING=1`, renewing an
+expired token as `run.sh` would), the project and the dock tools the config names, each card
+table's columns by id and title, the timer and listener units (installed, pointing at files
+that exist, enabled and active), the last `sync.log` line (FAILED, or older than 20 minutes),
+and the wake check's registration. Each problem prints with its fix; it exits 1 when anything
+is broken.
 
 ### The base prompt and the agent skill
 
@@ -616,6 +687,11 @@ several people with who wrote each record, captain-only approvals and decisions,
 unchanged single-captain config and `init --listen-to`; `tests/test_pings.py` covers the Ping reader with a stubbed
 `/my/readings.json`, the reply in a Ping, and the listener's every-bucket poll. The `basecamp`, `gh` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
 registration sit behind a fake; tests make no network calls and touch no real home.
+`tests/test_setup.py` covers `setup` (defaults, a project URL, interactive picks, the card
+mirror creating tables and columns, the device-code sign-in, refusals, re-runs and a failed
+test sync) and `doctor` (a healthy home and each failure: no config, a locked keyring, an
+expired login, a missing column, a stopped listener, a failed or stale sync, an unregistered
+wake check, a missing home) with the CLIs, `systemctl` and `run.sh` stubbed.
 
 ## Pending records
 

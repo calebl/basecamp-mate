@@ -164,6 +164,16 @@ class InitTest(unittest.TestCase):
         self.assertEqual(list(self.system.checks), ["basecamp-sync"])
         self.assertEqual(self.stub.writes(), [])
 
+    def test_no_chats_and_no_keyring(self):
+        cfg, _ = self.init(chats=False).discover()
+        self.assertNotIn("chats", cfg)
+        self.init(no_keyring=True, listen=True).main()
+        (svc, _), listener = self.system.units[init_home.unit_name(self.home)], \
+            self.system.units[init_home.unit_name(self.home) + "-listen"]
+        self.assertIn("Environment=BASECAMP_NO_KEYRING=1\n", svc)
+        self.assertIn("Environment=BASECAMP_NO_KEYRING=1\n", listener)
+        self.assertNotIn("Environment=", self.init(no_keyring=False).units("c")[1])
+
     def test_missing_column_refused(self):
         self.stub.tables["200"] = table(200, "Engine", drop=("In progress",))
         with self.assertRaises(init_home.Refuse) as e:
