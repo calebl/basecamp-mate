@@ -27,7 +27,9 @@ in the chats) and --checkins <time zone> (the one Automatic Check-ins questionna
 --no-releases leaves release announcements out. --inbox delivers each pending record
 as a firstmate inbox note, and the wake check then watches only failures. --pings
 relays the owner's Pings (direct messages) to the --login, which live outside the
-project. --listen
+project. --listen-to <person> (repeatable: a person id, email or exact name) adds
+people the sync listens to besides the captain, as "people"; their input is relayed
+with who wrote it, but only the captain decides or approves. --listen
 turns on the owner-event listener and installs and enables its systemd user service
 (`sync.py listen`, restarted on failure), beside the timer; without "listen" in the
 config no service is installed.
@@ -215,12 +217,12 @@ class System:
 
 
 class Init:
-    def __init__(self, url, login, home, captain=None, repo_map=(), create_missing=False, dry=False,
+    def __init__(self, url, login, home, captain=None, listen_to=(), repo_map=(), create_missing=False, dry=False,
                  force=False, cards=True, todos=False, reports=False, every_line=False, checkins=None, releases=True, inbox=False,
                  listen=False, pings=False, runner=subprocess.run, system=None, sync_dir=HERE, out=print):
         self.account, self.project = parse_url(url)
         self.login, self.home = login, os.path.abspath(home)
-        self.captain_arg = captain
+        self.captain_arg, self.listen_to = captain, list(listen_to)
         self.repo_map = {}
         for pair in repo_map:
             name, sep, repo = pair.partition("=")
@@ -325,9 +327,12 @@ class Init:
         acting = me.get("id")
         people = self.bc("api", "get", f"/projects/{self.project}/people.json") or []
         captain = self.find_captain(people, acting, problems)
+        listened = self.find_people(people, acting, problems)
         if problems:
             raise Refuse("init refused, nothing was written:\n  - " + "\n  - ".join(problems))
         cfg = {"account": self.account, "project": self.project, "captain": captain, "profile": self.login}
+        if listened:
+            cfg["people"] = [captain] + sorted(set(listened) - {captain})
         if self.cards:
             cfg.update(repos=dict(sorted(repos.items())), tables=cfg_tables)
         chats = [d["id"] for d in dock if d.get("name") == "chat"]
@@ -416,6 +421,26 @@ class Init:
                             "sign the login in as a separate user (docs/firstmate-account.md)")
             return None
         return hits[0]["id"]
+
+    def find_people(self, people, acting, problems):
+        """The person ids each --listen-to names (an id, an email or an exact name), refusing a miss, a tie or the login."""
+        found = []
+        for arg in (str(a).strip() for a in self.listen_to):
+            if arg.isdigit():
+                hits = [p for p in people if p.get("id") == int(arg)]
+            else:
+                hits = [p for p in people if (p.get("email_address") or "").lower() == arg.lower()]
+                hits = hits or [p for p in people if (p.get("name") or "").strip().lower() == arg.lower()]
+            if len(hits) != 1:
+                names = ", ".join(f"{p.get('name')} ({p.get('id')})" for p in hits)
+                problems.append(f"--listen-to {arg} matches " + (f"several people on the project: {names}; pass the person id"
+                                                                  if hits else "no person on the project"))
+                continue
+            if hits[0].get("id") == acting:
+                problems.append(f"--listen-to {arg} is the login {self.login} itself; the agent never listens to its own lines")
+                continue
+            found.append(hits[0]["id"])
+        return found
 
     def units(self, config_path):
         name = unit_name(self.home)
@@ -516,6 +541,9 @@ def cli(argv, **kw):
     ap.add_argument("--login", required=True, help="the basecamp CLI profile the sync acts as")
     ap.add_argument("--home", required=True, help="the firstmate home")
     ap.add_argument("--captain", help="the captain's person id or email (default: the project's account owner)")
+    ap.add_argument("--listen-to", action="append", default=[], metavar="PERSON",
+                    help="also relay this person's lines, comments and boosts as information, never as the captain's "
+                         "decisions: a person id, email or exact name on the project (repeatable; the captain is always listened to)")
     ap.add_argument("--repo-map", action="append", default=[], metavar="TABLE=REPO",
                     help="map a card table to a backlog repo when their names differ (repeatable)")
     ap.add_argument("--create-missing-columns", action="store_true",
@@ -539,7 +567,7 @@ def cli(argv, **kw):
     ap.add_argument("--dry-run", action="store_true", help="print the discovered config and planned installs; write nothing")
     a = ap.parse_args(argv)
     try:
-        Init(a.url, a.login, a.home, captain=a.captain, repo_map=a.repo_map,
+        Init(a.url, a.login, a.home, captain=a.captain, listen_to=a.listen_to, repo_map=a.repo_map,
              create_missing=a.create_missing_columns, dry=a.dry_run, force=a.force,
              cards=not a.no_cards, todos=a.todos, reports=a.reports, every_line=a.every_line,
              checkins=a.checkins, releases=not a.no_releases, inbox=a.inbox, listen=a.listen, pings=a.pings, **kw).main()
