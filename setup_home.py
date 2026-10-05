@@ -10,8 +10,10 @@ card-table columns, writes the config, installs the background services with
 BASECAMP_NO_KEYRING=1 and registers the wake check), runs one test sync, and ends with
 a short summary of what is on and how to change it.
 
-Defaults are the safe ones: the chat inbox, decision to-dos, check-ins and the event
-listener on; the card mirror, release announcements, reports and Pings off.
+Defaults are the safe ones: the chat inbox, decision to-dos and check-ins on; the card
+mirror, release announcements, reports and Pings off. The agent's Basecamp notifications
+are always read (within about half a minute), since setup signs the agent in as its own
+person.
 
 Non-interactive (for tests and agents): --answers <file.json> supplies the answers by
 key (see ANSWERS) and --yes takes the default for every answer the file leaves out;
@@ -31,7 +33,6 @@ QUESTIONS = (
     ("chat", "Relay your questions from the project's chat (Campfire) to the agent?", True),
     ("todos", "Let the agent ask you for decisions as to-dos assigned to you?", True),
     ("checkins", "Let the agent answer the project's automatic check-in questions?", True),
-    ("listen", "Notice your comments within a minute (a small background listener)?", True),
     ("cards", "Mirror the agent's task list onto card tables (one per code repo)?", False),
     ("releases", "Announce new GitHub releases on the Message Board?", False),
     ("reports", "Let the agent post reports on the Message Board?", False),
@@ -40,7 +41,7 @@ QUESTIONS = (
 ANSWERS = ("home", "login", "account", "project", "captain", "timezone", "replace", "install_cli",
            "inbox", *(k for k, _, _ in QUESTIONS))
 LABELS = {"chat": "chat inbox", "todos": "decision to-dos", "checkins": "check-in answers",
-          "listen": "event listener", "cards": "card mirror", "releases": "release announcements",
+          "cards": "card mirror", "releases": "release announcements",
           "reports": "Message Board reports", "pings": "Pings", "inbox": "firstmate inbox notes"}
 # The dock tool each behavior needs, and whether there must be exactly one.
 TOOLS = {"chat": ("chat", "Chat", False), "todos": ("todoset", "To-dos", True),
@@ -382,7 +383,7 @@ class Setup:
         init = Init(f"https://app.basecamp.com/{account}/projects/{project}", login, home, captain=captain,
                     create_missing=chosen["cards"], force=force, cards=chosen["cards"], todos=chosen["todos"],
                     reports=chosen["reports"], checkins=timezone if chosen["checkins"] else None,
-                    releases=chosen["releases"], inbox=chosen["inbox"], listen=chosen["listen"],
+                    releases=chosen["releases"], inbox=chosen["inbox"],
                     pings=chosen["pings"], chats=chosen["chat"], no_keyring=True,
                     runner=lambda cmd, **kw: self.run(cmd, **{**kw, "env": bc_env()}),
                     system=self.system, sync_dir=self.sync_dir, out=printed.append)

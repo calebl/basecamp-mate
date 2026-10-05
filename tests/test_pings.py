@@ -1,4 +1,4 @@
-"""Tests for the Pings behavior: finding Pings through /my/readings.json, relaying the owner's lines, replying, the listener.
+"""Tests for the Pings behavior: finding Pings through /my/readings.json, relaying the owner's lines, replying, notifications.
 
 /my/readings.json and the Ping chats are stubbed; nothing touches the network.
 """
@@ -8,7 +8,7 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_sync import ACTING, CAPTAIN  # noqa: E402
 from test_tools import boost  # noqa: E402
-from test_listen import FeedStub, ListenBase, PROJECT, event  # noqa: E402
+from test_notifications import NotifStub, NotifBase, PROJECT  # noqa: E402
 import behaviors  # noqa: E402
 import sync  # noqa: E402
 
@@ -23,13 +23,14 @@ def ping_line(id, who=CAPTAIN, content="<p>Can you make a project?</p>", at="209
 
 
 def reading(bucket=CIRCLE, chat=CHAT, people=(CAPTAIN,), section="pings", kind="Chat", updated="2099-01-01T00:00:00Z"):
-    return {"section": section, "type": kind, "bucket_name": f"Owner + Agent {bucket}",
+    return {"id": chat + 1000 * (section != "pings"), "unread_at": updated,
+            "section": section, "type": kind, "bucket_name": f"Owner + Agent {bucket}",
             "app_url": f"https://app.basecamp.com/1/circles/{bucket}", "updated_at": updated,
             "subscription_url": f"https://3.basecampapi.com/1/buckets/{bucket}/recordings/{chat}/subscription.json",
             "creator": {"id": people[0]}, "participants": [{"id": p} for p in people]}
 
 
-class PingStub(FeedStub):
+class PingStub(NotifStub):
     """Adds /my/readings.json; the Ping chats' lines and boosts are the base stub's (keyed by chat and recording id)."""
 
     def __init__(self):
@@ -49,7 +50,7 @@ class PingStub(FeedStub):
         return [c[2] for c in self.calls if c[:2] == ["api", verb]]
 
 
-class PingBase(ListenBase):
+class PingBase(NotifBase):
     def setUp(self):
         super().setUp()
         self.stub = PingStub()
@@ -107,7 +108,7 @@ class Reader(PingBase):
         self.cfg(pings={"limit": 1})
         self.stub.readings["reads"] = [reading(OTHER_CIRCLE, OTHER_CHAT, updated="2098-01-01T00:00:00Z")]
         self.stub.lines[str(OTHER_CHAT)] = []
-        self.poll()
+        self.sync().read_pings(1)  # the repair sweep's read
         self.assertEqual([p for p in self.stub.paths() if "/chats/" in p and "/77/" not in p],
                          [f"/buckets/{CIRCLE}/chats/{CHAT}/lines.json"])
 
@@ -138,10 +139,14 @@ class Reader(PingBase):
         self.assertEqual((self.pending(), self.stub.posted()), ([], []))
         self.assertEqual(self.state()["pings"][str(CHAT)]["cursor"], 1)
 
-    def test_off_makes_no_calls(self):
+    def test_off_reads_no_ping(self):
         self.cfg(pings=False)
         self.poll()
-        self.assertNotIn("/my/readings.json", self.stub.paths())
+        self.stub.readings["unreads"] = [reading(updated="2099-01-02T00:00:00Z")]
+        self.say(ping_line(2))
+        self.poll()
+        self.assertFalse(any(f"/buckets/{CIRCLE}/" in p for p in self.stub.paths()))
+        self.assertEqual((self.pending(), self.stub.marked), ([], []))
 
     def test_malformed_config_refused(self):
         for bad in ([], {"limit": 0}):
@@ -188,37 +193,41 @@ class Reply(PingBase):
         self.assertEqual(self.stub.chat_posts(), [(str(CHAT), "<div>Yes.</div>")])
 
 
-class Listener(PingBase):
+class Notifications(PingBase):
     def setUp(self):
         super().setUp()
-        self.poll()  # since and cursors seeded
+        self.poll()  # since, cursors and the notifications seeded
         self.stub.calls.clear()
 
-    def test_an_owner_line_outside_the_project_runs_the_ping_reader_in_the_same_cycle(self):
+    def test_a_new_line_runs_that_pings_reader_delivers_and_marks_it_read_in_one_run(self):
         self.cfg(inbox={})
         self.poll()
+        self.stub.calls.clear()
+        self.stub.readings["unreads"].append(reading(OTHER_CIRCLE, OTHER_CHAT))
+        self.stub.lines[str(OTHER_CHAT)] = []
+        self.poll()  # a quiet Ping comes into view: seen, nothing to relay
+        self.stub.calls.clear()
         self.say(ping_line(2))
-        self.stub.page()  # the project feed: nothing
-        self.stub.page(event(20, bucket=CIRCLE, rid=2))
-        self.listen()
+        self.stub.readings["unreads"][0] = reading(updated="2099-01-02T00:00:00Z")
+        self.stub.marked.clear()
+        self.sync().behaviors["notifications"].run()
         self.assertEqual(self.kinds(), ["ping"])
         self.assertEqual([n[0] for n in self.stub.notes], ["basecamp-ping-2"])
-        main, pings = self.stub.queries
-        self.assertEqual(main["buckets"], str(PROJECT))
-        self.assertNotIn("buckets", pings)
-        self.assertEqual((pings["types"], pings["creators"]), ("boost.created,chat.line.created", str(CAPTAIN)))
-        self.assertTrue(os.path.exists(os.path.join(self.cfgdir, "pings-feed.json")))
+        self.assertEqual([p for p in self.stub.paths() if "/chats/" in p], [f"/buckets/{CIRCLE}/chats/{CHAT}/lines.json"])
+        self.assertEqual(self.stub.marked, [[str(CHAT)]])
 
-    def test_events_in_the_project_do_not_read_pings(self):
-        self.stub.page()
-        self.stub.page(event(20, bucket=PROJECT, rid=2))
-        self.listen()
-        self.assertNotIn("/my/readings.json", self.stub.paths())
-
-    def test_off_polls_only_the_project_feed(self):
-        self.cfg(pings=False)
-        self.listen()
-        self.assertEqual(len(self.stub.queries), 1)
+    def test_an_owner_boost_on_the_agents_line_in_a_ping_is_relayed(self):
+        mine = dict(ping_line(2, who=ACTING, content="Done."), boosts_count=0)
+        self.say(mine)
+        self.poll()  # seeds the boost counts
+        mine["boosts_count"] = 1
+        self.stub.boosts["2"] = [boost(42, content="🎉")]
+        self.stub.my_boosts = [{"id": 42, "content": "🎉", "booster": {"id": CAPTAIN}, "created_at": "tb",
+                                "recording": {"id": 2, "type": "Chat::Lines::RichText", "app_url": "https://x/c@2",
+                                              "bucket": {"id": CIRCLE, "name": "Owner + Agent", "type": "Circle"},
+                                              "parent": {"id": CHAT, "type": "Chat::Transcript"}}}]
+        self.sync().behaviors["notifications"].run()
+        self.assertEqual([(r["kind"], r["surface"], r["chat"]) for r in self.pending()], [("boost", "ping", CHAT)])
 
 
 class Note(unittest.TestCase):

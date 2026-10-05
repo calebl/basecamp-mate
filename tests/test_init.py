@@ -1,5 +1,6 @@
 """Unit tests for `sync.py init`. The basecamp CLI is stubbed and systemd/check registration sit behind a fake seam."""
-import copy, hashlib, json, os, shutil, sys, tempfile, unittest
+import copy, hashlib, io, json, os, shutil, sys, tempfile, unittest
+from contextlib import redirect_stderr
 from types import SimpleNamespace
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -80,13 +81,13 @@ class FakeSystem:
             self.units[name] = (service, timer)
         return [f"install {name}"]
 
-    def install_service(self, name, service, dry):
-        self.calls.append(("service", name, dry))
-        if self.units.get(name) == service:
+    def remove_service(self, name, dry):
+        self.calls.append(("remove", name, dry))
+        if name not in self.units:
             return []
         if not dry:
-            self.units[name] = service
-        return [f"install {name}.service"]
+            del self.units[name]
+        return [f"remove {name}.service"]
 
     def register_check(self, home, cid, script, dry):
         self.calls.append(("check", cid, dry))
@@ -160,18 +161,16 @@ class InitTest(unittest.TestCase):
         self.assertTrue(name.startswith("basecamp-sync-"))
         self.assertIn("run.sh", service)
         self.assertIn("TimeoutStartSec=240", service)
-        self.assertIn("OnUnitActiveSec=5min", timer)
+        self.assertIn("OnUnitActiveSec=30s", timer)
         self.assertEqual(list(self.system.checks), ["basecamp-sync"])
         self.assertEqual(self.stub.writes(), [])
 
     def test_no_chats_and_no_keyring(self):
         cfg, _ = self.init(chats=False).discover()
         self.assertNotIn("chats", cfg)
-        self.init(no_keyring=True, listen=True).main()
-        (svc, _), listener = self.system.units[init_home.unit_name(self.home)], \
-            self.system.units[init_home.unit_name(self.home) + "-listen"]
+        self.init(no_keyring=True).main()
+        svc, _ = self.system.units[init_home.unit_name(self.home)]
         self.assertIn("Environment=BASECAMP_NO_KEYRING=1\n", svc)
-        self.assertIn("Environment=BASECAMP_NO_KEYRING=1\n", listener)
         self.assertNotIn("Environment=", self.init(no_keyring=False).units("c")[1])
 
     def test_missing_column_refused(self):
@@ -351,20 +350,34 @@ class InitTest(unittest.TestCase):
         cfg, _ = self.init(assigned_anywhere=True).discover()
         self.assertEqual(cfg["assigned_todos"], {"scope": "account"})
 
-    def test_listen_installs_the_listener_service_only_when_set(self):
+    def test_upgrade_removes_the_listener_service_and_drops_listen_without_force(self):
+        listener = init_home.unit_name(self.home) + "-listen"
         self.init().main()
-        self.assertFalse([c for c in self.system.calls if c[0] == "service"])
-        cfg, _ = self.init(listen=True).discover()
-        self.assertEqual(cfg, EXPECTED | {"listen": {}})
-        self.assertIn("install basecamp-sync-", " ".join(self.init(listen=True, force=True, dry=True).main()))
-        self.assertFalse([n for n in self.system.units if n.endswith("-listen")])
-        self.init(listen=True, force=True).main()
-        [name] = [n for n in self.system.units if n.endswith("-listen")]
-        unit = self.system.units[name]
-        self.assertIn("Type=simple", unit)
-        self.assertIn("Restart=on-failure", unit)
-        self.assertIn(f"sync.py listen --home {self.home} --config {os.path.join(self.dir, 'config.json')}", unit)
-        self.assertEqual(self.init(listen=True).main(), [])  # re-run: nothing to change
+        path = os.path.join(self.dir, "config.json")
+        json.dump(EXPECTED | {"listen": {"interval": 30}}, open(path, "w"))  # written by an earlier version
+        self.system.units[listener] = "[Service]\nExecStart=... sync.py listen ..."
+        plan = self.init(dry=True).main()
+        self.assertIn(f"remove {listener}.service", plan)
+        self.assertIn(f'drop the retired "listen" from {path} (notifications replaced the event listener)', plan)
+        self.assertIn(listener, self.system.units)  # a dry run removes nothing
+        done = self.init().main()
+        self.assertIn(f"remove {listener}.service", done)
+        self.assertNotIn(listener, self.system.units)
+        self.assertEqual(json.load(open(path)), EXPECTED)
+        self.assertEqual(self.init().main(), [])  # re-run: nothing to change
+        json.dump(EXPECTED | {"listen": {}, "pings": {}}, open(path, "w"))  # differs in more than "listen": still refused
+        with self.assertRaises(init_home.Refuse):
+            self.init().main()
+
+    def test_the_listen_flag_is_accepted_and_does_nothing(self):
+        out = io.StringIO()
+        with redirect_stderr(out):
+            code = init_home.cli([URL, "--login", "firstmate", "--home", self.home, "--repo-map", "server=my-server",
+                                  "--listen", "--dry-run"], runner=self.stub, system=self.system,
+                                 sync_dir=os.path.join(self.tmp, "repo"), out=self.printed.append)
+        self.assertEqual(code, 0)
+        self.assertIn("--listen is no longer needed", out.getvalue())
+        self.assertNotIn("listen", json.loads(self.printed[0]))
 
     def test_no_releases_reads_no_origins(self):
         self.stub.origins = {"Engine": "https://github.com/acme/engine.git"}
@@ -428,13 +441,18 @@ class SystemTest(unittest.TestCase):
         self.assertIn("systemctl --user enable --now u.timer", changed)
         self.assertEqual(self.sys.install_timer("u", "S", "T", dry=False), [])
 
-    def test_service_installed_started_then_restarted_on_change(self):
-        changed = self.sys.install_service("u-listen", "S", dry=False)
-        self.assertEqual(changed[1:], ["systemctl --user daemon-reload", "systemctl --user enable --now u-listen.service"])
-        self.assertEqual(self.sys.install_service("u-listen", "S", dry=False), [])
-        self.assertEqual(self.sys.install_service("u-listen", "S2", dry=False)[1:],
-                         ["systemctl --user daemon-reload", "systemctl --user restart u-listen.service"])
-        self.assertIn(["systemctl", "--user", "restart", "u-listen.service"], self.cmds)
+    def test_an_old_service_is_stopped_disabled_and_removed(self):
+        self.assertEqual(self.sys.remove_service("u-listen", dry=False), [])
+        os.makedirs(os.path.join(self.tmp, "units"))
+        path = os.path.join(self.tmp, "units", "u-listen.service")
+        open(path, "w").write("S")
+        self.assertEqual(self.sys.remove_service("u-listen", dry=True),
+                         ["systemctl --user disable --now u-listen.service", f"remove {path}", "systemctl --user daemon-reload"])
+        self.assertTrue(os.path.exists(path))
+        self.sys.remove_service("u-listen", dry=False)
+        self.assertFalse(os.path.exists(path))
+        self.assertIn(["systemctl", "--user", "disable", "--now", "u-listen.service"], self.cmds)
+        self.assertIn(["systemctl", "--user", "daemon-reload"], self.cmds)
 
     def test_check_registered_then_nothing(self):
         self.assertTrue(self.sys.register_check(self.home, "basecamp-sync", init_home.CHECK, dry=True))

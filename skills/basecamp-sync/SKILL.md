@@ -1,24 +1,27 @@
 ---
 name: basecamp-sync
-description: Operating contract for a firstmate or second mate whose home mirrors its backlog into a Basecamp project with basecamp-mate (formerly firstmate-basecamp-sync). Use when told to "use this Basecamp project", when setting a home up with `sync.py init` or `basecamp-mate setup`, when checking a home with `basecamp-mate doctor`, when the basecamp-sync wake check fires, when handling data/basecamp-sync/pending-comments.jsonl, when putting a decision to the owner as a Basecamp to-do (`sync.py todo`), when posting a report to the Message Board (`sync.py post-message`), when handling an `unmonitored` record (`sync.py unmonitored`), a `ping` record (the owner's direct message) or a `todo-request` record (a to-do assigned to the agent), or when editing figuring.json, not-now.json, decisions.json, boards.json, extra-repos.json or skip.json.
+description: Operating contract for a firstmate or second mate whose home mirrors its backlog into a Basecamp project with basecamp-mate (formerly firstmate-basecamp-sync). Use when told to "use this Basecamp project", when setting a home up with `sync.py init` or `basecamp-mate setup`, when checking a home with `basecamp-mate doctor`, when the basecamp-sync wake check fires, when handling data/basecamp-sync/pending-comments.jsonl, when putting a decision to the owner as a Basecamp to-do (`sync.py todo`), when posting a report to the Message Board (`sync.py post-message`), when handling an `unmonitored` record (`sync.py unmonitored`), a `ping` record (the owner's direct message), a `mention` or `thread-comment` record (the owner writing on something the agent follows) or a `todo-request` record (a to-do assigned to the agent), or when editing figuring.json, not-now.json, decisions.json, boards.json, extra-repos.json or skip.json.
 ---
 
 # Basecamp sync
 
-The sync has two layers. Tools are single-purpose: readers that the 5-minute timer runs
-to append pending records, and commands you run to post (`reply`, `ask`, `answer`,
+The sync has two layers. Tools are single-purpose: readers that the timer (every 30
+seconds) runs to append pending records, and commands you run to post (`reply`, `ask`, `answer`,
 `todo create|track|comment|complete`, `post-message`). Behaviors are the workflows the
 config turns on, each composed from tools: the card mirror (`tables`, `repos`; off with
 `"cards": false` or without `tables`), the chat inbox (`chats`), chat asks (`ask_chat`),
 check-in answering (`checkins`), release announcements (`releases`), decision to-dos
 (`todos`), reports (`message_board`), Pings (`pings`: the owner's direct messages to the
 agent's login, outside the project), to-do requests (`assigned_todos`: to-dos the owner
-assigns to the agent's login, in the project or, with `"scope": "account"`, anywhere in the account), inbox delivery (`inbox`) and the owner-event
-listener (`listen`: a `sync.py listen` service beside the timer that polls Basecamp's event
-feed and runs the same readers within about a minute of the captain posting; the records
-are the same, plus an `unmonitored` record when the captain does something nothing
-monitors). `python3 $SYNC/sync.py behaviors --home <home>
---config <config>` lists which are on. Sections below about cards and the side files apply
+assigns to the agent's login, in the project or, with `"scope": "account"`, anywhere in the account), inbox delivery (`inbox`) and notifications (on
+with a `profile`: every run reads the agent login's Basecamp notifications and boosts and
+runs the reader for each thread that changed, so the captain's input arrives within about
+half a minute; it relays their comments and @mentions on anything the login follows, marks
+handled notifications read, and records an `unmonitored` record when the captain does
+something nothing monitors). The other readers run as an hourly (to-do requests: 5-minute)
+repair sweep. `"listen"` and `sync.py listen`, the retired event listener, are ignored;
+re-running `init` removes its service. `python3 $SYNC/sync.py behaviors --home <home>
+--config <config>` lists which are on and how often each runs. Sections below about cards and the side files apply
 only when the card mirror is on. Mechanics (column rules, file formats, record fields,
 safety bounds) are in the repo's README: `basecamp-mate/README.md` (https://github.com/calebl/basecamp-mate). `SYNC` below
 means that checkout.
@@ -34,9 +37,9 @@ A person setting a home up by hand runs `$SYNC/bin/basecamp-mate setup`: a guide
 setup (sign-in with a link and code, project picker, yes/no questions) that ends in the same
 `init`. To run it yourself without questions, pass `--answers <file.json>` (keys: `home`,
 `login`, `project` id or URL, `captain` person id, `timezone`, and `true`/`false` for `chat`,
-`todos`, `checkins`, `listen`, `cards`, `releases`, `reports`, `pings`, `inbox`); it refuses
+`todos`, `checkins`, `cards`, `releases`, `reports`, `pings`, `inbox`); it refuses
 instead of asking when the login is not signed in. `$SYNC/bin/basecamp-mate doctor` checks
-everything (CLI, sign-in, project, card columns, services, last sync, wake check) and prints
+everything (CLI, sign-in, project, card columns, notifications, the timer, last sync, wake check) and prints
 each problem with its fix; it exits non-zero when something is broken.
 
 "Use this Basecamp project with the firstmate login" means:
@@ -51,8 +54,9 @@ is not a registered project's name). A card table matching no registered project
 skipped and printed, not refused; check the skipped list and pass `--repo-map` for any
 board that is really a repo's. When the owner wants only chat, check-ins or release
 announcements, or the project has no card tables, pass `--no-cards`. `--todos`,
-`--reports`, `--every-line`, `--pings`, `--assigned-todos`, `--inbox`, `--listen` and `--checkins <time zone>` turn on decision
-to-dos, reports, every-line chat, Ping relaying, to-do requests, inbox delivery, the listener service and check-in answering; `--no-releases` leaves announcements out.
+`--reports`, `--every-line`, `--pings`, `--assigned-todos`, `--inbox` and `--checkins <time zone>` turn on decision
+to-dos, reports, every-line chat, Ping relaying, to-do requests, inbox delivery and check-in answering; `--no-releases` leaves announcements out.
+Notifications need no flag (`--listen` is accepted and does nothing).
 `--assigned-todos-anywhere` takes to-do requests from every project of the account
 (`"assigned_todos": {"scope": "account"}`); only the main firstmate home uses it, and a
 second mate's home keeps `--assigned-todos`.
@@ -161,6 +165,11 @@ they wrote is a request.
 - `ping`: a line the captain wrote to this home's login in a Ping (a direct message, in a
   bucket of its own). Treat it like a `chat-question` from an `every_line` chat, and answer
   in the Ping with `sync.py reply --recording <line id>`; never with the `basecamp` CLI.
+- `mention`, `thread-comment`: the captain @mentioned this home's login in, or commented
+  on, something it follows that nothing else tracks (a card whose task left the backlog, a
+  document, someone else's to-do). A mention is addressed to you; a thread comment is said
+  to you. Handle it like a card `comment` (relay outside the main firstmate's home), and
+  answer there with `sync.py reply --recording <comment id>`.
 - `todo-comment`: the captain commented on a tracked to-do; see "Decisions as to-dos", or,
   with `request: true`, "To-do requests".
 - `todo-request`, `todo-request-update`, `todo-request-closed`: a to-do assigned to this
@@ -169,14 +178,14 @@ they wrote is a request.
   report); it is feedback or an instruction on it. Act on it (relaying first outside the
   main firstmate's home), then answer with `sync.py reply --recording <comment id>`.
 - `boost`: the captain boosted something being watched (`surface`: chat, ping, card,
-  card-comment, todo, todo-comment, checkin-answer, message, message-comment); a boost
+  card-comment, todo, todo-comment, checkin-answer, message, message-comment, thread-comment); a boost
   can carry short text. It is an answer to what was boosted, like a comment there: on a
   decision to-do or a comment under it, a decision or feedback as above; on a to-do request
   (`request: true`), more about that request; elsewhere a reply
   to that line, answer or post. Relay it like a comment outside the main firstmate's home.
 - `unmonitored`: the captain did something in the project that no enabled behavior handles
-  (`event_type` on `recording_type`, e.g. `todo.created` on `Todo` or `comment.created` on
-  a `Document`; one record per kind, `key`). Put it to the owner as a decision to-do (see
+  (`event_type` on `recording_type`, e.g. `chat.line.created` in a chat not relayed, or
+  `todo.assignment_changed` on a `Todo` with to-do requests off; one record per kind, `key`). Put it to the owner as a decision to-do (see
   "Decisions as to-dos") asking how such events should be handled: start monitoring them
   and how, ignore them, or something else. Act on the answer (monitoring needs a change to
   the sync: relay it to the main firstmate), then record it with
@@ -194,7 +203,7 @@ they wrote is a request.
   one per line with
   `python3 $SYNC/sync.py ask --home <home> --config <home>/data/basecamp-sync/config.json --body-file <file>`;
   it @mentions the owner.
-- A FAILED run (or `FAILED listen`, three listener cycles in a row): read `sync.log` and run
+- A FAILED run: read `sync.log` and run
   `$SYNC/bin/basecamp-mate doctor`, which names the problem and its fix; a token failure needs
   `BASECAMP_NO_KEYRING=1 basecamp auth login -P <profile> --device-code` (or `basecamp-mate setup`),
   which only the captain can do, so relay it.
@@ -205,7 +214,7 @@ The main firstmate's own home answers its questions itself rather than relaying.
 
 - Post, comment, complete, delete, archive or trash anything in Basecamp outside `sync.py`
   and its commands (`reply`, `ask`, `answer`, `todo create|track|comment|complete`,
-  `post-message`), or hand-edit `todos.json`, `feed.json`, `pings.json`, `requests-feed.json`, `assigned-todos.json` or `unmonitored.json`.
+  `post-message`), or hand-edit `todos.json`, `pings.json`, `notifications.json`, `threads.json`, `timer.json`, `assigned-todos.json` or `unmonitored.json`.
   The sync's one automatic post is a release announcement: releases only (GitHub releases
   of the repos in `releases`, never merges or PRs), Message Board only. Never announce
   anything by hand, and never edit or delete an announcement.

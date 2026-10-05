@@ -10,28 +10,36 @@ false), the chat inbox ("chats"), chat asks ("ask_chat"), check-in answering
 ("checkins"), release announcements ("releases"), decision to-dos ("todos"),
 reports ("message_board"), Pings ("pings": the owner's direct messages to the agent's
 login), to-do requests ("assigned_todos": to-dos the owner assigns to the agent's login),
-inbox delivery ("inbox") and the owner-event listener
-("listen", run by `sync.py listen` as a service beside the timer, which also records
-the owner's unmonitored events; `sync.py unmonitored` keeps their keys). prompts/base.md is
-the agent's side of each behavior.
+inbox delivery ("inbox") and notifications (on with a "profile": every run reads the agent
+login's notifications and boosts and runs the reader for each thread that changed, and
+records the owner's unmonitored input; `sync.py unmonitored` keeps their keys).
+prompts/base.md is the agent's side of each behavior.
+
+The timer runs every 30 seconds. Each behavior's step runs when it is due (timer.json
+keeps when each last ran): notifications and inbox delivery every run, the card mirror,
+release announcements and check-ins every 5 minutes, and the other readers hourly as the
+repair sweep (every 5 minutes without notifications). `--all` runs every step.
 
 Deterministic, no model calls. Safety bounds, enforced here:
   - only the configured account, project, card tables, chats, check-ins, to-do set
     and message board are touched, and, with "pings" on, the Pings the agent's login
     is in with the owner; with "assigned_todos" on, the project's to-dos assigned to
     the agent's login (with "scope": "account", any project's) are read and
-    acknowledged with a 👀;
+    acknowledged with a 👀; the agent login's notifications and boosts are read across
+    the account, but only this project's (and those Pings and requests) are acted on,
+    and an owner's @mention of the agent anywhere in the project is relayed;
   - nothing is ever deleted, trashed or archived, except the acting user's own 👀
     boost once a question is answered; the timer run posts nothing to chat or as a
     comment, and its only writes besides the card mirror are 👀/👍 acknowledgement
-    boosts and a Message Board announcement per new GitHub release;
+    boosts, marking the agent login's handled notifications read, and a Message Board
+    announcement per new GitHub release;
   - only the explicit commands post, run by the agent, and each refuses to when no
     profile is set or the profile signs in as the owner;
   - id maps (map.json, todos.json, ...) make re-runs update or skip instead of
     duplicating.
 All runtime state lives in the directory that holds the config file.
 
-Usage: sync.py --home <home> --config <config.json> [--dry-run] [--include-prereleases]
+Usage: sync.py --home <home> --config <config.json> [--all] [--dry-run] [--include-prereleases]
        sync.py reply --home <home> --config <config.json> --recording <comment, chat line or Ping line id> --body-file <file> [--again] [--dry-run]
        sync.py ask --home <home> --config <config.json> --body-file <file> [--dry-run]
        sync.py answer --home <home> --config <config.json> --question <check-in question id> --body-file <file> [--dry-run]
@@ -40,7 +48,6 @@ Usage: sync.py --home <home> --config <config.json> [--dry-run] [--include-prere
        sync.py todo comment --home <home> --config <config.json> --todo <key or id> --body-file <file> [--dry-run]
        sync.py todo complete --home <home> --config <config.json> --todo <key or id> [--dry-run]
        sync.py post-message --home <home> --config <config.json> --subject <text> --body-file <file> [--dry-run]
-       sync.py listen --home <home> --config <config.json> [--once] [--dry-run]
        sync.py unmonitored list|handle|forget --home <home> --config <config.json> [--key <key>] [--decision <text>] [--dry-run]
        sync.py behaviors --home <home> --config <config.json>
        sync.py setup [--answers <file.json>] [--yes]      (guided; also bin/basecamp-mate setup)
@@ -48,7 +55,7 @@ Usage: sync.py --home <home> --config <config.json> [--dry-run] [--include-prere
        sync.py init <project URL> --login <profile> --home <home> [--captain <id or email>] [--listen-to <person>]... [--repo-map TABLE=REPO] [--dry-run]
 """
 import argparse, json, subprocess, sys
-from datetime import datetime, timezone  # noqa: F401  (kept importable from sync)
+from datetime import datetime, timezone
 
 import behaviors
 from behaviors import COLUMNS, render_decision, render_release, inline_md  # noqa: F401
@@ -85,58 +92,53 @@ class Sync(Tools):
     def body_for(self, *args, **kw):
         return self.card_mirror.body_for(*args, **kw)
 
-    def main(self, items=None):
+    def main(self, items=None, due=False):
         """One run: each behavior that is on, in order; a behavior left out of the config makes no calls.
 
-        It holds the shared state lock throughout, so a listener cycle waits for it.
+        With `due` (the timer's run), only the behaviors whose cadence has passed since
+        they last ran (timer.json); otherwise all of them. The card mirror's slot logs
+        "cards off" when it is off, so sync.log shows the timer alive every 5 minutes. It
+        holds the shared state lock throughout, so a command waits for it.
         """
         plan = None
         with self.locked("sync"):
+            timer = self.load("timer.json", {})
+            ran = timer.setdefault("ran", {})
+            if self.cfg.get("listen") not in (None, False) and not timer.get("listen_noted"):
+                self.log('notifications replace the event listener: "listen" in the config is ignored'
+                         + ('; its "unmonitored": false still applies (move it to "notifications")'
+                            if isinstance(self.cfg["listen"], dict) and self.cfg["listen"].get("unmonitored") is False else "")
+                         + "; re-run init (or basecamp-mate setup) to remove the listener service")
+                timer["listen_noted"] = True
+            now = datetime.now(timezone.utc)
             for b in self.behaviors.values():
-                if b.on and b.timer:
+                if not b.timer or (not b.on and b is not self.card_mirror):
+                    continue
+                last = ran.get(b.name)
+                if due and b.every and last and (now - datetime.fromisoformat(last)).total_seconds() < b.every - SLACK:
+                    continue
+                if b.on:
                     out = b.run(items)
                     plan = out if b is self.card_mirror else plan
-        if not self.cards:
-            self.log("cards off" + (" (dry run)" if self.dry else ""))
+                else:
+                    self.log("cards off" + (" (dry run)" if self.dry else ""))
+                ran[b.name] = now.isoformat(timespec="seconds")
+                if not self.dry:
+                    self.save_json("timer.json", timer)
+            if not self.dry:
+                self.save_json("timer.json", timer)
         return plan
 
-    def listen_once(self):
-        """One listener cycle under the shared state lock: the owner's new events, each dispatched to its reader."""
-        with self.locked("sync"):
-            return self.behaviors["owner-events"].run()
+
+SLACK = 20  # seconds: a step comes due this much early, so timer jitter never pushes it a whole run later
 
 
-def listen(a, runner, sleep=None, cycles=None):
-    """`sync.py listen`: a listener cycle every "interval" seconds until the config turns "listen" off.
-
-    The config is re-read each cycle. A failed cycle is retried on the next; the third
-    failure in a row is logged once as FAILED (so the wake check sees it) and recovery
-    is logged too. Exits 0 when "listen" is off, so a Restart=on-failure service stays down.
-    """
-    import time
-    sleep = sleep or time.sleep
-    failures, n = 0, 0
-    while cycles is None or n < cycles:
-        n += 1
-        s = Sync(a.home, a.config, dry=a.dry_run, runner=runner)
-        ev = s.behaviors["owner-events"]
-        if not ev.on:
-            s.log('listen: "listen" is not set in the config; stopping')
-            return 0
-        try:
-            s.listen_once()
-            if failures >= 3:
-                s.log(f"listen: recovered after {failures} failed cycles")
-            failures = 0
-        except Exception as e:
-            failures += 1
-            if failures == 3:
-                s.log(f"FAILED listen {type(e).__name__}: {e} (3 cycles in a row; retrying every {ev.interval}s)")
-            elif failures < 3:
-                s.log(f"listen: cycle failed, retrying: {type(e).__name__}: {e}")
-        if a.once:
-            return 1 if failures else 0
-        sleep(ev.interval)
+def listen(a, runner):
+    """`sync.py listen`, retired: notifications on the timer replaced the event listener. Logs that and exits 0,
+    so a listener service left from before stays down (it restarts only on failure) until init removes it."""
+    Sync(a.home, a.config, runner=runner).log(
+        "listen: the event listener was removed; notifications on the timer read the owner's input now. "
+        "Re-run init (or basecamp-mate setup) to remove this service.")
     return 0
 
 
@@ -259,9 +261,9 @@ def cli(argv=None, runner=subprocess.run):
         a = ap.parse_args(argv[1:])
         return command(a, "post-message", lambda s: s.post_message(a.subject, read(a.body_file)), runner)
     if argv[:1] == ["listen"]:
-        ap = common("sync.py listen", "Poll the Basecamp event feed for the owner's events and run the matching readers.")
-        ap.add_argument("--once", action="store_true", help="one cycle, then exit (non-zero when it failed)")
-        ap.add_argument("--dry-run", action="store_true", help="read and log; record, boost and save nothing")
+        ap = common("sync.py listen", "Retired: notifications on the timer replaced the event listener; logs that and exits.")
+        ap.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
+        ap.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
         return listen(ap.parse_args(argv[1:]), runner)
     if argv[:1] == ["behaviors"]:
         a = common("sync.py behaviors", "List the behaviors and whether this config turns each on.").parse_args(argv[1:])
@@ -269,15 +271,16 @@ def cli(argv=None, runner=subprocess.run):
         for b in s.behaviors.values():
             print(f"{b.name:22} {'on ' if b.on else 'off'}  {b.runs:8}  ({', '.join(b.keys)})")
         return 0
-    ap = argparse.ArgumentParser(description="One timer run: every behavior the config turns on.")
+    ap = argparse.ArgumentParser(description="One timer run: every behavior the config turns on that is due.")
     ap.add_argument("--home", required=True, help="firstmate home (holds data/backlog.md and state/)")
     ap.add_argument("--config", required=True, help="config.json; its directory holds all runtime state")
-    ap.add_argument("--dry-run", action="store_true", help="plan only: no Basecamp calls, map.json untouched")
+    ap.add_argument("--all", action="store_true", help="run every behavior's step now, whether or not it is due")
+    ap.add_argument("--dry-run", action="store_true", help="plan only: no Basecamp writes, map.json untouched")
     ap.add_argument("--include-prereleases", action="store_true", help="also announce GitHub prereleases")
     a = ap.parse_args(argv)
     s = Sync(a.home, a.config, dry=a.dry_run, runner=runner, prereleases=a.include_prereleases)
     try:
-        s.main()
+        s.main(due=not a.all)
     except Exception as e:
         s.log(f"FAILED {type(e).__name__}: {e}")
         return 1

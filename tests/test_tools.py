@@ -308,7 +308,7 @@ class Cli(ToolBase):
         on = {ln.split()[0]: ln.split()[1] for ln in out.splitlines()}
         self.assertEqual(on, {"card-mirror": "on", "chat-inbox": "off", "chat-asks": "off", "release-announcements": "off",
                               "checkin-answering": "off", "decision-todos": "on", "assigned-todos": "off", "reports": "on",
-                              "pings": "off", "inbox-delivery": "off", "owner-events": "off"})
+                              "pings": "off", "inbox-delivery": "off", "notifications": "on"})
 
 
 def boost(id, who=CAPTAIN, content="a"):
@@ -322,7 +322,8 @@ class TodoBoosts(ToolBase):
         self.c = str(self.tid)
 
     def boost_reads(self):
-        return [c[2].split("/")[4] for c in self.stub.calls if c[:2] == ["api", "get"] and c[2].endswith("/boosts.json")]
+        return [c[2].split("/")[4] for c in self.stub.calls if c[:2] == ["api", "get"] and c[2].endswith("/boosts.json")
+                and c[2] != "/my/boosts.json"]
 
     def test_owner_boost_on_the_todo_recorded_once(self):
         self.stub.boosts[self.c] = [boost(70, content="<div>yes</div>"), boost(71, who=ACTING)]

@@ -1,14 +1,15 @@
 """Tests for the people list: relaying several listened-to people while only the captain decides or approves.
 
-The basecamp CLI and the event feed are stubbed; nothing touches the network.
+The basecamp CLI and the notifications are stubbed; nothing touches the network.
 """
-import json, os, sys, unittest
+import io, json, os, sys, unittest
+from contextlib import redirect_stderr
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_sync import ACTING, CAPTAIN, Base, Stub, item, line  # noqa: E402
 from test_sync import boost as card_boost  # noqa: E402
 from test_tools import boost, comment  # noqa: E402
-from test_listen import ListenBase, PROJECT, event  # noqa: E402
+from test_notifications import NotifBase as ListenBase, PROJECT, note  # noqa: E402
 from test_pings import PingBase, ping_line, reading, CHAT  # noqa: E402
 import test_init  # noqa: E402
 import behaviors  # noqa: E402
@@ -44,7 +45,7 @@ class Config(Base):
 
 
 class Relay(ListenBase):
-    """Chat, to-do, message and listener relaying with a people list."""
+    """Chat, to-do, message and notification relaying with a people list."""
 
     def setUp(self):
         super().setUp()
@@ -88,37 +89,35 @@ class Relay(ListenBase):
         self.assertIn("never a captain decision or approval", body)
         self.assertNotIn("todo complete", body)
 
-    def test_listener_asks_the_feed_for_everyone_listened_to(self):
+    def test_a_notification_from_another_listed_person_is_relayed_as_theirs(self):
         self.stub.lines["77"].append(line(2, who=MATE))
-        self.stub.page(event(10, rid=2, who=MATE), position="p1")
-        self.listen()
-        self.assertEqual(self.stub.queries[0]["creators"], ",".join(str(p) for p in sorted((CAPTAIN, MATE))))
+        self.notify(note(10, "Chat", thread=77, path="chats", section="chats", who=MATE))
+        self.poll()
         self.assertEqual([(r["kind"], r["captain"]) for r in self.pending()], [("chat-question", False)])
 
-    def test_listener_drops_a_stray_event_from_someone_not_listened_to(self):
-        self.stub.lines["77"].append(line(2, who=STRANGER))
-        self.stub.page(event(10, rid=2, who=STRANGER), position="p1")
-        self.listen()
+    def test_a_mention_from_someone_not_listened_to_is_dropped(self):
+        self.stub.comments["4"] = [comment(9, who=STRANGER)]
+        self.notify(note(10, "Mention", thread=4, anchor=9, path="documents", who=STRANGER))
+        self.poll()
         self.assertEqual(self.pending(), [])
 
-    def test_unmonitored_event_from_another_person_names_them(self):
-        self.stub.recordings[40] = {"type": "Todo", "title": "Buy paint", "creator": named(MATE), "app_url": "u"}
-        self.stub.page(event(10, kind="todo.created", rid=40, who=MATE), position="p1")
-        self.listen()
+    def test_unmonitored_input_from_another_person_names_them(self):
+        self.notify(note(10, "Chat", thread=78, path="chats", section="chats", who=MATE))
+        self.stub.readings["unreads"][0]["creator"] = named(MATE)
+        self.poll()
         [rec] = self.pending()
         self.assertEqual((rec["kind"], rec["author"], rec["captain"]), ("unmonitored", named(MATE), False))
         _, body = behaviors.inbox_note(rec, "1", "2")
-        self.assertTrue(body.startswith("Basecamp event from Mate (not the captain) that nothing monitors"))
+        self.assertTrue(body.startswith("Basecamp activity from Mate (not the captain) that nothing monitors"))
 
 
 class SingleCaptain(ListenBase):
     """A config with only "captain" relays as before: other people's lines only move cursors."""
 
-    def test_other_people_ignored_and_feed_filtered_to_the_captain(self):
+    def test_other_people_ignored(self):
         self.stub.lines["77"] += [line(2, who=MATE), line(3)]
-        self.stub.page(event(10, rid=3), position="p1")
-        self.listen()
-        self.assertEqual(self.stub.queries[0]["creators"], str(CAPTAIN))
+        self.notify(note(10, "Chat", thread=77, path="chats", section="chats"))
+        self.poll()
         [rec] = self.pending()
         self.assertEqual((rec["line"], rec["captain"]), (3, True))
         _, body = behaviors.inbox_note(rec, "1", "2")
@@ -222,11 +221,13 @@ class Init(unittest.TestCase):
             raise init_home.Refuse("stop")
         init_home.Init.__init__ = spy
         try:
-            init_home.cli(["https://app.basecamp.com/1/projects/2", "--login", "f", "--home", self.home,
-                           "--listen-to", "a", "--listen-to", "b", "--listen"])
+            with redirect_stderr(io.StringIO()):  # the retired --listen beside it is still accepted, not --listen-to
+                init_home.cli(["https://app.basecamp.com/1/projects/2", "--login", "f", "--home", self.home,
+                               "--listen-to", "a", "--listen-to", "b", "--listen"])
         finally:
             init_home.Init.__init__ = real
-        self.assertEqual((seen["listen_to"], seen["listen"]), (["a", "b"], True))
+        self.assertEqual(seen["listen_to"], ["a", "b"])
+        self.assertNotIn("listen", seen)
 
 
 if __name__ == "__main__":

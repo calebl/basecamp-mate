@@ -8,9 +8,11 @@ A tool does one explicit thing to the configured account and project, through th
     approvals, chat lines, the owner's lines in Pings (direct messages to the acting
     login, each in a bucket of its own), due check-in questions, comments on tracked
     to-dos, to-dos the owner assigns to the acting login (as requests, then their edits
-    and closing); the event-feed reader hands pages of the account event feed to a behavior
-    instead, and the unmonitored-event recorder records, once per kind, the owner
-    events it finds no behavior handles;
+    and closing), the owner's comments and @mentions on any other thread the acting login is
+    subscribed to or mentioned in;
+    the notification and boost readers (`/my/readings.json`, `/my/boosts.json`) only
+    hand what changed to a behavior, `mark_read` marks notifications read, and the
+    unmonitored recorder records, once per kind, the owner input no behavior handles;
   - commands post exactly what the agent hands them: `reply`, `ask`, `answer`,
     `todo create|track|comment|complete`, `post-message`; `unmonitored handle|forget`
     only edit local state;
@@ -26,9 +28,8 @@ post-message) posts nothing when no profile is set, or when the profile signs in
 the owner, and `--dry-run` only logs. All state lives in the directory holding the
 config.
 """
-import contextlib, csv, fcntl, hashlib, html, json, os, re, subprocess, time, tomllib
+import base64, contextlib, csv, fcntl, hashlib, html, json, os, re, subprocess, time, tomllib
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 THUMBS, EYES = "\U0001F44D", "\U0001F440"
@@ -66,6 +67,7 @@ class Tools:
         self.dry, self.run = dry, runner
         self._acting = False  # acting person id once resolved; None when it can't be
         self._acting_sgid = None  # the acting person's mention sgid, to spot @mentions in chat
+        self.errors = 0  # failed basecamp calls this run, so a caller can tell whether a reader it ran fully worked
         self.data = os.path.join(self.home, "data")
         self.state = os.path.join(self.home, "state")
 
@@ -131,6 +133,7 @@ class Tools:
             if out.get("ok"):
                 return out.get("data")
             if not out.get("retryable") or attempt == 2:
+                self.errors += 1
                 raise BasecampError(f"basecamp {' '.join(args[:3])}: {out.get('error')}", out.get("code"), out.get("error"))
             time.sleep(3)
 
@@ -420,14 +423,17 @@ class Tools:
         if not self.dry:
             rec.setdefault("card_boost_seen", [])
 
-    def read_chats(self, chats, every_line=()):
+    def read_chats(self, chats, every_line=(), addressed=()):
         """Record the chat lines of the people listened to in `chats` as chat-question records.
 
         Per chat, chats.json keeps a cursor (the newest line id seen). The first run
         only sets the cursor, so old history is not relayed. A listened-to line that
         mentions the acting user or contains "?" is recorded and queued for a 👀; every
         other line is skipped, unless the chat is in `every_line`, where every such
-        line is recorded. A dry run reads and logs only.
+        line is recorded. `addressed` holds line ids a notification says address the
+        acting user (an @mention, or a Campfire reply to one of its lines, which carries
+        no mention): each is recorded like a question, even when the cursor has passed
+        it, unless it already was. A dry run reads and logs only.
         """
         state = self.load("chats.json", {})
         for chat in chats:
@@ -442,14 +448,15 @@ class Tools:
             cursor = rec.get("cursor", 0)
             for ln in lines:
                 lid = ln.get("id", 0)
-                if lid <= cursor:
+                late = lid <= cursor and lid in addressed and lid not in rec.get("lines", []) and not first
+                if lid <= cursor and not late:
                     continue
-                cursor = lid
+                cursor = max(cursor, lid)
                 if first or not self.hears(ln.get("creator")):
                     continue
                 content = ln.get("content", "")
                 text = html.unescape(re.sub(r"<[^>]+>", "", content)).strip()
-                if "?" not in text and chat not in every_line:
+                if "?" not in text and chat not in every_line and lid not in addressed:
                     self.acting_id()
                     if not (self._acting_sgid and self._acting_sgid in content):
                         continue
@@ -572,7 +579,7 @@ class Tools:
         if not self.dry:
             self.save_json("checkins.json", state)
 
-    def read_messages(self, board, days=14):
+    def read_messages(self, board, days=14, only=None):
         """The owner's comments and boosts on messages the acting user posted on `board` in the last `days` days.
 
         One read of the board's newest messages; a boosts read per message whose
@@ -580,19 +587,25 @@ class Tools:
         boosts read per comment whose count changed. Each owner comment newer than the
         message's cursor is recorded once as a `message-comment`, acknowledged like a card
         comment (👀 when it contains "?", 👍 otherwise). A message has no cursor until its
-        first read, so feedback already on a recent post is relayed, not skipped. State is
-        messages.json. A dry run reads and logs only.
+        first read, so feedback already on a recent post is relayed, not skipped. `only`
+        (a message id, from a notification) reads that one message instead of the board,
+        whatever its age, when the acting user posted it. State is messages.json. A dry
+        run reads and logs only.
         """
         me = self.agent()
         if me is None:
             return
         since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
         try:
-            msgs = self.bc("api", "get", f"/buckets/{self.project}/message_boards/{board}/messages.json") or []
+            if only is not None:
+                msgs = [self.bc("api", "get", f"/buckets/{self.project}/messages/{only}.json") or {}]
+            else:
+                msgs = self.bc("api", "get", f"/buckets/{self.project}/message_boards/{board}/messages.json") or []
         except RuntimeError as e:
-            self.log(f"messages {board}: {e}")
+            self.log(f"messages {only or board}: {e}")
             return
-        mine = [m for m in msgs if (m.get("creator") or {}).get("id") == me and (m.get("created_at") or "") >= since]
+        mine = [m for m in msgs if (m.get("creator") or {}).get("id") == me
+                and (only is not None or (m.get("created_at") or "") >= since)]
         with self.locked("messages.json"):
             state = self.load("messages.json", {})
             for m in mine:
@@ -704,14 +717,29 @@ class Tools:
         self.read_boosts(rec, "todo-comment", ctx, bucket=bucket,
                          counted=[(c.get("id"), c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
 
-    def ping_conversations(self):
+    def readings(self):
+        """The acting user's notifications, one read of /my/readings.json: {"unreads": [...], "reads": [first page], ...}."""
+        return self.bc("api", "get", "/my/readings.json") or {}
+
+    def my_boosts(self):
+        """The boosts on the acting user's own recordings (its chat lines, comments, to-dos, cards, messages, answers),
+        one read of /my/boosts.json, each with its "recording" (type, bucket, parent). Not in Basecamp's API docs."""
+        return self.bc("api", "get", "/my/boosts.json") or []
+
+    def mark_read(self, ids):
+        """Mark the acting user's notifications `ids` read, through `basecamp notifications read` (PUT /my/unreads.json)."""
+        if ids:
+            self.bc("notifications", "read", *[str(i) for i in ids])
+
+    def ping_conversations(self, data=None):
         """The Ping conversations (direct messages, each a chat in its own "circle" bucket) the acting user is in with someone listened to.
 
-        One read of /my/readings.json: its "pings" section, read and unread, lists each
-        recently active Ping with a listened-to person among its participants or as its creator; the
-        bucket and chat ids come from its subscription_url. Newest activity first.
+        One read of /my/readings.json (or `data`, a read already made): its "pings" section,
+        read and unread, lists each recently active Ping with a listened-to person among
+        its participants or as its creator; the bucket and chat ids come from its
+        subscription_url. Newest activity first.
         """
-        data = self.bc("api", "get", "/my/readings.json") or {}
+        data = self.readings() if data is None else data
         found = {}
         for r in (data.get("unreads") or []) + (data.get("reads") or []):
             m = re.search(r"/buckets/(\d+)/recordings/(\d+)/", r.get("subscription_url") or "")
@@ -722,12 +750,13 @@ class Tools:
                                           "url": r.get("app_url"), "updated_at": r.get("updated_at") or ""})
         return sorted(found.values(), key=lambda p: p["updated_at"], reverse=True)
 
-    def read_pings(self, limit=10):
+    def read_pings(self, limit=10, convs=None):
         """Record each new line someone listened to writes in a Ping with the acting user as a `ping` record, once.
 
         Pings are found with ping_conversations(), at most `limit` per run, newest activity
         first; a Ping drops out of the readings once it goes quiet, and a new line puts it
-        back. pings.json keeps "since" (when the behavior first ran) and, per Ping chat, a
+        back. `convs` (from a notification) reads those Pings instead. pings.json keeps
+        "since" (when the behavior first ran) and, per Ping chat, a
         cursor (the newest line id seen): every owner line newer than both is recorded and
         queued for a 👀, so a Ping that starts after "since" is relayed from its first line
         and history from before it never is. The owner's boosts on lines in a Ping are
@@ -741,7 +770,7 @@ class Tools:
         state = self.load("pings.json", {})
         since = state.get("since") or now_iso()
         try:
-            convs = self.ping_conversations()[:limit]
+            convs = self.ping_conversations()[:limit] if convs is None else convs
         except RuntimeError as e:
             self.log(f"pings: {e}")
             return
@@ -947,37 +976,128 @@ class Tools:
         self.log(f"todo request {key}: {kind}" + (f" ({reason})" if reason else ""))
         return kind
 
-    # --- the account event feed: wake-ups for the readers, never records ---
+    # --- refetches, @mentions in threads nothing tracks, and unmonitored input ---
 
     def comment(self, cid, bucket=None):
         """Comment `cid` (in `bucket`, default the project), refetched from Basecamp; its "parent" names what it is on."""
         return self.bc("api", "get", f"/buckets/{bucket or self.project}/comments/{cid}.json", project=bucket) or {}
 
-    def recording(self, rid):
-        """Recording `rid` of any type, refetched from Basecamp (type, title, content, creator, parent, app_url)."""
-        return self.bc("api", "get", f"/buckets/{self.project}/recordings/{rid}.json") or {}
+    def recording(self, rid, bucket=None):
+        """Recording `rid` of any type (in `bucket`, default the project), refetched (type, title, content, creator, parent, app_url)."""
+        return self.bc("api", "get", f"/buckets/{bucket or self.project}/recordings/{rid}.json", project=bucket) or {}
 
-    def record_unmonitored(self, ev, rtype=None, rec=None, on=None):
-        """Record an owner event no behavior handles as an `unmonitored` record, once per kind of thing.
+    def read_mention(self, bucket, chat, rid):
+        """Record a listened-to person's line `rid` in chat `chat` that @mentions the acting user (or is a Campfire reply
+        to one of its lines) when no chat reader relays that chat, once, as a `chat-question` kept in chats.json, so
+        `reply` answers it there; queued for a 👀. Returns True when recorded. A dry run records nothing."""
+        if self.agent() is None or rid in self.load("chats.json", {}).get(str(chat), {}).get("lines", []):
+            return False
+        try:
+            ln = self.bc("api", "get", f"/buckets/{bucket}/chats/{chat}/lines/{rid}.json", project=bucket) or {}
+        except RuntimeError as e:
+            self.log(f"mention {rid} in chat {chat}: {e}")
+            return False
+        if not self.hears(ln.get("creator")):
+            return False
+        if self.dry:
+            self.log(f"dry mention {rid} in chat {chat}: record and acknowledge with {EYES}")
+            return False
+        state = self.load("chats.json", {})
+        rec = state.setdefault(str(chat), {})
+        self.record({"kind": "chat-question", "chat": int(chat), "line": rid, "mention": True,
+                     "url": ln.get("app_url") or f"https://3.basecamp.com/{self.account}/buckets/{bucket}/chats/{chat}@{rid}",
+                     "text": plain(ln.get("content")), "at": ln.get("created_at"), **self.author(ln.get("creator"))})
+        rec.setdefault("lines", []).append(rid)
+        rec.setdefault("ack", []).append([rid, EYES])
+        self.log(f"new owner mention in chat {chat}: {rid}")
+        self.acknowledge(f"chat {chat}", rec)
+        self.save_json("chats.json", state)
+        return True
 
-        The key is "<event type>/<recording type>" (for a comment, the type of what it is
-        on), e.g. "comment.created/Document". unmonitored.json keeps each key with the
-        first event recorded, how many were seen and, once the agent marks it handled, the
-        decision; a key already there is only counted, so the owner is asked once.
-        `rtype` None means the recording's own type, refetched; otherwise the recording
-        (or `rec`, already fetched) is read only for a new key, for its title, excerpt and
-        link, and a failed read still records what the event says. `on` is the parent a
-        comment is on. A dry run records and saves nothing. Returns the key when recorded.
+    def read_thread(self, bucket, thread, since, mentions=(), ptype=None, title=None):
+        """Record the listened-to people's new comments on recording `thread` (in `bucket`), a thread no other reader
+        tracks but the acting user is subscribed to or @mentioned in: a card whatever its backlog state, a document, an
+        upload, someone else's message or to-do, a check-in answer.
+
+        threads.json keeps, per "<bucket>:<thread>", a cursor (the newest comment id seen),
+        the comments recorded, acknowledgements and replies. A thread's first read starts at
+        comment `since` (the notification's first unread comment), so what was already
+        read before it is not replayed. Each new comment by someone listened to is a
+        `mention` record when it is in `mentions` (a notification said so) or @mentions the
+        acting user, else a `thread-comment`, and is queued for a 👀 when it is a mention or
+        contains "?", a 👍 otherwise. `reply` answers either with a comment on the thread.
+        `ptype` and `title` name the thread when the comments do not. The owner's boosts on
+        its comments (the agent's replies included) are `boost` records with surface
+        `thread-comment`. A dry run reads and logs only.
         """
-        kind, rid = ev.get("event_type"), ev.get("recording_id")
+        if self.agent() is None:
+            return
+        try:
+            comments = self.bc("comments", "list", str(thread), project=bucket) or []
+        except RuntimeError as e:
+            self.log(f"thread {thread}: {e}")
+            return
+        key = f"{bucket}:{thread}"
+        state = self.load("threads.json", {})
+        rec = json.loads(json.dumps(state.get(key) or {"bucket": int(bucket), "thread": thread, "cursor": (since or 1) - 1,
+                                                       "parent_type": ptype, "title": title}))
+        self.acting_id()
+        cursor = rec["cursor"]
+        for c in sorted(comments, key=lambda c: c.get("id", 0)):
+            cid = c.get("id", 0)
+            if cid <= cursor:
+                continue
+            cursor = cid
+            if not self.hears(c.get("creator")):
+                continue
+            text = plain(c.get("content"))
+            on = c.get("parent") or {}
+            mention = cid in mentions or bool(self._acting_sgid and self._acting_sgid in (c.get("content") or ""))
+            if self.dry:
+                self.log(f"dry thread {thread}: owner {'mention' if mention else 'comment'} {cid}")
+                continue
+            rec.update(parent_type=on.get("type") or rec.get("parent_type"), title=on.get("title") or rec.get("title"))
+            self.record({"kind": "mention" if mention else "thread-comment", "bucket": int(bucket), "parent": thread,
+                         "parent_type": rec.get("parent_type"), "title": rec.get("title"), "comment": cid,
+                         "question": "?" in text, "url": c.get("app_url") or on.get("app_url"), "text": text,
+                         "at": c.get("created_at"), **self.author(c.get("creator"))})
+            rec.setdefault("comments", []).append(cid)
+            rec.setdefault("ack", []).append([cid, EYES if mention or "?" in text else THUMBS])
+            self.log(f"new owner {'mention' if mention else 'comment'} on {rec.get('parent_type') or 'thread'} {thread}: {cid}")
+        self.read_boosts(rec, "thread-comment", {"bucket": int(bucket), "parent": thread, "title": rec.get("title")},
+                         bucket=bucket, counted=[(c.get("id"), c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
+        self.acknowledge(f"thread {thread}", rec, bucket)
+        if not self.dry:
+            rec["cursor"] = cursor
+            state[key] = rec
+            self.save_json("threads.json", state)
+
+    def record_unmonitored(self, kind, rtype, rid, who, at=None, rec=None, on=None, bucket=None, ref=None):
+        """Record owner input no behavior handles as an `unmonitored` record, once per kind of thing.
+
+        The key is "<kind>/<recording type>", in the event feed's words so keys recorded
+        before notifications replaced it still apply: `kind` is what happened
+        (comment.created, chat.line.created, boost.created, todo.assignment_changed,
+        todo.completed) and the type is, for a comment, the type of what it is on, e.g.
+        "comment.created/Document". unmonitored.json keeps each key with the first
+        notification (or boost) recorded, how many were seen and, once the agent marks it
+        handled, the decision; a key already there is only counted, so the owner is asked
+        once. `rtype` None means recording `rid`'s own type, refetched; otherwise the
+        recording (or `rec`, already fetched) is read only for a new key, for its title,
+        excerpt and link, and a failed read still records what is known. `who` is the
+        person, `on` the parent a comment is on, `bucket` where `rid` is (default the
+        project) and `ref` the notification or boost id. A dry run records and saves
+        nothing. Returns the key when recorded.
+        """
         state = self.load("unmonitored.json", {})
         if rtype is None or f"{kind}/{rtype}" not in state:
             if rec is None:
+                errors = self.errors
                 try:
-                    rec = self.recording(rid)
+                    rec = self.recording(rid, bucket)
                 except RuntimeError as e:
                     self.log(f"unmonitored: recording {rid}: {e}")
-                    rec = {}
+                    rec, self.errors = {}, errors  # recorded anyway, so the caller has nothing to retry
             rtype = rtype or recording_type(rec.get("type")) or "unknown"
         key = f"{kind}/{rtype}"
         if key in state:
@@ -986,85 +1106,20 @@ class Tools:
                 self.save_json("unmonitored.json", state)
             return None
         if self.dry:
-            self.log(f"dry unmonitored: {key} (event {ev.get('id')})")
+            self.log(f"dry unmonitored: {key} ({ref})")
             return None
         title = (on or {}).get("title") or rec.get("title") or rec.get("subject")
-        texts = (re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", rec.get(f) or ""))).strip()
-                 for f in ("content", "description"))  # a to-do's content is its name; its notes are the description
+        texts = (plain(rec.get(f)) for f in ("content", "description"))  # a to-do's content is its name; its notes are the description
         text = next((x for x in texts if x and x != title), "")
-        creator = rec.get("creator") or {}
+        who = {"id": (who or {}).get("id"), "name": (who or {}).get("name") or (rec.get("creator") or {}).get("name")}
         self.record({"kind": "unmonitored", "key": key, "event_type": kind, "recording_type": rtype,
-                     "event": ev.get("id"), "recording": rid, "title": title,
-                     "text": text[:300] + ("..." if len(text) > 300 else ""),
-                     "creator": {"id": ev.get("creator_id"), "name": creator.get("name")},
-                     **self.author({"id": ev.get("creator_id"), "name": creator.get("name")}),
-                     "url": rec.get("app_url") or (on or {}).get("app_url"), "at": ev.get("created_at")})
-        state[key] = {"event": ev.get("id"), "recording": rid, "recorded_at": now_iso(), "seen": 1}
+                     "notification": ref, "recording": rid, "title": title,
+                     "text": text[:300] + ("..." if len(text) > 300 else ""), "creator": who, **self.author(who),
+                     "url": rec.get("app_url") or (on or {}).get("app_url"), "at": at})
+        state[key] = {"notification": ref, "recording": rid, "recorded_at": now_iso(), "seen": 1}
         self.save_json("unmonitored.json", state)
-        self.log(f"unmonitored owner event: {key} (event {ev.get('id')})")
+        self.log(f"unmonitored owner input: {key} ({ref})")
         return key
-
-    def read_feed(self, types, creators, on_page, max_pages=20, every_bucket=False, store="feed.json"):
-        """Hand each page of the account event feed, filtered to this project, `types` and `creators`, to `on_page`.
-
-        Empty `types` means every type in the feed's catalog, new ones included.
-        `every_bucket` drops the project filter (Pings live in buckets of their own), and
-        `store` names the state file, so each filter set keeps its own position.
-
-        An event is a thin pointer (id, event_type, bucket_id, creator_id,
-        recording_id, details), never content: it only says which reader to run.
-        The state file keeps the position, the last event id handed over and the filters
-        they belong to. The first poll enters at the present (since=now), so history is
-        not replayed. A page's position is saved only after `on_page` returns, so a
-        failure re-reads that page next time; events at or below the last id are
-        dropped. `next` is followed up to `max_pages` pages.
-
-        Re-entry when Basecamp refuses where the poll starts: a position from before
-        the feed's epoch (410) re-enters at the epoch (since=0); one bound to other
-        filters (409) or unrecognized (400) re-enters after the last event handed over
-        (since=<id>), else at the present. Changed filters re-enter the same way without
-        waiting for the 409. The CLI passes on neither the HTTP status nor the body's
-        `reason`, so the error text tells them apart; an invalid filter is never retried.
-        A dry run hands pages over but saves nothing. Returns the number of events handed over.
-        """
-        filters = {"types": ",".join(sorted(types))} if types else {}
-        if not every_bucket:
-            filters["buckets"] = self.project
-        if creators:
-            filters["creators"] = ",".join(str(c) for c in sorted(creators))
-        key = urlencode(filters, safe=",", quote_via=quote)
-        state = self.load(store, {})
-        last = state.get("last_event") or 0
-        if state.get("filters") == key and state.get("position"):
-            start = {"position": state["position"]}
-        else:
-            start = {"since": last if last and state.get("filters") else "now"}
-            self.log(f"feed: entering with since={start['since']}" + (" (filters changed)" if state.get("filters") else ""))
-        handed, reentries = 0, 0
-        for _ in range(max_pages):
-            try:
-                page = self.bc("api", "get", "/events.json?" + urlencode({**filters, **start}, safe=",", quote_via=quote)) or {}
-            except BasecampError as e:
-                again = feed_reentry(e.error, start, last)
-                if again is None or reentries == 2:
-                    raise
-                reentries += 1
-                self.log(f"feed: {e.error.strip()} Re-entering with since={again['since']}.")
-                start = again
-                continue
-            events = sorted((ev for ev in page.get("events") or [] if (ev.get("id") or 0) > last), key=lambda ev: ev["id"])
-            if events:
-                on_page(events)
-                handed += len(events)
-                last = events[-1]["id"]
-            if not page.get("position"):
-                raise RuntimeError("feed: a page without a position")
-            start = {"position": page["position"]}
-            if not self.dry:
-                self.save_json(store, {"filters": key, "position": page["position"], "last_event": last})
-            if not page.get("next"):
-                break
-        return handed
 
     # --- commands: explicit posts, run by the agent ---
 
@@ -1072,8 +1127,8 @@ class Tools:
         """Answer the captain's comment or line `rid` where it was made, then take the acting user's 👀 off it.
 
         A card comment is answered with a comment on that card, a chat or Ping line with
-        a new line in that chat or Ping, and a to-do or message comment with a comment on that to-do
-        or message (as Markdown, rendered by the CLI). Run only by the relaying agent; the sync
+        a new line in that chat or Ping, and a to-do, message or followed thread's comment (or
+        mention) with a comment on that to-do, message or thread (as Markdown, rendered by the CLI). Run only by the relaying agent; the sync
         itself never posts comments. A reply is recorded in the "replied" list and a
         second one is refused unless `again`. A failed post removes nothing, so the
         👀 stays.
@@ -1093,6 +1148,10 @@ class Tools:
             post = next((k for k, r in self.load("messages.json", {}).get("posts", {}).items() if rid in r.get("comments", [])), None)
         if post is not None:
             return self.reply_message(post, rid, text, again)
+        thread = None if chat is not None else next(
+            (k for k, r in self.load("threads.json", {}).items() if rid in r.get("comments", [])), None)
+        if thread is not None:
+            return self.reply_thread(thread, rid, text, again)
         if chat is not None:
             store, rec = ("chats.json", chats), chats[chat]
             target = f"/buckets/{self.project}/chats/{chat}/lines.json"
@@ -1100,8 +1159,8 @@ class Tools:
             cards = self.load("map.json", {})
             rec = next((r for r in cards.values() if rid in r.get("comments", [])), None)
             if rec is None:
-                raise RuntimeError(f"no card in map.json, chat in chats.json, Ping in pings.json, to-do in todos.json "
-                                   f"or message in messages.json has {rid}")
+                raise RuntimeError(f"no card in map.json, chat in chats.json, Ping in pings.json, to-do in todos.json, "
+                                   f"message in messages.json or thread in threads.json has {rid}")
             store = ("map.json", cards)
             target = f"/buckets/{self.project}/recordings/{rec['card']}/comments.json"
         where = f"chat {chat}" if chat is not None else f"card {rec['card']}"
@@ -1182,6 +1241,26 @@ class Tools:
             self.save_json("messages.json", state)
         self.log(f"reply {rid}: posted on message {mid}")
         self.remove_eyes(rid)
+        return True
+
+    def reply_thread(self, key, rid, text, again):
+        """Answer the owner's comment `rid` on thread `key` (threads.json) with a comment (Markdown) there, in its bucket."""
+        rec = self.load("threads.json", {})[key]
+        if rid in rec.get("replied", []) and not again:
+            self.log(f"reply {rid}: already replied, pass --again to post another")
+            return False
+        if self.refused(f"reply {rid}"):
+            return False
+        where = f"{rec.get('parent_type') or 'thread'} {rec['thread']}"
+        if self.dry:
+            self.log(f"dry reply {rid}: comment on {where}, then remove {EYES}")
+            return False
+        self.bc("comments", "create", str(rec["thread"]), "-", input=text, project=rec.get("bucket"))
+        state = self.load("threads.json", {})
+        state[key].setdefault("replied", []).append(rid)
+        self.save_json("threads.json", state)
+        self.log(f"reply {rid}: posted on {where}")
+        self.remove_eyes(rid, rec.get("bucket"))
         return True
 
     def remove_eyes(self, rid, bucket=None):
@@ -1432,6 +1511,33 @@ def recording_type(t):
     return "Chat::Lines" if (t or "").startswith("Chat::Lines") else t
 
 
+# The thread a notification's app_url names, by its path under /buckets/<id>/, as a recording type.
+THREADS = {"todos": "Todo", "messages": "Message", "cards": "Kanban::Card", "documents": "Document",
+           "uploads": "Upload", "question_answers": "Question::Answer", "questions": "Question",
+           "schedule_entries": "Schedule::Entry", "chats": "Chat::Transcript"}
+
+
+def parse_reading(r):
+    """Where a notification (an item of /my/readings.json) points: {"bucket", "thread", "anchor", "path"}.
+
+    The bucket and the thread (the commented recording, the chat, the to-do) come from its
+    subscription_url, the anchor (the first unread comment, the mentioning line, the
+    to-do) from readable_identifier (base64 of gid://bc3/Recording/<id>), and the path
+    (todos, messages, cards, chats, ... or the Ping's circles) from app_url. Any part it
+    lacks is None.
+    """
+    m = re.search(r"/buckets/(\d+)/recordings/(\d+)/", r.get("subscription_url") or "")
+    ident = r.get("readable_identifier") or ""
+    try:
+        gid = base64.b64decode(ident + "=" * (-len(ident) % 4)).decode()
+    except (ValueError, UnicodeDecodeError):
+        gid = ""
+    a = re.fullmatch(r"gid://bc3/Recording/(\d+)", gid)
+    p = re.search(r"basecamp\.com/\d+/(?:buckets/\d+/(?:card_tables/)?)?([a-z_]+)", r.get("app_url") or "")
+    return {"bucket": m.group(1) if m else None, "thread": int(m.group(2)) if m else None,
+            "anchor": int(a.group(1)) if a else None, "path": p.group(1) if p else None}
+
+
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1457,24 +1563,6 @@ def is_due(q, now):
     if end and end < now.strftime("%Y-%m-%d"):
         return False
     return (now.hour, now.minute) >= (int(sch.get("hour", 0)), int(sch.get("minute", 0)))
-
-
-def feed_reentry(error, start, last):
-    """Where to re-enter the event feed after Basecamp refused `start` with `error`, or None to fail.
-
-    The texts are Basecamp's: 410 "predates this feed's epoch", 409 "bound to the filter
-    set", 400 "Unrecognized position"; an invalid filter says "Fix the filters".
-    """
-    text = (error or "").lower()
-    if "fix the filters" in text:
-        return None
-    if "epoch" in text:
-        return None if start.get("since") == 0 else {"since": 0}
-    if "position" in text and "since" not in start:
-        return {"since": last or "now"}
-    if "position" in text and start.get("since") not in ("now", 0):
-        return {"since": "now"}
-    return None
 
 
 def render_reply(text):

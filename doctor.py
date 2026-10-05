@@ -3,8 +3,9 @@
 Checks, in order: Python, the basecamp CLI and its version, systemd user services, the
 firstmate home, the config, the Basecamp sign-in (every call under a timeout and the
 file credential store, so a locked system keyring cannot hang it), the project and the
-dock tools the config uses, each mirrored card table and its columns, the background
-services, the last sync, and the wake check; across the homes checked, that only one per
+dock tools the config uses, each mirrored card table and its columns, the agent's
+notifications (readable, and under Basecamp's 100 unread), the background timer (and
+that the retired event listener is gone), the last sync, and the wake check; across the homes checked, that only one per
 Basecamp login takes to-do requests account-wide. A check whose prerequisite failed is
 skipped. Each problem is printed with the exact fix; the exit status is 1 when anything
 is broken, 0 otherwise.
@@ -21,7 +22,8 @@ from init_home import CHECK, CHECK_ID, CHECK_INBOX, unit_name
 from setup_home import Basecamp, INSTALL_CLI, default_home
 
 MIN_BASECAMP = (0, 11, 0)
-STALE_MINUTES = 20  # the timer runs every 5 minutes; this many without a log line means it is not running
+STALE_MINUTES = 20  # the timer logs at least every 5 minutes (the card mirror's slot); this many without a line: not running
+UNREAD_CAP = 100  # Basecamp lists at most this many unread notifications
 SETUP = "basecamp-mate setup"
 
 
@@ -216,11 +218,31 @@ class Doctor:
             if not (missing or renamed):
                 self.ok(f"card table {board!r} and its columns")
 
+    def notifications(self, bc, cfg):
+        """The agent's own notifications, which the sync reads every run: readable, and not at Basecamp's unread cap."""
+        if not cfg.get("profile") or cfg.get("notifications") is False:
+            self.skip("the agent's notifications are not read (no separate agent sign-in, or turned off); "
+                      "your messages are read every 5 minutes instead")
+            return
+        out = bc.call("api", "get", "/my/readings.json")
+        if not out.get("ok"):
+            self.bad(f"The agent's Basecamp notifications cannot be read: {out.get('error')}",
+                     "Fix: check the internet connection; if it keeps failing, run  " + SETUP + "  and sign in again.")
+            return
+        unread = len((out.get("data") or {}).get("unreads") or [])
+        if unread >= UNREAD_CAP:
+            self.bad(f"The agent has {unread} unread Basecamp notifications, Basecamp's limit, so new ones can be missed.",
+                     "Fix: sign in to Basecamp as the agent and mark old notifications read (the bell, then \"Mark all read\"),\n"
+                     "     or remove the agent from projects it does not work in.")
+        else:
+            self.ok(f"the agent's Basecamp notifications ({unread} unread)")
+
     def services(self, home, config, cfg):
         name = unit_name(home)
-        units = [(f"{name}.timer", "the 5-minute sync timer", f"{name}.service")]
-        if cfg.get("listen") not in (None, False):
-            units.append((f"{name}-listen.service", "the event listener", f"{name}-listen.service"))
+        units = [(f"{name}.timer", "the sync timer (every 30 seconds)", f"{name}.service")]
+        if os.path.exists(os.path.join(self.system.unit_dir, f"{name}-listen.service")):
+            self.bad("The old event listener is still installed; notifications on the sync timer replaced it.",
+                     f"Fix: run  {SETUP}  again (or sync.py init with the same options); it removes the listener.")
         for unit, what, svc in units:
             path = os.path.join(self.system.unit_dir, unit)
             if not os.path.exists(path):
@@ -246,7 +268,7 @@ class Doctor:
         lines = [ln.strip() for ln in open(log)] if os.path.exists(log) else []
         lines = [ln for ln in lines if ln]
         if not lines:
-            self.bad("The sync has not run yet.", "Fix: wait five minutes, or run  " + SETUP + "  again for a test sync.")
+            self.bad("The sync has not run yet.", "Fix: wait a minute, or run  " + SETUP + "  again for a test sync.")
             return
         last = lines[-1]
         when = None
@@ -257,7 +279,7 @@ class Doctor:
             self.bad(f"The last sync failed: {last}", self.failure_fix(last))
         elif when and self.now() - when > STALE_MINUTES * 60:
             self.bad(f"The sync has not run for {int((self.now() - when) // 60)} minutes.",
-                     "Fix: check the sync timer above; it should run every 5 minutes.")
+                     "Fix: check the sync timer above; it should run every 30 seconds.")
         else:
             self.ok("the last sync worked")
 
@@ -306,6 +328,7 @@ class Doctor:
             bc = self.login(cfg) if cli_ok else None
             if bc and self.project(bc, cfg):
                 self.card_tables(bc, cfg)
+                self.notifications(bc, cfg)
             elif cli_ok:
                 self.skip("skipped the project and card table checks until the problems above are fixed")
             if sd_ok:

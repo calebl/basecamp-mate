@@ -1,6 +1,6 @@
 """Tests for the assigned-todos behavior: to-dos the listened-to people assign to the agent's login, as requests.
 
-/my/assignments.json, the to-dos, their comments and boosts and the event feed are stubbed; nothing touches the network.
+/my/assignments.json, the to-dos, their comments and boosts and the notifications are stubbed; nothing touches the network.
 """
 import json, os, sys, unittest
 from types import SimpleNamespace
@@ -8,7 +8,7 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_sync import ACTING, CAPTAIN  # noqa: E402
 from test_tools import boost, comment  # noqa: E402
-from test_listen import FeedStub, ListenBase, PROJECT, event  # noqa: E402
+from test_notifications import NotifStub, NotifBase, PROJECT, note  # noqa: E402
 import behaviors  # noqa: E402
 import sync  # noqa: E402
 
@@ -24,7 +24,7 @@ def todo(id, by=CAPTAIN, to=(ACTING,), title="Rotate the API keys", description=
             "updated_at": "2026-10-04T12:00:00Z", "bucket": {"id": bucket, "name": f"Project {bucket}", "type": "Project"}}
 
 
-class AssignStub(FeedStub):
+class AssignStub(NotifStub):
     """Adds /my/assignments.json, answered from the stubbed to-dos open and assigned to the acting user, and keeps the
     project (-p) each call ran on."""
 
@@ -58,7 +58,7 @@ class AssignStub(FeedStub):
         return [p for c, p in self.on if c[:2] == verb.split()]
 
 
-class AssignBase(ListenBase):
+class AssignBase(NotifBase):
     def setUp(self):
         super().setUp()
         self.stub = AssignStub()
@@ -210,75 +210,54 @@ class Sweep(AssignBase):
                 self.sync()
 
 
-class Listener(AssignBase):
+class Notifications(AssignBase):
     def setUp(self):
         super().setUp()
         self.cfg(inbox={})
         self.poll()
         self.stub.calls.clear()
 
-    def test_the_captain_assigning_a_todo_is_a_request_in_the_same_cycle(self):
+    def notify(self, *items):
+        self.stub.readings = {"unreads": list(items), "reads": []}
+        self.sync().behaviors["notifications"].run()
+
+    def test_the_captain_assigning_a_todo_is_a_request_in_the_same_run(self):
         self.add(todo(42, by=STRANGER))  # created by someone else, assigned by the captain
-        self.stub.page(event(10, kind="todo.assignment_changed", rid=42))
-        self.listen()
+        self.notify(note(10, "Assignment", thread=42, title="Assigned you: Rotate the API keys"))
         [rec] = self.pending()
         self.assertEqual((rec["kind"], rec["author"]["id"], rec["captain"]), ("todo-request", CAPTAIN, True))
         self.assertEqual([n[0] for n in self.stub.notes], ["basecamp-todo-request-42-1"])
         self.assertEqual(self.stub.posted(), [("42", EYES)])
+        self.assertEqual(self.stub.marked, [["10"]])
 
-    def test_edit_and_completion_events_are_recorded_with_who_did_them(self):
+    def test_its_comments_and_completion_are_recorded_with_who_did_them(self):
         self.add(todo(42))
-        self.stub.page(event(10, kind="todo.created", rid=42))
-        self.listen()
-        self.edit(42, description="<div>Prod only.</div>")
-        self.stub.page(event(11, kind="todo.description_changed", rid=42))
-        self.listen()
+        self.notify(note(10, "Assignment", thread=42))
+        self.stub.comments["42"] = [comment(5)]
+        self.notify(note(10, "Assignment", thread=42), note(11, thread=42, anchor=5))
         self.edit(42, completed=True)
-        self.stub.page(event(12, kind="todo.completed", rid=42))
-        self.listen()
+        self.notify(note(10, "Assignment", thread=42), note(11, thread=42, anchor=5), note(12, "Completion", thread=42))
         self.assertEqual([(r["kind"], (r["author"] or {}).get("id")) for r in self.pending()],
-                         [("todo-request", CAPTAIN), ("todo-request-update", CAPTAIN), ("todo-request-closed", CAPTAIN)])
+                         [("todo-request", CAPTAIN), ("todo-comment", CAPTAIN), ("todo-request-closed", CAPTAIN)])
         self.assertEqual(len(self.stub.notes), 3)
 
-    def test_a_comment_on_a_request_runs_its_reader(self):
-        self.add(todo(42))
-        self.poll()
-        self.stub.comments["42"] = [comment(5)]
-        self.stub.parents[5] = {"type": "Todo", "id": 42}
-        self.stub.page(event(10, kind="comment.created", rid=5))
-        self.listen()
-        self.assertEqual([r["kind"] for r in self.pending()], ["todo-request", "todo-comment"])
-
-    def test_a_todo_assigned_to_someone_else_is_ignored_not_unmonitored(self):
+    def test_a_completion_of_a_todo_assigned_to_someone_else_is_ignored_not_unmonitored(self):
         self.add(todo(42, to=(CAPTAIN,)))
-        self.stub.parents[5] = {"type": "Todo", "id": 42}
-        self.stub.recordings[6] = {"type": "Todo"}
-        self.stub.recordings[7] = {"type": "Comment", "parent": {"type": "Todo", "id": 42}}
-        self.stub.page(event(10, kind="todo.created", rid=42), event(11, kind="todo.completed", rid=42),
-                       event(12, kind="comment.created", rid=5), event(13, kind="boost.created", rid=6),
-                       event(14, kind="boost.created", rid=7))
-        self.listen()
+        self.notify(note(10, "Completion", thread=42), note(11, "Assignment", thread=43, who=STRANGER))
         self.assertEqual(self.pending(), [])
         self.assertFalse(os.path.exists(os.path.join(self.cfgdir, "unmonitored.json")))
+        self.assertEqual(self.stub.marked, [["10", "11"]])
 
-    def test_off_they_stay_unmonitored(self):
+    def test_off_an_assignment_is_unmonitored(self):
         self.cfg(assigned_todos=False)
         self.add(todo(42))
-        self.stub.page(event(10, kind="todo.created", rid=42))
-        self.stub.recordings[42] = {"type": "Todo", "title": "Rotate the API keys"}
-        self.listen()
-        self.assertEqual([(r["kind"], r["key"]) for r in self.pending()], [("unmonitored", "todo.created/Todo")])
+        self.notify(note(10, "Assignment", thread=42, title="Assigned you: Rotate the API keys"))
+        self.assertEqual([(r["kind"], r["key"]) for r in self.pending()], [("unmonitored", "todo.assignment_changed/Todo")])
 
-    def test_the_narrow_feed_adds_the_todo_events(self):
-        self.cfg(listen={"unmonitored": False})
-        self.listen()
-        self.assertEqual(self.stub.queries[-1]["types"], "boost.created,chat.line.created,comment.created,"
-                         "todo.assignment_changed,todo.completed,todo.created,todo.description_changed")
-
-    def test_project_scope_polls_only_the_project(self):
-        self.listen()
-        self.assertEqual([q.get("buckets") for q in self.stub.queries], [str(PROJECT)])
-        self.assertFalse(os.path.exists(os.path.join(self.cfgdir, "requests-feed.json")))
+    def test_project_scope_leaves_other_projects_assignments_alone(self):
+        self.add(todo(42, bucket=OTHER))
+        self.notify(note(10, "Assignment", thread=42, bucket=OTHER))
+        self.assertEqual((self.pending(), self.stub.marked, self.stub.fetched(42, OTHER)), ([], [], 0))
 
 
 class AccountWide(AssignBase):
@@ -336,65 +315,44 @@ class AccountWide(AssignBase):
         self.assertEqual((self.pending(), self.stub.fetched(42, OTHER)), ([], 0))
 
 
-class AccountWideListener(AssignBase):
+class AccountWideNotifications(AssignBase):
     def setUp(self):
         super().setUp()
         self.cfg(assigned_todos={"scope": "account"}, inbox={})
         self.poll()
         self.stub.calls.clear()
 
-    def other(self, *events):
-        """Queue an empty page for the project's poll, then `events` for the account-wide request poll."""
-        self.stub.page()
-        self.stub.page(*events)
+    def notify(self, *items):
+        self.stub.readings = {"unreads": list(items), "reads": []}
+        self.sync().behaviors["notifications"].run()
 
-    def test_a_second_poll_reads_every_bucket_with_its_own_position(self):
-        self.listen()
-        main, requests = self.stub.queries
-        self.assertEqual(main.get("buckets"), str(PROJECT))
-        self.assertNotIn("buckets", requests)
-        self.assertEqual(requests["types"], "boost.created,comment.created,todo.assignment_changed,todo.completed,"
-                         "todo.created,todo.description_changed")
-        self.assertTrue(os.path.exists(os.path.join(self.cfgdir, "requests-feed.json")))
-
-    def test_a_todo_assigned_in_another_project_is_a_request_in_the_same_cycle(self):
+    def test_a_todo_assigned_in_another_project_is_a_request_in_the_same_run(self):
         self.add(todo(42, by=STRANGER, bucket=OTHER))
-        self.other(event(10, kind="todo.assignment_changed", rid=42, bucket=OTHER))
-        self.listen()
+        self.notify(note(10, "Assignment", thread=42, bucket=OTHER))
         [rec] = self.pending()
         self.assertEqual((rec["kind"], rec["author"]["id"], rec["project"]["id"]), ("todo-request", CAPTAIN, OTHER))
         [(rid, body, _, _)] = self.stub.notes
         self.assertEqual(rid, "basecamp-todo-request-42-1")
         self.assertIn(f"in project 'Project {OTHER}' ({OTHER})", body)
         self.assertIn("route the work", body)
+        self.assertEqual(self.stub.marked, [["10"]])
 
-    def test_comments_boosts_and_closing_on_it_follow_it(self):
+    def test_comments_and_closing_on_it_follow_it(self):
         self.add(todo(42, bucket=OTHER))
-        self.other(event(10, kind="todo.created", rid=42, bucket=OTHER))
-        self.listen()
+        self.notify(note(10, "Assignment", thread=42, bucket=OTHER))
         self.stub.comments["42"] = [comment(5)]
-        self.stub.parents[5] = {"type": "Todo", "id": 42}
-        self.other(event(11, kind="comment.created", rid=5, bucket=OTHER))
-        self.listen()
-        self.stub.boosts["42"] = [boost(8)]
-        self.other(event(12, kind="boost.created", rid=42, bucket=OTHER))
-        self.listen()
+        self.notify(note(11, thread=42, anchor=5, bucket=OTHER))
         self.edit(42, completed=True)
-        self.other(event(13, kind="todo.completed", rid=42, bucket=OTHER))
-        self.listen()
-        self.assertEqual([r["kind"] for r in self.pending()], ["todo-request", "todo-comment", "boost", "todo-request-closed"])
-        self.assertIn(f"/buckets/{OTHER}/comments/5.json", self.stub.paths())
-        self.assertEqual(len(self.stub.notes), 4)
+        self.notify(note(12, "Completion", thread=42, bucket=OTHER))
+        self.assertEqual([r["kind"] for r in self.pending()], ["todo-request", "todo-comment", "todo-request-closed"])
+        self.assertEqual(set(self.stub.projects("comments list")), {str(OTHER)})
+        self.assertEqual(len(self.stub.notes), 3)
 
-    def test_other_projects_events_on_untracked_todos_read_nothing(self):
+    def test_other_projects_items_on_untracked_todos_read_nothing(self):
         self.add(todo(42, to=(CAPTAIN,), bucket=OTHER))
-        self.other(event(10, kind="todo.created", rid=42, bucket=OTHER), event(11, kind="comment.created", rid=5, bucket=OTHER),
-                   event(12, kind="boost.created", rid=6, bucket=OTHER), event(13, kind="todo.created", rid=42, who=STRANGER,
-                                                                          bucket=OTHER))
-        self.listen()
-        self.assertEqual(self.pending(), [])
-        self.assertNotIn(f"/buckets/{OTHER}/comments/5.json", self.stub.paths())
-        self.assertEqual(self.stub.fetched(42, OTHER), 1)
+        self.notify(note(11, thread=42, anchor=5, bucket=OTHER), note(12, "Mention", thread=42, anchor=6, bucket=OTHER))
+        self.assertEqual((self.pending(), self.stub.marked), ([], []))
+        self.assertEqual(self.stub.projects("comments list"), [])
 
 
 class Note(unittest.TestCase):

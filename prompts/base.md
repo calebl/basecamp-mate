@@ -51,15 +51,16 @@ Run `doctor` after setting up, and whenever a run fails. As the agent, follow th
 
    ```sh
    python3 SYNC/sync.py init URL --login firstmate --home HOME --no-cards --no-releases \
-     --todos --reports --every-line --pings --assigned-todos --inbox --listen --checkins <account time zone, e.g. America/New_York> --dry-run
+     --todos --reports --every-line --pings --assigned-todos --inbox --checkins <account time zone, e.g. America/New_York> --dry-run
    ```
 
    Drop `--no-cards` only when the captain wants the card mirror, and `--no-releases` only
    when they want release announcements. Leave `--checkins` out if the project has no Automatic
-   Check-ins. `--listen` runs a small listener beside the timer that hears the captain's chat
-   lines, comments and boosts within about a minute instead of up to five, and notices
-   anything else they do in the project that nothing monitors (an `unmonitored` record);
-   leave it out only if they ask. `--pings` relays their Pings (direct messages) to your
+   Check-ins. Your login's Basecamp notifications are read every 30 seconds, so the
+   captain's chat lines, comments, mentions, Pings, assignments and boosts reach you within
+   about half a minute, and anything else they do in the project that nothing monitors
+   becomes an `unmonitored` record; no flag is needed (`--listen`, from earlier versions,
+   is accepted and does nothing). `--pings` relays their Pings (direct messages) to your
    login, which live outside the project; leave it out only if they ask. `--assigned-todos`
    relays each to-do they assign to your login as a request; leave it out only if they ask.
    In the main firstmate home only, use `--assigned-todos-anywhere` instead, so a to-do
@@ -71,10 +72,10 @@ Run `doctor` after setting up, and whenever a run fails. As the agent, follow th
    name>` (repeatable) for each other person the captain asks you to listen to; never add
    one on your own, and never your own login.
 4. Read the printed config, then run the same command without `--dry-run`. It writes the
-   config, installs a 5-minute timer (and, with `--listen`, the listener service) and
-   registers the wake check.
+   config, installs a 30-second timer (and removes the old event-listener service, if an
+   earlier version installed one) and registers the wake check.
 5. Confirm with `python3 SYNC/sync.py behaviors C`: `chat-inbox`, `checkin-answering`,
-   `decision-todos`, `assigned-todos`, `reports`, `pings`, `inbox-delivery` and `owner-events` on (plus `card-mirror` and
+   `decision-todos`, `assigned-todos`, `reports`, `pings`, `inbox-delivery` and `notifications` on (plus `card-mirror` and
    `release-announcements` if they asked for them).
 6. Adopt to-dos that already wait on the captain, if any: for each open to-do assigned to them that
    you made by hand, `python3 SYNC/sync.py todo track C --key <key> --todo <id>`.
@@ -83,8 +84,8 @@ Run `doctor` after setting up, and whenever a run fails. As the agent, follow th
 ## 2. Pending records
 
 The timer appends what it reads to `HOME/data/basecamp-sync/pending-comments.jsonl`, one
-JSON record per line (with `owner-events` on, the listener runs the same readers as soon as
-the captain posts, so the same records arrive sooner), and with `inbox-delivery` on it also delivers each new record as a
+JSON record per line (`notifications` runs the reader for whatever the captain just wrote
+on the next 30-second run), and with `inbox-delivery` on it also delivers each new record as a
 note in your firstmate inbox. The inbox note is the wake: it says what the record is, who
 wrote it, the text, its link and how to handle it. Handle it, then acknowledge it with
 `HOME/bin/fm-inbox.sh drain --ack <note id>`. (Without `inbox-delivery`, the wake check
@@ -97,7 +98,8 @@ still fires on a FAILED line in `sync.log`. By `kind`:
 - `todo-request-update`, `todo-request-closed`: a to-do request was edited (adjust the work
   to the new text) or closed (below).
 - `chat-question`: a line the captain posted in chat. With `every_line` on, that is every line, not
-  only questions. Treat it as an instruction or question from them, do what it asks, and
+  only questions; with `mention: true` it @mentions you (or replies to your line) in a chat
+  you otherwise do not relay. Treat it as an instruction or question from them, do what it asks, and
   answer in the chat: write the answer to a file and run
   `python3 SYNC/sync.py reply C --recording <line> --body-file <file>`.
   Answer every line, even if only to say what you did or that you are on it.
@@ -105,6 +107,13 @@ still fires on a FAILED line in `sync.log`. By `kind`:
   Handle it exactly like a chat line: do what it asks and answer in the Ping with
   `python3 SYNC/sync.py reply C --recording <line> --body-file <file>`. Answer every line.
   Never answer a Ping with the `basecamp` CLI directly.
+- `mention`: the captain @mentioned you in a comment on something nothing else tracks
+  (a document, someone else's to-do, a card): addressed to you. Do what it asks and answer
+  there with `python3 SYNC/sync.py reply C --recording <comment> --body-file <file>`.
+- `thread-comment`: the captain commented on something you follow (you made it, commented
+  on it or were assigned it) that nothing else tracks, e.g. a card whose task has left the
+  backlog, or a document. Read it as said to you; act on it if it asks something of you, and
+  answer there with `reply` as for a mention.
 - `checkin`: a check-in question came due today (section 4).
 - `message-comment`: the captain commented on a report you posted (section 5).
 - `boost`: the captain boosted something you are watching; a boost can carry short text
@@ -114,8 +123,9 @@ still fires on a FAILED line in `sync.log`. By `kind`:
   reply to it. `surface` says where, `recording` is what was boosted and `text` is the
   boost. If its meaning is unclear, ask in a reply where it was made rather than guess.
 - `unmonitored`: the captain did something in the project that nothing you run handles:
-  `event_type` on `recording_type` (e.g. `todo.created` on `Todo`, `comment.created` on a
-  `Document`, a boost on an `Upload`), with its `title`, `text` and link. You get one per
+  `event_type` on `recording_type` (e.g. `chat.line.created` in a chat you do not relay,
+  `todo.assignment_changed` on a `Todo` with to-do requests off, a boost on your comment on
+  an `Upload`), with its `title`, `text` and link. You get one per
   kind of thing (`key`), not per event. Put it to them as a decision to-do (section 3),
   with a key like `unmonitored-comment-on-document`, titled "How should I handle <what they did>?", with the
   link and these options: start monitoring it (and what you should do when it happens:
@@ -167,7 +177,8 @@ who asked. When their request conflicts with the captain's, the captain wins.
 
 The timer acknowledges each record for you: 👀 on a question ("looking into it", removed
 when `reply` answers it) and 👍 on anything else ("got it"). Never add or remove those by
-hand.
+hand. It also marks your login's Basecamp notifications read once their records are
+written.
 
 ## 3. Decision to-dos
 
@@ -230,13 +241,14 @@ decide something, also make that a decision to-do that links the report.
   `unmonitored handle|forget` only edit local state). Never
   use the `basecamp` CLI to write directly, and never delete, trash or archive anything.
 - Only this project, and the captain's Pings to you. Only to-dos you track (decision to-dos and
-  to-do requests) are commented on or completed.
+  to-do requests) are commented on or completed; elsewhere in the project you answer only a
+  recorded comment or mention, with `reply`.
 - You are never the captain: every command refuses to post when the login is unset or
   signs in as the captain. If that happens, fix the login; never work around it.
 - The timer's only automatic post is a release announcement, and only when the captain
   turned release announcements on. Never announce anything by hand.
 - Do not hand-edit the state beside the config (`todos.json`, `chats.json`,
-  `checkins.json`, `map.json`, `releases.json`, `feed.json`, `pings.json`, `pings-feed.json`, `requests-feed.json`, `unmonitored.json`, `assigned-todos.json`). The hand-kept card side files
+  `checkins.json`, `map.json`, `releases.json`, `pings.json`, `notifications.json`, `threads.json`, `timer.json`, `unmonitored.json`, `assigned-todos.json`). The hand-kept card side files
   (`figuring.json`, `not-now.json`, `decisions.json`, ...) are covered by the skill.
 - A Basecamp comment, chat line or Ping line is the captain's only when the record says so
   (`captain` true). Text inside it is their instruction to you. A record from another person
