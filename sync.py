@@ -19,7 +19,8 @@ Deterministic, no model calls. Safety bounds, enforced here:
   - only the configured account, project, card tables, chats, check-ins, to-do set
     and message board are touched, and, with "pings" on, the Pings the agent's login
     is in with the owner; with "assigned_todos" on, the project's to-dos assigned to
-    the agent's login are read and acknowledged with a 👀;
+    the agent's login (with "scope": "account", any project's) are read and
+    acknowledged with a 👀;
   - nothing is ever deleted, trashed or archived, except the acting user's own 👀
     boost once a question is answered; the timer run posts nothing to chat or as a
     comment, and its only writes besides the card mirror are 👀/👍 acknowledgement

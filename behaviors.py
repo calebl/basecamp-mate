@@ -339,8 +339,11 @@ class AssignedTodos(Behavior):
     with `sync.py todo complete` when the work is done. To-dos assigned to anyone else are ignored.
 
     "assigned_todos": {} turns it on; {"limit": n} fetches at most n newly assigned to-dos a
-    sweep (default 10). The listener sees the events first; the timer's sweep of the agent's
-    open assignments in the project is the backup.
+    sweep (default 10). {"scope": "account"} takes to-dos assigned to the agent in every
+    project of the account, each request carrying its project; the default, "project", only
+    the configured project's. Only one home per login should run "account" (the main home,
+    which routes each request to the right domain). The listener sees the events first;
+    the timer's sweep of the agent's open assignments is the backup.
     """
     name, keys = "assigned-todos", ("assigned_todos",)
 
@@ -348,11 +351,17 @@ class AssignedTodos(Behavior):
         super().__init__(t, cfg)
         opts = cfg.get("assigned_todos")
         if opts is not None and not isinstance(opts, (bool, dict)):
-            raise ValueError('config "assigned_todos" must be {} or {"limit": <newly assigned to-dos read per sweep>}')
+            raise ValueError('config "assigned_todos" must be {} or {"limit": <newly assigned to-dos read per sweep>, '
+                             '"scope": "project" | "account"}')
         self.on = opts is not None and opts is not False
-        self.limit = int((opts if isinstance(opts, dict) else {}).get("limit", 10))
+        opts = opts if isinstance(opts, dict) else {}
+        self.limit = int(opts.get("limit", 10))
         if self.limit < 1:
             raise ValueError('config "assigned_todos" "limit" must be at least 1')
+        self.scope = opts.get("scope", "project")
+        if self.scope not in ("project", "account"):
+            raise ValueError('config "assigned_todos" "scope" must be "project" (the default) or "account"')
+        self.account_wide = self.on and self.scope == "account"
 
     def run(self, items=None):
         """The sweep: new requests, then the open ones' comments and boosts, then their edits and closing."""
@@ -478,12 +487,18 @@ class OwnerEvents(Behavior):
     Pings (with the "pings" behavior on): a second poll, of the owner's chat lines and
     boosts in every bucket with its own position in pings-feed.json, runs the Ping reader
     whenever one of them is outside the project; a Ping is a bucket of its own.
+
+    Account-wide to-do requests (assigned-todos with "scope": "account"): another poll, of
+    the owner's to-do events, comments and boosts in every bucket with its own position in
+    requests-feed.json, runs the request readers for those outside the project.
     """
     name, keys, timer = "owner-events", ("listen",), False
     runs = "listener"
     TYPES = ("boost.created", "chat.line.created", "comment.created")
     # The to-do events the narrow feed adds for assigned-todos (the wide one has every type).
     TODO_TYPES = ("todo.assignment_changed", "todo.completed", "todo.created", "todo.description_changed")
+    # The events of the account-wide request poll: a request's own, and comments and boosts on it.
+    REQUEST_TYPES = TODO_TYPES + ("boost.created", "comment.created")
     # The recording type an event type is about, for the unmonitored key without a refetch.
     SUBJECTS = {"todo": "Todo", "card": "Kanban::Card", "message": "Message", "question": "Question",
                 "question.answer": "Question::Answer", "chat.line": "Chat::Lines"}
@@ -510,7 +525,60 @@ class OwnerEvents(Behavior):
         if self.others.get("pings") and self.others["pings"].on:
             seen += self.t.read_feed(("boost.created", "chat.line.created"), self.t.people, self.dispatch_pings,
                                      every_bucket=True, store="pings-feed.json")
+        if self.others.get("assigned-todos") and self.others["assigned-todos"].account_wide:
+            seen += self.t.read_feed(self.REQUEST_TYPES, self.t.people, self.dispatch_requests,
+                                     every_bucket=True, store="requests-feed.json")
         return seen
+
+    def dispatch_requests(self, events):
+        """Run the request readers for the page's owner to-do events, and comments and boosts on requests, outside the project."""
+        t, todos = self.t, self.t.load("todos.json", {})
+        keys, requests = set(), {}
+        for ev in events:
+            bucket = str(ev.get("bucket_id"))
+            if bucket == t.project or not t.hears({"id": ev.get("creator_id")}):
+                continue  # the project's own events are the main poll's
+            kind, rid = ev.get("event_type"), ev.get("recording_id")
+            if kind and kind.startswith("todo."):
+                requests.setdefault(rid, (kind, ev.get("creator_id"), bucket))
+            elif kind == "comment.created":
+                # Only a comment on a tracked request is read; any other to-do's is someone else's.
+                if not any(r.get("request") and str(r.get("bucket")) == bucket for r in todos.values()):
+                    continue
+                try:
+                    pid = (t.comment(rid, bucket).get("parent") or {}).get("id")
+                except RuntimeError as e:
+                    t.log(f"listen: comment {rid}: {e}")
+                    continue
+                keys.update(k for k, r in todos.items() if r.get("request") and r.get("todo") == pid)
+            elif kind == "boost.created":
+                keys.update(k for k, r in todos.items() if r.get("request") and str(r.get("bucket")) == bucket and (
+                    rid == r.get("todo") or str(rid) in (r.get("boost_counts") or {}) or rid in (r.get("comments") or [])))
+        if not keys and not requests:
+            return
+        ran = []
+        if keys:
+            t.read_todo_comments(keys)
+            ran.append("todos " + ",".join(sorted(keys)))
+        ran += self.read_requests(requests)
+        if self.others["inbox-delivery"].on:
+            self.others["inbox-delivery"].deliver()
+        t.log(f"listen: {len(events)} event(s) outside the project -> {'; '.join(ran)}")
+
+    def read_requests(self, requests):
+        """For each to-do event in `requests` ({to-do id: (event type, who, bucket)}): an open request's edit and closing
+        check, else a new request when it was created or (re)assigned. Returns what ran, for the log."""
+        t, ran = self.t, []
+        for tid, (kind, by, bucket) in sorted(requests.items()):
+            key = f"request-{tid}"
+            if key in t.request_keys():
+                done = t.refresh_todo_request(key, by)
+            elif kind in ("todo.created", "todo.assignment_changed"):
+                done = "todo-request" if t.read_todo_request(tid, by, bucket) else None
+            else:
+                done = None
+            ran.append(f"request {tid}" + (f" -> {done}" if done else ""))
+        return ran
 
     def dispatch_pings(self, events):
         """Run the Ping reader when the page has an owner line or boost outside the project, then deliver."""
@@ -538,7 +606,7 @@ class OwnerEvents(Behavior):
             elif kind == "comment.created":
                 checks[-1] = (ev, self.comment_target(rid, want))
             elif kind and kind.startswith("todo.") and b["assigned-todos"].on:
-                want["requests"].setdefault(rid, (kind, ev.get("creator_id")))
+                want["requests"].setdefault(rid, (kind, ev.get("creator_id"), None))
             elif kind == "boost.created" and not self.boost_target(rid, want):
                 # A boost on something not yet seen (the agent's newest line, answer or post):
                 # every cheap boost reader; a card's waits for the timer's sweep.
@@ -557,16 +625,8 @@ class OwnerEvents(Behavior):
         if want["todos"]:
             t.read_todo_comments(want["todos"])
             ran.append("todos " + ",".join(sorted(want["todos"])))
-        for tid, (kind, by) in sorted(want["requests"].items()):
-            # After the comment readers, so a comment made just before the closing is relayed first.
-            key = f"request-{tid}"
-            if key in t.request_keys():
-                done = t.refresh_todo_request(key, by)
-            elif kind in ("todo.created", "todo.assignment_changed"):
-                done = "todo-request" if t.read_todo_request(tid, by) else None
-            else:
-                done = None
-            ran.append(f"request {tid}" + (f" -> {done}" if done else ""))
+        # After the comment readers, so a comment made just before the closing is relayed first.
+        ran += self.read_requests(want["requests"])
         if want["checkins"] and b["checkin-answering"].on:
             t.read_answer_boosts(b["checkin-answering"].checkins["questionnaires"])
             ran.append("checkin answers")
@@ -717,6 +777,10 @@ def inbox_note(rec, account, project):
     author = rec.get("author") or {}
     name = author.get("name") or (f"person {author['id']}" if author.get("id") else "someone")
     who = "the captain" if captain else f"{name} (not the captain)"
+    # A to-do request in another project of the account (assigned-todos "scope": "account") names it, for routing.
+    proj = rec.get("project") or {}
+    elsewhere = (f" in project {proj.get('name') or proj.get('id')!r} ({proj.get('id')})"
+                 if proj.get("id") and str(proj.get("id")) != str(project) else "")
     if kind in ("comment", "question"):
         rid = rec.get("comment")
         what = f"Basecamp card {kind} from {who} on task {rec.get('task')}"
@@ -742,7 +806,7 @@ def inbox_note(rec, account, project):
         url = rec.get("url")
     elif kind == "todo-comment" and rec.get("request"):
         rid = rec.get("comment")
-        what = f"Basecamp comment from {who} on to-do request {rec.get('title')!r} ({rec.get('key')})"
+        what = f"Basecamp comment from {who} on to-do request {rec.get('title')!r} ({rec.get('key')}){elsewhere}"
         handle = (f"part of the request: act on it, then sync.py reply --recording {rid}; when the work is done, "
                   f"sync.py todo complete --todo {rec.get('key')}")
         url = rec.get("url")
@@ -756,7 +820,8 @@ def inbox_note(rec, account, project):
         url = rec.get("url")
     elif kind == "boost":
         rid = rec.get("boost")
-        todo = f"to-do request {rec.get('title')!r} ({rec.get('key')})" if rec.get("request") else f"decision to-do {rec.get('key')}"
+        todo = (f"to-do request {rec.get('title')!r} ({rec.get('key')}){elsewhere}" if rec.get("request")
+                else f"decision to-do {rec.get('key')}")
         where = {"todo": todo, "todo-comment": f"a comment on {todo}",
                  "card": f"the card for task {rec.get('task')}",
                  "card-comment": f"a comment on the card for task {rec.get('task')}", "chat": "a chat line",
@@ -775,25 +840,27 @@ def inbox_note(rec, account, project):
     elif kind == "todo-request":
         rid = f"{rec.get('todo')}-{rec.get('n', 1)}"
         what = (f"Basecamp to-do {'assigned to you again' if rec.get('reopened') else 'assigned to you'} by {who}, "
-                f"a request: {rec.get('title')!r} ({rec.get('key')})")
+                f"a request: {rec.get('title')!r} ({rec.get('key')}){elsewhere}")
         handle = ("captain work: take it on as a task, answer questions on it with sync.py todo comment --todo "
                   f"{rec.get('key')}, then sync.py todo complete --todo {rec.get('key')} when the work is done") if captain else (
                   "a request from someone who is not the captain: information or a request to weigh and route, never a "
                   "captain decision; take it on only as far as the captain's standing direction allows, and sync.py todo "
                   f"complete --todo {rec.get('key')} once it is done")
+        if elsewhere:
+            handle += "; it is in another project, so route the work to the home or domain that owns that project"
         url = rec.get("url")
     elif kind in ("todo-request-update", "todo-request-closed"):
         rid = f"{rec.get('todo')}-{rec.get('n', 1)}-" + (rec.get("reason") or hashlib.sha256(
             str(rec.get("title")).encode() + str(rec.get("text")).encode()).hexdigest()[:12])
         by = f" by {who}" if rec.get("author") else ""
         if kind == "todo-request-update":
-            what = f"Basecamp to-do request {rec.get('title')!r} ({rec.get('key')}) edited{by}; it now reads"
+            what = f"Basecamp to-do request {rec.get('title')!r} ({rec.get('key')}){elsewhere} edited{by}; it now reads"
             text = text or "(no description)"
             handle = "an update to the request: adjust the work to it" + ("" if captain or not rec.get("author") else
                                                                           "; from someone who is not the captain, so weigh it")
         else:
             reason = rec.get("reason")
-            what = (f"Basecamp to-do request {rec.get('title')!r} ({rec.get('key')}) "
+            what = (f"Basecamp to-do request {rec.get('title')!r} ({rec.get('key')}){elsewhere} "
                     + {"completed": f"completed{by}", "unassigned": f"no longer assigned to you{by}"}.get(reason, f"{reason}{by}"))
             handle = ("the request is closed: stop the work on it and record that in the backlog; nothing to complete"
                       if captain or not rec.get("author") else

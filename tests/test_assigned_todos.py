@@ -13,26 +13,34 @@ import behaviors  # noqa: E402
 import sync  # noqa: E402
 
 PARTNER, STRANGER = 55555555, 66666666
+OTHER = 44444444  # another project of the account
 EYES = "\U0001F440"
 
 
-def todo(id, by=CAPTAIN, to=(ACTING,), title="Rotate the API keys", description="<div>Both <b>staging</b> and prod.</div>"):
+def todo(id, by=CAPTAIN, to=(ACTING,), title="Rotate the API keys", description="<div>Both <b>staging</b> and prod.</div>",
+         bucket=PROJECT):
     return {"id": id, "content": title, "description": description, "completed": False, "status": "active",
             "creator": {"id": by, "name": f"person-{by}"}, "assignees": [{"id": p, "name": f"person-{p}"} for p in to],
-            "updated_at": "2026-10-04T12:00:00Z"}
+            "updated_at": "2026-10-04T12:00:00Z", "bucket": {"id": bucket, "name": f"Project {bucket}", "type": "Project"}}
 
 
 class AssignStub(FeedStub):
-    """Adds /my/assignments.json, answered from the stubbed to-dos open and assigned to the acting user."""
+    """Adds /my/assignments.json, answered from the stubbed to-dos open and assigned to the acting user, and keeps the
+    project (-p) each call ran on."""
+
+    def __init__(self):
+        super().__init__()
+        self.on = []  # (call, its -p project)
 
     def __call__(self, cmd, **kw):
         if cmd[0] == "basecamp":
             args = cmd[3:-3]
             core = args[2:] if args[:1] == ["-P"] else args
+            self.on.append((core, cmd[-2]))
             if core[:3] == ["api", "get", "/my/assignments.json"]:
                 self.calls.append(core)
                 mine = [{"id": t["id"], "type": "todo", "content": t["content"], "completed": False,
-                         "bucket": {"id": t.get("bucket", PROJECT)}}
+                         "bucket": {"id": t["bucket"]["id"], "name": t["bucket"]["name"]}}
                         for t in self.todo_records.values()
                         if not t.get("completed") and self.me in [a["id"] for a in t.get("assignees", [])]]
                 data = {"priorities": mine[:1], "non_priorities": mine[1:]}
@@ -42,8 +50,12 @@ class AssignStub(FeedStub):
     def paths(self, verb="get"):
         return [c[2] for c in self.calls if c[:2] == ["api", verb]]
 
-    def fetched(self, tid):
-        return self.paths().count(f"/buckets/{PROJECT}/todos/{tid}.json")
+    def fetched(self, tid, bucket=PROJECT):
+        return self.paths().count(f"/buckets/{bucket}/todos/{tid}.json")
+
+    def projects(self, verb):
+        """The -p project of each `verb` call (e.g. "comments list")."""
+        return [p for c, p in self.on if c[:2] == verb.split()]
 
 
 class AssignBase(ListenBase):
@@ -95,7 +107,7 @@ class Sweep(AssignBase):
 
     def test_todos_assigned_to_anyone_else_or_in_other_projects_are_never_read(self):
         self.add(todo(42, to=(CAPTAIN,)))
-        self.add(dict(todo(43), bucket=PROJECT + 1))
+        self.add(todo(43, bucket=OTHER))
         self.poll()
         self.assertEqual(self.pending(), [])
         self.assertEqual((self.stub.fetched(42), self.stub.fetched(43)), (0, 0))
@@ -192,7 +204,7 @@ class Sweep(AssignBase):
         self.assertNotIn("/my/assignments.json", self.stub.paths())
 
     def test_malformed_config_refused(self):
-        for bad in ([], {"limit": 0}):
+        for bad in ([], {"limit": 0}, {"scope": "everywhere"}):
             self.cfg(assigned_todos=bad)
             with self.assertRaises(ValueError):
                 self.sync()
@@ -263,6 +275,127 @@ class Listener(AssignBase):
         self.assertEqual(self.stub.queries[-1]["types"], "boost.created,chat.line.created,comment.created,"
                          "todo.assignment_changed,todo.completed,todo.created,todo.description_changed")
 
+    def test_project_scope_polls_only_the_project(self):
+        self.listen()
+        self.assertEqual([q.get("buckets") for q in self.stub.queries], [str(PROJECT)])
+        self.assertFalse(os.path.exists(os.path.join(self.cfgdir, "requests-feed.json")))
+
+
+class AccountWide(AssignBase):
+    """"scope": "account": to-dos assigned to the agent in any project of the account are requests, each with its project."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg(assigned_todos={"scope": "account"})
+
+    def test_a_todo_in_another_project_is_a_request_carrying_its_project(self):
+        self.add(todo(42, bucket=OTHER))
+        self.add(todo(43))
+        self.poll()
+        self.poll()
+        recs = {r["todo"]: r for r in self.pending()}
+        self.assertEqual(sorted(recs), [42, 43])
+        self.assertEqual(recs[42]["project"], {"id": OTHER, "name": f"Project {OTHER}"})
+        self.assertEqual(recs[43]["project"], {"id": int(PROJECT), "name": f"Project {PROJECT}"})
+        # Read once to record it, then each sweep's edit check: always in its own project.
+        self.assertEqual((self.stub.fetched(42, OTHER), self.stub.fetched(42)), (3, 0))
+        self.assertIn(f"/buckets/{OTHER}/recordings/42/boosts.json", self.stub.paths("post"))
+        self.assertEqual((self.request(42)["bucket"], self.request(42)["project_name"]), (OTHER, f"Project {OTHER}"))
+
+    def test_its_comments_boosts_replies_and_completion_go_to_its_project(self):
+        self.add(todo(42, bucket=OTHER))
+        self.poll()
+        self.stub.comments["42"] = [comment(6, content="<p>Done yet?</p>")]
+        self.stub.boosts["42"] = [boost(7)]
+        self.poll()
+        self.assertEqual([(r["kind"], r["project"]["id"]) for r in self.pending()],
+                         [("todo-request", OTHER), ("todo-comment", OTHER), ("boost", OTHER)])
+        self.assertEqual(set(self.stub.projects("comments list")), {str(OTHER)})
+        self.assertTrue(self.sync().reply(6, "Almost."))
+        self.assertTrue(self.sync().todo_comment("request-42", "Started."))
+        self.assertTrue(self.sync().todo_complete("request-42"))
+        self.assertEqual(self.stub.projects("comments create") + self.stub.projects("todos complete"), [str(OTHER)] * 3)
+        self.assertIn(f"/buckets/{OTHER}/recordings/6/boosts.json", self.stub.paths("post"))  # the 👀 on the question
+        self.assertTrue(any(p.startswith(f"/buckets/{OTHER}/boosts/") for p in self.stub.paths("delete")))
+
+    def test_its_edit_and_closing_are_read_in_its_project(self):
+        self.add(todo(42, bucket=OTHER))
+        self.poll()
+        self.edit(42, description="<div>Prod only.</div>")
+        self.poll()
+        self.edit(42, assignees=[{"id": CAPTAIN}])
+        self.poll()
+        self.assertEqual([(r["kind"], r.get("reason"), r["project"]["id"]) for r in self.pending()],
+                         [("todo-request", None, OTHER), ("todo-request-update", None, OTHER),
+                          ("todo-request-closed", "unassigned", OTHER)])
+
+    def test_the_project_scope_default_is_unchanged(self):
+        self.cfg(assigned_todos={})
+        self.add(todo(42, bucket=OTHER))
+        self.poll()
+        self.assertEqual((self.pending(), self.stub.fetched(42, OTHER)), ([], 0))
+
+
+class AccountWideListener(AssignBase):
+    def setUp(self):
+        super().setUp()
+        self.cfg(assigned_todos={"scope": "account"}, inbox={})
+        self.poll()
+        self.stub.calls.clear()
+
+    def other(self, *events):
+        """Queue an empty page for the project's poll, then `events` for the account-wide request poll."""
+        self.stub.page()
+        self.stub.page(*events)
+
+    def test_a_second_poll_reads_every_bucket_with_its_own_position(self):
+        self.listen()
+        main, requests = self.stub.queries
+        self.assertEqual(main.get("buckets"), str(PROJECT))
+        self.assertNotIn("buckets", requests)
+        self.assertEqual(requests["types"], "boost.created,comment.created,todo.assignment_changed,todo.completed,"
+                         "todo.created,todo.description_changed")
+        self.assertTrue(os.path.exists(os.path.join(self.cfgdir, "requests-feed.json")))
+
+    def test_a_todo_assigned_in_another_project_is_a_request_in_the_same_cycle(self):
+        self.add(todo(42, by=STRANGER, bucket=OTHER))
+        self.other(event(10, kind="todo.assignment_changed", rid=42, bucket=OTHER))
+        self.listen()
+        [rec] = self.pending()
+        self.assertEqual((rec["kind"], rec["author"]["id"], rec["project"]["id"]), ("todo-request", CAPTAIN, OTHER))
+        [(rid, body, _, _)] = self.stub.notes
+        self.assertEqual(rid, "basecamp-todo-request-42-1")
+        self.assertIn(f"in project 'Project {OTHER}' ({OTHER})", body)
+        self.assertIn("route the work", body)
+
+    def test_comments_boosts_and_closing_on_it_follow_it(self):
+        self.add(todo(42, bucket=OTHER))
+        self.other(event(10, kind="todo.created", rid=42, bucket=OTHER))
+        self.listen()
+        self.stub.comments["42"] = [comment(5)]
+        self.stub.parents[5] = {"type": "Todo", "id": 42}
+        self.other(event(11, kind="comment.created", rid=5, bucket=OTHER))
+        self.listen()
+        self.stub.boosts["42"] = [boost(8)]
+        self.other(event(12, kind="boost.created", rid=42, bucket=OTHER))
+        self.listen()
+        self.edit(42, completed=True)
+        self.other(event(13, kind="todo.completed", rid=42, bucket=OTHER))
+        self.listen()
+        self.assertEqual([r["kind"] for r in self.pending()], ["todo-request", "todo-comment", "boost", "todo-request-closed"])
+        self.assertIn(f"/buckets/{OTHER}/comments/5.json", self.stub.paths())
+        self.assertEqual(len(self.stub.notes), 4)
+
+    def test_other_projects_events_on_untracked_todos_read_nothing(self):
+        self.add(todo(42, to=(CAPTAIN,), bucket=OTHER))
+        self.other(event(10, kind="todo.created", rid=42, bucket=OTHER), event(11, kind="comment.created", rid=5, bucket=OTHER),
+                   event(12, kind="boost.created", rid=6, bucket=OTHER), event(13, kind="todo.created", rid=42, who=STRANGER,
+                                                                          bucket=OTHER))
+        self.listen()
+        self.assertEqual(self.pending(), [])
+        self.assertNotIn(f"/buckets/{OTHER}/comments/5.json", self.stub.paths())
+        self.assertEqual(self.stub.fetched(42, OTHER), 1)
+
 
 class Note(unittest.TestCase):
     def test_request_notes(self):
@@ -285,6 +418,14 @@ class Note(unittest.TestCase):
                                         "title": "Rotate keys", "boost": 8}, "1", "2")
         self.assertIn("on to-do request 'Rotate keys'", body)
         self.assertNotIn("settles the decision", body)
+
+    def test_a_request_in_the_configured_project_does_not_name_it(self):
+        _, body = behaviors.inbox_note({"kind": "todo-request", "key": "request-42", "todo": 42, "captain": True,
+                                        "project": {"id": 2, "name": "Home"}}, "1", "2")
+        self.assertNotIn("in project", body)
+        _, body = behaviors.inbox_note({"kind": "todo-request-closed", "key": "request-42", "todo": 42, "reason": "trashed",
+                                        "captain": None, "author": None, "project": {"id": 3, "name": "Ops"}}, "1", "2")
+        self.assertIn("(request-42) in project 'Ops' (3) trashed", body)
 
     def test_update_and_closed_notes(self):
         rid, body = behaviors.inbox_note({"kind": "todo-request-update", "key": "request-42", "todo": 42, "title": "Rotate",

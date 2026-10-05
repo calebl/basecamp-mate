@@ -4,7 +4,8 @@ Checks, in order: Python, the basecamp CLI and its version, systemd user service
 firstmate home, the config, the Basecamp sign-in (every call under a timeout and the
 file credential store, so a locked system keyring cannot hang it), the project and the
 dock tools the config uses, each mirrored card table and its columns, the background
-services, the last sync, and the wake check. A check whose prerequisite failed is
+services, the last sync, and the wake check; across the homes checked, that only one per
+Basecamp login takes to-do requests account-wide. A check whose prerequisite failed is
 skipped. Each problem is printed with the exact fix; the exit status is 1 when anything
 is broken, 0 otherwise.
 
@@ -291,6 +292,7 @@ class Doctor:
             else self.homes()
         if not homes:
             self.bad("No basecamp-mate setup was found on this computer.", f"Fix: run  {SETUP}")
+        anywhere = {}  # (account, profile) -> the homes taking to-do requests account-wide with that login
         for h, c in homes:
             self.out(f"\n{h}")
             if not self.home(h):
@@ -298,6 +300,9 @@ class Doctor:
             cfg = self.config(h, c)
             if cfg is None:
                 continue
+            opts = cfg.get("assigned_todos")
+            if isinstance(opts, dict) and opts.get("scope") == "account":
+                anywhere.setdefault((str(cfg.get("account")), cfg.get("profile")), []).append(h)
             bc = self.login(cfg) if cli_ok else None
             if bc and self.project(bc, cfg):
                 self.card_tables(bc, cfg)
@@ -307,9 +312,23 @@ class Doctor:
                 self.services(h, c, cfg)
             self.last_sync(c)
             self.wake_check(h, cfg)
+        self.account_wide(anywhere)
         self.out("\n" + (f"{self.problems} problem(s) found; fix them in order, then run  basecamp-mate doctor  again."
                          if self.problems else "Everything looks good."))
         return 1 if self.problems else 0
+
+
+    def account_wide(self, anywhere):
+        """Warn when more than one home here takes to-do requests account-wide with the same Basecamp login."""
+        for (account, profile), hs in sorted(anywhere.items(), key=str):
+            if len(hs) < 2:
+                continue
+            login = f"the sign-in {profile!r}" if profile else "the default sign-in"
+            self.out("")
+            self.bad(f"{len(hs)} homes take to-dos assigned anywhere in account {account} with {login}, so each such "
+                     f"to-do would reach all of them: {', '.join(hs)}",
+                     'Fix: keep "assigned_todos": {"scope": "account"} only in the main home\'s settings, and set the '
+                     'others to "assigned_todos": {} (their own project only).')
 
 
 def cli(argv, **kw):
