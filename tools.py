@@ -7,7 +7,8 @@ A tool does one explicit thing to the configured account and project, through th
     each, with a cursor or seen-list kept beside the config: card comments and
     approvals, chat lines, the owner's lines in Pings (direct messages to the acting
     login, each in a bucket of its own), due check-in questions, comments on tracked
-    to-dos; the event-feed reader hands pages of the account event feed to a behavior
+    to-dos, to-dos the owner assigns to the acting login (as requests, then their edits
+    and closing); the event-feed reader hands pages of the account event feed to a behavior
     instead, and the unmonitored-event recorder records, once per kind, the owner
     events it finds no behavior handles;
   - commands post exactly what the agent hands them: `reply`, `ask`, `answer`,
@@ -25,7 +26,7 @@ post-message) posts nothing when no profile is set, or when the profile signs in
 the owner, and `--dry-run` only logs. All state lives in the directory holding the
 config.
 """
-import contextlib, csv, fcntl, html, json, os, re, subprocess, time, tomllib
+import contextlib, csv, fcntl, hashlib, html, json, os, re, subprocess, time, tomllib
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
@@ -57,6 +58,7 @@ class Tools:
         self.ask_chat = str(cfg["ask_chat"]) if cfg.get("ask_chat") is not None else None
         self.checkins = cfg.get("checkins")
         self.todos = cfg.get("todos")
+        self.assigned_todos = cfg.get("assigned_todos") not in (None, False)
         self.message_board = str(cfg["message_board"]) if cfg.get("message_board") is not None else None
         self.dry, self.run = dry, runner
         self._acting = False  # acting person id once resolved; None when it can't be
@@ -636,14 +638,16 @@ class Tools:
         return any((a.get("creator") or {}).get("id") == me and (a.get("group_on") or (a.get("created_at") or "")[:10]) == date
                    for a in answers)
 
-    def read_todo_comments(self, keys=None):
+    def read_todo_comments(self, keys=None, requests=None):
         """Record the owner's new comments on each open tracked to-do (or only those in `keys`) as `todo-comment` records.
 
         todos.json keeps, per key, the to-do id and a cursor (the newest comment id
         seen). Each comment by someone listened to newer than the cursor is recorded once
         and queued for a 👀 when it contains "?", a 👍 otherwise; other people's comments,
-        the agent's own included, only move the cursor. Completed to-dos are not read.
-        A dry run reads and logs only.
+        the agent's own included, only move the cursor. Completed or closed to-dos are
+        not read. `requests` True reads only to-do requests (records carry "request":
+        true), False only the agent's decision to-dos, None both. A dry run reads and
+        logs only.
         """
         for key in sorted(self.load("todos.json", {})):
             if keys is not None and key not in keys:
@@ -651,7 +655,9 @@ class Tools:
             with self.locked("todos.json"):
                 state = self.load("todos.json", {})
                 rec = state.get(key)
-                if rec is None or rec.get("completed"):
+                if rec is None or rec.get("completed") or rec.get("closed"):
+                    continue
+                if requests is not None and bool(rec.get("request")) != requests:
                     continue
                 try:
                     comments = self.bc("comments", "list", str(rec["todo"])) or []
@@ -677,7 +683,8 @@ class Tools:
                         continue
                     self.record({"kind": "todo-comment", "key": key, "todo": rec["todo"], "comment": cid,
                                  "question": question, "url": c.get("app_url") or rec.get("url"),
-                                 "text": text, "at": c.get("created_at"), **self.author(c.get("creator"))})
+                                 "text": text, "at": c.get("created_at"), **request_fields(rec),
+                                 **self.author(c.get("creator"))})
                     rec.setdefault("comments", []).append(cid)
                     self.log(f"new owner comment on todo {key}: {cid}")
                 self.read_todo_boosts(key, rec, comments)
@@ -688,7 +695,7 @@ class Tools:
 
     def read_todo_boosts(self, key, rec, comments):
         """The owner's boosts on the to-do (read every run) and on its comments (when their count changes)."""
-        ctx = {"key": key, "todo": rec["todo"]}
+        ctx = {"key": key, "todo": rec["todo"], **request_fields(rec)}
         self.read_boosts(rec, "todo", ctx, always=[(rec["todo"], rec.get("url"))])
         self.read_boosts(rec, "todo-comment", ctx,
                          counted=[(c.get("id"), c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
@@ -771,6 +778,159 @@ class Tools:
         if not self.dry:
             state["since"] = since
             self.save_json("pings.json", state)
+
+    # --- to-do requests: to-dos the people listened to assign to the acting user ---
+
+    def todo(self, tid):
+        """To-do `tid`, refetched: content (its name), description, assignees, creator, completed, completion, status."""
+        return self.bc("api", "get", f"/buckets/{self.project}/todos/{tid}.json") or {}
+
+    def assigned_todo_ids(self):
+        """The ids of the open to-dos in this project assigned to the acting user, from one read of /my/assignments.json."""
+        data = self.bc("api", "get", "/my/assignments.json") or {}
+        items = data if isinstance(data, list) else (data.get("priorities") or []) + (data.get("non_priorities") or [])
+        return list(dict.fromkeys(a["id"] for a in items if a.get("id") and not a.get("completed")
+                                  and (a.get("type") or "todo").lower() == "todo"
+                                  and str((a.get("bucket") or {}).get("id")) == self.project))
+
+    def request_keys(self):
+        """The keys of the open to-do requests in todos.json."""
+        return sorted(k for k, r in self.load("todos.json", {}).items()
+                      if r.get("request") and not r.get("completed") and not r.get("closed"))
+
+    def read_todo_request(self, tid, by=None):
+        """Record to-do `tid` as a `todo-request` once, when it is open, assigned to the acting user, and `by` is listened to.
+
+        `by` is who assigned it (an event's creator id); None means its creator, as the
+        sweep has no other way to tell. A new request is tracked in todos.json as
+        "request-<id>" with a cursor of 0, so the comments already on it are relayed as
+        part of it, and the to-do is queued for a 👀. A closed request assigned again is
+        a new request under the same key. Returns True when recorded; False for an
+        open request already tracked, a to-do assigned to someone else, or one not
+        assigned by someone listened to (the sweep remembers those in
+        assigned-todos.json, so it fetches each once). A dry run records nothing.
+        """
+        me = self.agent()
+        key = f"request-{tid}"
+        rec = self.load("todos.json", {}).get(key)
+        if me is None or (rec is not None and not rec.get("completed") and not rec.get("closed")):
+            return False
+        try:
+            todo = self.todo(tid)
+        except RuntimeError as e:
+            self.log(f"todo request {tid}: {e}")
+            return False
+        if (todo.get("completed") or todo.get("status") not in (None, "active")
+                or me not in [a.get("id") for a in todo.get("assignees") or []]):
+            return False
+        creator = todo.get("creator") or {}
+        who = creator if by is None or by == creator.get("id") else {"id": by, "name": None}
+        if not self.hears(who):
+            if by is None and not self.dry:
+                state = self.load("assigned-todos.json", {})
+                state["ignored"] = sorted({*state.get("ignored", []), tid})
+                self.save_json("assigned-todos.json", state)
+            self.log(f"todo request {tid}: not assigned by someone listened to, ignored")
+            return False
+        if self.dry:
+            self.log(f"dry todo request {tid}: record and acknowledge with {EYES}")
+            return False
+        with self.locked("todos.json"):
+            state = self.load("todos.json", {})
+            rec = state.get(key) or {"todo": tid, "cursor": 0, "created": todo.get("created_at")}
+            for k in ("completed", "closed"):
+                rec.pop(k, None)
+            n = rec.get("requests", 0) + 1
+            rec.update(title=todo.get("content"), url=todo.get("app_url"), digest=todo_digest(todo), requests=n,
+                       request=self.author(who))
+            if [tid, EYES] not in [a[:2] for a in rec.get("acked", [])] + rec.get("ack", []):
+                rec.setdefault("ack", []).append([tid, EYES])
+            self.record({"kind": "todo-request", "key": key, "todo": tid, "n": n, "reopened": n > 1,
+                         "title": todo.get("content"), "text": plain(todo.get("description")),
+                         "assignees": [a.get("name") for a in todo.get("assignees") or []],
+                         "url": todo.get("app_url"), "at": todo.get("updated_at") or todo.get("created_at"),
+                         **self.author(who)})
+            self.log(f"todo request {key}: todo {tid} assigned by {who.get('id')}")
+            self.acknowledge(f"todo {key}", rec)
+            state[key] = rec
+            self.save_json("todos.json", state)
+        return True
+
+    def discover_todo_requests(self, limit=10):
+        """The sweep: run read_todo_request for each open to-do in this project assigned to the acting user that is not yet an open request.
+
+        At most `limit` to-dos are fetched a run; one already found not to be assigned by
+        someone listened to is never fetched again. Refused (logged) unless the acting
+        user is someone other than the owner: /my/assignments.json is the acting user's.
+        """
+        if self.agent() is None:
+            self.log("todo requests: the acting user is the owner, unset or unknown; assigned to-dos not read")
+            return
+        try:
+            ids = self.assigned_todo_ids()
+        except RuntimeError as e:
+            self.log(f"todo requests: {e}")
+            return
+        tracked = {self.load("todos.json", {})[k]["todo"] for k in self.request_keys()}
+        ignored = set(self.load("assigned-todos.json", {}).get("ignored", []))
+        for tid in [i for i in ids if i not in tracked and i not in ignored][:limit]:
+            self.read_todo_request(tid)
+
+    def refresh_todo_request(self, key, by=None):
+        """Record what changed on open to-do request `key` since it was last read: an edit, or its closing.
+
+        Completed (by anyone), trashed or archived, or no longer assigned to the acting
+        user: a `todo-request-closed` record (`reason` completed, trashed, archived or
+        unassigned, and who completed it when Basecamp says), and the request stops
+        being read; completed also marks it completed, so `todo complete` is not needed.
+        Its name or description changed: a `todo-request-update` record with the new
+        text. `by` is who did it, when an event says; otherwise Basecamp does not say who
+        edited it. A dry run records nothing. Returns the record kind, or None.
+        """
+        me = self.agent()
+        rec = self.load("todos.json", {}).get(key)
+        if me is None or rec is None or not rec.get("request") or rec.get("completed") or rec.get("closed"):
+            return None
+        try:
+            todo = self.todo(rec["todo"])
+        except RuntimeError as e:
+            self.log(f"todo request {key}: {e}")
+            return None
+        who = {"id": by, "name": None} if by is not None else None
+        if todo.get("completed"):
+            reason = "completed"
+            who = (todo.get("completion") or {}).get("creator") or who
+        elif todo.get("status") not in (None, "active"):
+            reason = todo.get("status")
+        elif me not in [a.get("id") for a in todo.get("assignees") or []]:
+            reason = "unassigned"
+        elif todo_digest(todo) != rec.get("digest"):
+            reason = None
+        else:
+            return None
+        kind = "todo-request-closed" if reason else "todo-request-update"
+        if self.dry:
+            self.log(f"dry todo request {key}: {kind}" + (f" ({reason})" if reason else ""))
+            return None
+        authored = self.author(who) if who else {"author": None, "captain": None}
+        with self.locked("todos.json"):
+            state = self.load("todos.json", {})
+            rec = state[key]
+            out = {"kind": kind, "key": key, "todo": rec["todo"], "n": rec.get("requests", 1),
+                   "title": todo.get("content") or rec.get("title"), "url": todo.get("app_url") or rec.get("url"),
+                   "at": (todo.get("completion") or {}).get("created_at") or todo.get("updated_at"), **authored}
+            if reason:
+                out["reason"] = reason
+                rec["closed"] = reason
+                if reason == "completed":
+                    rec["completed"] = now_iso()
+            else:
+                out["text"] = plain(todo.get("description"))
+                rec.update(digest=todo_digest(todo), title=todo.get("content") or rec.get("title"))
+            self.record(out)
+            self.save_json("todos.json", state)
+        self.log(f"todo request {key}: {kind}" + (f" ({reason})" if reason else ""))
+        return kind
 
     # --- the account event feed: wake-ups for the readers, never records ---
 
@@ -1071,9 +1231,10 @@ class Tools:
         self.log(f"answer {qid}: answered for {date}")
         return True
 
-    def need_todos(self):
-        if self.todos is None:
-            raise RuntimeError('config has no "todos"')
+    def need_todos(self, requests=True):
+        """Refuse a to-do command the config does not allow: "todos" for any, or "assigned_todos" for a tracked to-do request."""
+        if self.todos is None and not (requests and self.assigned_todos):
+            raise RuntimeError('config has no "todos"' + (' or "assigned_todos"' if requests else ""))
 
     def todo_create(self, key, title, description="", todolist=None, due=None):
         """Create a to-do assigned to the owner and track it in todos.json under `key`.
@@ -1084,7 +1245,7 @@ class Tools:
         refused, so a re-run never creates a duplicate. Returns the to-do id, or None
         when nothing was created.
         """
-        self.need_todos()
+        self.need_todos(requests=False)
         if not key or not title.strip():
             raise ValueError("a to-do needs a key and a title")
         if title.startswith("-"):
@@ -1119,7 +1280,7 @@ class Tools:
 
     def todo_track(self, key, tid):
         """Track an existing to-do under `key`; its comments and boosts so far are not relayed. Writes nothing to Basecamp."""
-        self.need_todos()
+        self.need_todos(requests=False)
         with self.locked("todos.json"):
             state = self.load("todos.json", {})
             if key in state or any(r["todo"] == tid for r in state.values()):
@@ -1172,6 +1333,9 @@ class Tools:
         key, rec = self.tracked(ref)
         if rec.get("completed"):
             self.log(f"todo complete {key}: already completed {rec['completed']}")
+            return False
+        if rec.get("closed"):
+            self.log(f"todo complete {key}: the request was closed ({rec['closed']}), not completing it")
             return False
         if self.refused(f"todo complete {key}", "owner"):
             return False
@@ -1226,6 +1390,21 @@ class Tools:
         del state[key]
         self.save_json("unmonitored.json", state)
         self.log(f"unmonitored: {key} forgotten")
+
+
+def request_fields(rec):
+    """The fields that mark a record as part of a to-do request: its title, for a to-do request's record; none otherwise."""
+    return {"request": True, "title": rec.get("title")} if rec.get("request") else {}
+
+
+def todo_digest(todo):
+    """A digest of a to-do's name and description, to notice an edit to either."""
+    return hashlib.sha256(f"{todo.get('content') or ''}\n{todo.get('description') or ''}".encode()).hexdigest()
+
+
+def plain(content):
+    """Basecamp rich text as one line of plain text."""
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", content or ""))).strip()
 
 
 def recording_type(t):
