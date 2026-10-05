@@ -12,8 +12,10 @@ matches no registered repo, and that --repo-map does not name, is skipped: it is
 out of the config and its columns are never read.
 
 It then writes <home>/data/basecamp-sync/config.json and the empty hand-kept side files,
-installs and enables a per-home systemd user timer (every 5 minutes, 240s cap), and
-registers the comment wake check through the home's own bin/fm-check-register.sh.
+installs and enables a per-home systemd user timer (every 30 seconds, 240s cap; each
+behavior's step runs at its own cadence inside it), removes the retired event-listener
+service if an earlier version installed one, and registers the comment wake check
+through the home's own bin/fm-check-register.sh.
 Re-running with the same inputs changes nothing; --dry-run prints the discovered config
 and the planned installs and writes nothing, locally or in Basecamp.
 
@@ -32,13 +34,12 @@ project as a request: relayed, acknowledged and tracked until done;
 --assigned-todos-anywhere does so in every project of the account (only one home per
 login should: the main one, which routes each request to the right domain). --listen-to <person> (repeatable: a person id, email or exact name) adds
 people the sync listens to besides the captain, as "people"; their input is relayed
-with who wrote it, but only the captain decides or approves. --listen
-turns on the owner-event listener and installs and enables its systemd user service
-(`sync.py listen`, restarted on failure), beside the timer; without "listen" in the
-config no service is installed. --no-chats leaves the dock's chats out. --no-keyring (on
-by default when BASECAMP_NO_KEYRING is set) gives both units BASECAMP_NO_KEYRING=1, so
-every basecamp call they make uses the file credential store and never waits on a
-locked system keyring.
+with who wrote it, but only the captain decides or approves. --listen is accepted for
+old scripts and does nothing: notifications on the timer replaced the event listener,
+and an existing config's "listen" key is dropped without --force. --no-chats leaves the
+dock's chats out. --no-keyring (on by default when BASECAMP_NO_KEYRING is set) gives the
+units BASECAMP_NO_KEYRING=1, so every basecamp call they make uses the file credential
+store and never waits on a locked system keyring.
 
 The only Basecamp write is creating a missing regular column, and only with
 --create-missing-columns.
@@ -51,6 +52,7 @@ from behaviors import COLUMNS
 HERE = os.path.dirname(os.path.abspath(__file__))
 CREATABLE = ("Figuring it out", "In progress", "Ready for QA")  # Triage, Not now and Done are built in
 CHECK_ID = "basecamp-sync"
+TIMER_SECONDS = 30  # the timer's period; each behavior's step runs at its own cadence inside it (behaviors.py)
 SIDE_FILES = {"extra-repos.json": {}, "figuring.json": {}, "not-now.json": {}, "skip.json": [],
               "boards.json": {}, "decisions.json": {}, "pending-comments.jsonl": None}
 
@@ -166,30 +168,18 @@ class System:
                         raise RuntimeError(f"{step}: {(r.stdout + r.stderr)[:300]}")
         return changed
 
-    def install_service(self, name, service, dry):
-        """Install and start a long-running user service; restart it when its unit changed while running."""
+    def remove_service(self, name, dry):
+        """Stop, disable and delete a user service an earlier version installed (the event listener); [] when absent."""
         path = os.path.join(self.unit_dir, f"{name}.service")
-        changed = []
-        if not (os.path.exists(path) and open(path).read() == service):
-            changed.append(f"write {path}")
-            if not dry:
-                os.makedirs(self.unit_dir, exist_ok=True)
-                with open(path, "w") as f:
-                    f.write(service)
-        enabled = self.systemctl("is-enabled", f"{name}.service").stdout.strip() == "enabled"
-        active = self.systemctl("is-active", f"{name}.service").stdout.strip() == "active"
-        if changed:
-            changed.append("systemctl --user daemon-reload")
-        if not (enabled and active):
-            changed.append(f"systemctl --user enable --now {name}.service")
-        elif changed:
-            changed.append(f"systemctl --user restart {name}.service")
+        if not os.path.exists(path):
+            return []
+        changed = [f"systemctl --user disable --now {name}.service", f"remove {path}", "systemctl --user daemon-reload"]
         if not dry:
-            for step in changed:
-                if step.startswith("systemctl"):
-                    r = self.systemctl(*step.split()[2:])
-                    if r.returncode != 0:
-                        raise RuntimeError(f"{step}: {(r.stdout + r.stderr)[:300]}")
+            self.systemctl("disable", "--now", f"{name}.service")  # already stopped or unknown to systemd is fine
+            os.remove(path)
+            r = self.systemctl("daemon-reload")
+            if r.returncode != 0:
+                raise RuntimeError(f"systemctl --user daemon-reload: {(r.stdout + r.stderr)[:300]}")
         return changed
 
     def register_check(self, home, cid, script, dry):
@@ -225,7 +215,7 @@ class System:
 class Init:
     def __init__(self, url, login, home, captain=None, listen_to=(), repo_map=(), create_missing=False, dry=False,
                  force=False, cards=True, todos=False, reports=False, every_line=False, checkins=None, releases=True, inbox=False,
-                 listen=False, pings=False, assigned_todos=False, assigned_anywhere=False, chats=True, no_keyring=None, runner=subprocess.run, system=None, sync_dir=HERE, out=print):
+                 pings=False, assigned_todos=False, assigned_anywhere=False, chats=True, no_keyring=None, runner=subprocess.run, system=None, sync_dir=HERE, out=print):
         self.account, self.project = parse_url(url)
         self.login, self.home = login, os.path.abspath(home)
         self.captain_arg, self.listen_to = captain, list(listen_to)
@@ -239,7 +229,7 @@ class Init:
         if not cards and (self.repo_map or create_missing):
             raise Refuse("--no-cards cannot be combined with --repo-map or --create-missing-columns")
         self.todos, self.reports, self.every_line, self.checkins = todos, reports, every_line, checkins
-        self.releases, self.inbox, self.listen, self.pings = releases, inbox, listen, pings
+        self.releases, self.inbox, self.pings = releases, inbox, pings
         self.assigned_todos, self.assigned_anywhere = assigned_todos or assigned_anywhere, assigned_anywhere
         self.chats = chats
         self.no_keyring = bool(os.environ.get("BASECAMP_NO_KEYRING")) if no_keyring is None else no_keyring
@@ -371,8 +361,6 @@ class Init:
             cfg["pings"] = {}
         if self.assigned_todos:
             cfg["assigned_todos"] = {"scope": "account"} if self.assigned_anywhere else {}
-        if self.listen:
-            cfg["listen"] = {}
         if problems:
             raise Refuse("init refused, nothing was written:\n  - " + "\n  - ".join(problems))
         gh_repos = {}
@@ -464,21 +452,10 @@ class Init:
                    "[Service]\nType=oneshot\nTimeoutStartSec=240\n" + self.environment() +
                    f"ExecStart={sd_quote(os.path.join(self.sync_dir, 'run.sh'))} {sd_quote(self.home)} {sd_quote(config_path)}\n")
         timer = ("[Unit]\n"
-                 f"Description=Basecamp sync for the firstmate backlog at {self.home}, every 5 minutes\n\n"
-                 "[Timer]\nOnBootSec=2min\nOnUnitActiveSec=5min\nAccuracySec=15s\n\n"
+                 f"Description=Basecamp sync for the firstmate backlog at {self.home}, every 30 seconds\n\n"
+                 f"[Timer]\nOnBootSec=2min\nOnUnitActiveSec={TIMER_SECONDS}s\nAccuracySec=5s\n\n"
                  "[Install]\nWantedBy=timers.target\n")
         return name, service, timer
-
-    def listen_unit(self, config_path):
-        """The listener's service: `sync.py listen`, restarted 30s after a failure; it exits cleanly once "listen" is off."""
-        name = unit_name(self.home) + "-listen"
-        service = ("[Unit]\n"
-                   f"Description=Listen to Basecamp project {self.project}'s event feed for the firstmate home at {self.home}\n\n"
-                   "[Service]\nType=simple\nRestart=on-failure\nRestartSec=30\n" + self.environment() +
-                   f"ExecStart=/usr/bin/env python3 {sd_quote(os.path.join(self.sync_dir, 'sync.py'))} listen "
-                   f"--home {sd_quote(self.home)} --config {sd_quote(config_path)}\n\n"
-                   "[Install]\nWantedBy=default.target\n")
-        return name, service
 
     def main(self):
         for sub in ("data", "state"):
@@ -491,6 +468,10 @@ class Init:
         config_path = os.path.join(self.dir, "config.json")
         existing = json.load(open(config_path)) if os.path.exists(config_path) else None
         plan = []
+        # A config that differs only in the retired "listen" is rewritten without it, no --force needed.
+        retired = existing is not None and "listen" in existing and {k: v for k, v in existing.items() if k != "listen"} == cfg
+        if retired:
+            plan.append(f'drop the retired "listen" from {config_path} (notifications replaced the event listener)')
         for board in self.skipped:
             self.out(f"skipped card table {board!r}: no matching repo; pass --repo-map {board}=<repo> to include it")
         for board, col in to_create:
@@ -498,7 +479,7 @@ class Init:
             cfg["tables"][board][col] = "<new>"
         if existing is None:
             plan.append(f"write {config_path}")
-        elif existing != cfg:
+        elif existing != cfg and not retired:
             fields = diff_fields(existing, cfg)
             if not self.force:
                 msg = (f"{config_path} already exists and differs in: {', '.join(fields)}. "
@@ -514,8 +495,7 @@ class Init:
         self.out(json.dumps(cfg, indent=1))
         if self.dry:
             plan += self.system.install_timer(*self.units(config_path), dry=True)
-            if cfg.get("listen") not in (None, False):
-                plan += self.system.install_service(*self.listen_unit(config_path), dry=True)
+            plan += self.system.remove_service(unit_name(self.home) + "-listen", dry=True)
             plan += self.system.register_check(self.home, CHECK_ID, CHECK_INBOX if self.inbox else CHECK, dry=True)
             self.out("dry run, nothing written. Would:" if plan else "dry run: nothing to change")
             for p in plan:
@@ -541,8 +521,7 @@ class Init:
                     f.write("" if empty is None else json.dumps(empty) + "\n")
         done = [p for p in plan if not p.startswith("create column")]
         done += self.system.install_timer(*self.units(config_path), dry=False)
-        if cfg.get("listen") not in (None, False):
-            done += self.system.install_service(*self.listen_unit(config_path), dry=False)
+        done += self.system.remove_service(unit_name(self.home) + "-listen", dry=False)
         done += self.system.register_check(self.home, CHECK_ID, CHECK_INBOX if self.inbox else CHECK, dry=False)
         self.out("done:" if done else "nothing to change")
         for p in done:
@@ -573,8 +552,7 @@ def cli(argv, **kw):
                     help="record due Automatic Check-ins questions, scheduled in this IANA time zone")
     ap.add_argument("--inbox", action="store_true",
                     help="deliver each new pending record as a note in this home's firstmate inbox (the wake)")
-    ap.add_argument("--listen", action="store_true",
-                    help="listen to the Basecamp event feed for the owner's events (a user service beside the timer)")
+    ap.add_argument("--listen", action="store_true", help=argparse.SUPPRESS)  # retired: notifications replaced it
     ap.add_argument("--pings", action="store_true",
                     help="relay the owner's Pings (direct messages) to the --login; the agent answers with sync.py reply")
     ap.add_argument("--assigned-todos", action="store_true",
@@ -591,11 +569,13 @@ def cli(argv, **kw):
     ap.add_argument("--force", action="store_true", help="replace an existing config.json that differs")
     ap.add_argument("--dry-run", action="store_true", help="print the discovered config and planned installs; write nothing")
     a = ap.parse_args(argv)
+    if a.listen:
+        print("--listen is no longer needed: notifications on the timer replaced the event listener", file=sys.stderr)
     try:
         Init(a.url, a.login, a.home, captain=a.captain, listen_to=a.listen_to, repo_map=a.repo_map,
              create_missing=a.create_missing_columns, dry=a.dry_run, force=a.force,
              cards=not a.no_cards, todos=a.todos, reports=a.reports, every_line=a.every_line,
-             checkins=a.checkins, releases=not a.no_releases, inbox=a.inbox, listen=a.listen, pings=a.pings,
+             checkins=a.checkins, releases=not a.no_releases, inbox=a.inbox, pings=a.pings,
              assigned_todos=a.assigned_todos, assigned_anywhere=a.assigned_todos_anywhere, chats=not a.no_chats, no_keyring=a.no_keyring, **kw).main()
     except Refuse as e:
         print(e, file=sys.stderr)

@@ -29,6 +29,7 @@ class Stub:
         self.profiles = [{"name": "firstmate", "authenticated": True}]
         self.auth = {"authenticated": True, "expired": False}
         self.calls, self.envs, self.sync_rc, self.timeout_auth = [], [], 0, False
+        self.unread = 3  # the agent's unread notifications
         self.active = {}
         self.next_id = 1000
 
@@ -100,6 +101,8 @@ class Stub:
                 return done(self.people)
             if path == "/my/profile.json":
                 return done({"id": ACTING, "name": "Firstmate"})
+            if path == "/my/readings.json":
+                return done({"unreads": [{"id": i} for i in range(self.unread)], "reads": []})
             if "/card_tables/" in path:
                 return done(copy.deepcopy(self.tables[path.split("/")[-1].split(".")[0]]))
         raise AssertionError(f"unexpected call {args}")
@@ -158,21 +161,21 @@ class SetupTest(Base):
         cfg = json.load(open(self.config))
         self.assertEqual(cfg, {"account": ACCOUNT, "project": PROJECT, "captain": CAPTAIN, "profile": "firstmate",
                                "chats": [700], "todos": {"todoset": "800"},
-                               "checkins": {"questionnaires": ["900"], "timezone": "America/Chicago"}, "listen": {}})
+                               "checkins": {"questionnaires": ["900"], "timezone": "America/Chicago"}})
         # the disabled check-ins tool was turned back on, nothing else written in Basecamp
         self.assertEqual(self.stub.writes(), [["tools", "enable", "900", "-p", PROJECT]])
-        # both units carry the no-keyring environment, every basecamp call used the file store
+        # the timer's service carries the no-keyring environment, every basecamp call used the file store
         units = self.system.units
         self.assertTrue(all("Environment=BASECAMP_NO_KEYRING=1" in (u[0] if isinstance(u, tuple) else u) for u in units.values()))
-        self.assertEqual(len(units), 2)
+        self.assertEqual(list(units), [init_home.unit_name(self.home)])
         self.assertEqual(set(self.stub.envs), {"1"})
         self.assertIn(["run.sh", self.home, self.config], self.stub.calls)
-        self.assertIn("On:  chat inbox, decision to-dos, check-in answers, event listener", self.text())
+        self.assertIn("On:  chat inbox, decision to-dos, check-in answers", self.text())
         self.assertIn("basecamp-mate setup` again", self.text())
 
     def test_project_url_and_choices(self):
         self.assertEqual(self.setup(project=f"https://app.basecamp.com/{ACCOUNT}/projects/{PROJECT}",
-                                    chat=False, todos=False, checkins=False, listen=False, reports=True), 0)
+                                    chat=False, todos=False, checkins=False, reports=True), 0)
         cfg = json.load(open(self.config))
         self.assertEqual(cfg, {"account": ACCOUNT, "project": PROJECT, "captain": CAPTAIN, "profile": "firstmate",
                                "message_board": "9"})
@@ -302,16 +305,32 @@ class DoctorTest(Base):
         self.assertEqual(self.doctor(self.home), 1)
         self.assertIn("missing its 'In progress' column", self.text())
 
-    def test_listener_not_running_and_failed_sync(self):
+    def test_timer_not_running_and_failed_sync(self):
         self.healthy()
-        self.stub.active[init_home.unit_name(self.home) + "-listen.service"] = ("enabled", "failed")
+        self.stub.active[init_home.unit_name(self.home) + ".timer"] = ("enabled", "failed")
         with open(os.path.join(os.path.dirname(self.config), "sync.log"), "a") as f:
             f.write("2026-01-01T00:00:00Z FAILED token refresh; run basecamp auth login -P firstmate\n")
         self.assertEqual(self.doctor(self.home), 1)
-        self.assertIn("The event listener is not running (enabled, failed)", self.text())
+        self.assertIn("The sync timer (every 30 seconds) is not running (enabled, failed)", self.text())
         self.assertIn("systemctl --user enable --now", self.text())
         self.assertIn("The last sync failed", self.text())
         self.assertIn("sign-in needs renewing", self.text())
+
+    def test_a_leftover_listener_is_flagged(self):
+        self.healthy()
+        with open(os.path.join(self.system.unit_dir, init_home.unit_name(self.home) + "-listen.service"), "w") as f:
+            f.write("[Service]\nExecStart=/usr/bin/env python3 sync.py listen\n")
+        self.assertEqual(self.doctor(self.home), 1)
+        self.assertIn("The old event listener is still installed", self.text())
+        self.assertIn("it removes the listener", self.text())
+
+    def test_notifications_read_and_the_unread_cap(self):
+        self.healthy()
+        self.assertEqual(self.doctor(self.home), 0, self.text())
+        self.assertIn("the agent's Basecamp notifications (3 unread)", self.text())
+        self.stub.unread = 100
+        self.assertEqual(self.doctor(self.home), 1)
+        self.assertIn("100 unread Basecamp notifications, Basecamp's limit", self.text())
 
     def test_wake_check_not_registered(self):
         self.healthy()

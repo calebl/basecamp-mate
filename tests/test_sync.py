@@ -20,6 +20,8 @@ class Stub:
         self.questions, self.answers = [], {}  # check-in questions; question id -> answers
         self.me, self.fail_post = ACTING, False  # /my/profile.json id; make boost posts fail
         self.lavish, self.lavish_calls = "", 0  # stdout of plain `lavish-axi`, or an exception to raise
+        self.readings, self.my_boosts = {"unreads": [], "reads": []}, []  # /my/readings.json, /my/boosts.json
+        self.marked = []  # the ids of each `notifications read` call
 
     def __call__(self, cmd, **kw):
         if cmd[0] == "lavish-axi":
@@ -42,6 +44,12 @@ class Stub:
             data = {"id": self.next_id}
         elif args[:2] == ["comments", "list"]:
             data = self.comments.get(args[2], [])
+        elif args[:3] == ["api", "get", "/my/readings.json"]:
+            data = self.readings
+        elif args[:3] == ["api", "get", "/my/boosts.json"]:
+            data = self.my_boosts
+        elif args[:2] == ["notifications", "read"]:
+            self.marked.append(args[2:])
         elif args[:3] == ["api", "get", "/my/profile.json"]:
             data = {"id": self.me, "attachable_sgid": f"sgid-{self.me}"}
         elif args[:2] == ["api", "get"] and args[2].startswith("/people/"):

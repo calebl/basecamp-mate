@@ -1,10 +1,14 @@
 """The behaviors layer: opt-in, per-home workflows composed from tools.py.
 
 A behavior is on when its config keys are set, and off (making no calls at all)
-otherwise. It holds the policy: which readers run on the timer, what the card
-mirror shows, when a release is announced. Some behaviors have no timer step at
-all and are carried out by the agent with the tools (chat asks, reports); the
-agent's side of every behavior is in prompts/base.md.
+otherwise. It holds the policy: which readers run on the timer and how often, what
+the card mirror shows, when a release is announced. The timer runs every 30 seconds;
+each behavior's step runs when its `every` has passed: notifications and inbox
+delivery every run, the card mirror, release announcements and check-ins every 5
+minutes (and the to-do request sweep), and the readers notifications take over hourly,
+as the repair sweep. Some
+behaviors have no timer step at all and are carried out by the agent with the tools
+(chat asks); the agent's side of every behavior is in prompts/base.md.
 
 Behaviors never call a CLI themselves; every Basecamp, GitHub and backlog read or
 write goes through a Tools method.
@@ -12,23 +16,27 @@ write goes through a Tools method.
 import hashlib, html, json, os, re
 from datetime import datetime, timezone
 
-from tools import recording_type
+from tools import THREADS, parse_reading, recording_type
 
 COLUMNS = ("Triage", "Not now", "Figuring it out", "In progress", "Ready for QA", "Done")
+SLOW, SWEEP = 300, 3600  # seconds: the card mirror's, releases' and check-ins' cadence; the hourly repair sweep's
 
 
 class Behavior:
     name = ""  # as the README and `sync.py behaviors` name it
     keys = ()  # the config keys that turn it on or configure it
     timer = True  # False: the agent carries it out with the tools; nothing runs on the timer
+    every = 0  # seconds between its timer steps; 0: every timer run (every 30 seconds)
 
     def __init__(self, t, cfg):
         self.t, self.on = t, False
 
     @property
     def runs(self):
-        """Where it runs, as `sync.py behaviors` prints it."""
-        return "timer" if self.timer else "agent"
+        """Where and how often it runs, as `sync.py behaviors` prints it."""
+        if not self.timer:
+            return "agent"
+        return {0: "each run", SLOW: "5 min", SWEEP: "hourly"}.get(self.every, f"{self.every}s")
 
     def run(self, items=None):
         pass
@@ -36,7 +44,7 @@ class Behavior:
 
 class CardMirror(Behavior):
     """Mirror the backlog onto card tables; relay the listened-to people's card comments and the captain's 👍 approvals."""
-    name, keys = "card-mirror", ("tables", "repos", "cards")
+    name, keys, every = "card-mirror", ("tables", "repos", "cards"), SLOW
 
     def __init__(self, t, cfg):
         super().__init__(t, cfg)
@@ -210,7 +218,11 @@ class CardMirror(Behavior):
 
 
 class ChatInbox(Behavior):
-    """Relay the listened-to people's chat questions, or every line they write in an "every_line" chat."""
+    """Relay the listened-to people's chat questions, or every line they write in an "every_line" chat.
+
+    Notifications run the chat reader for a chat as soon as it has a new line; the timer's
+    step is the repair sweep (hourly with notifications on, else every 5 minutes).
+    """
     name, keys = "chat-inbox", ("chats",)
 
     def __init__(self, t, cfg):
@@ -239,7 +251,7 @@ class ChatAsks(Behavior):
 
 class ReleaseAnnouncements(Behavior):
     """Post one Message Board announcement per new GitHub release: the sync's one automatic post."""
-    name, keys = "release-announcements", ("releases",)
+    name, keys, every = "release-announcements", ("releases",), SLOW
 
     def __init__(self, t, cfg, prereleases=False):
         super().__init__(t, cfg)
@@ -304,7 +316,7 @@ class ReleaseAnnouncements(Behavior):
 
 class CheckinAnswering(Behavior):
     """Record due check-in questions; the agent answers each once a day with `sync.py answer`."""
-    name, keys = "checkin-answering", ("checkins",)
+    name, keys, every = "checkin-answering", ("checkins",), SLOW
 
     def __init__(self, t, cfg):
         super().__init__(t, cfg)
@@ -319,7 +331,11 @@ class CheckinAnswering(Behavior):
 
 
 class DecisionTodos(Behavior):
-    """Decisions for the owner as assigned to-dos: the agent creates and completes them; the timer relays the owner's comments."""
+    """Decisions for the owner as assigned to-dos: the agent creates and completes them; the owner's comments are relayed.
+
+    Notifications run a to-do's reader when it has a new comment; the timer's step reads
+    every open one as the repair sweep (hourly with notifications on, else every 5 minutes).
+    """
     name, keys = "decision-todos", ("todos",)
 
     def __init__(self, t, cfg):
@@ -342,10 +358,12 @@ class AssignedTodos(Behavior):
     sweep (default 10). {"scope": "account"} takes to-dos assigned to the agent in every
     project of the account, each request carrying its project; the default, "project", only
     the configured project's. Only one home per login should run "account" (the main home,
-    which routes each request to the right domain). The listener sees the events first;
-    the timer's sweep of the agent's open assignments is the backup.
+    which routes each request to the right domain). Notifications see the assignment,
+    comments and completion first; the timer's sweep every 5 minutes, of the agent's open
+    assignments and every open request, is the repair sweep and the only reader of a
+    request's edits and the owner's boosts on it, which reach no notification.
     """
-    name, keys = "assigned-todos", ("assigned_todos",)
+    name, keys, every = "assigned-todos", ("assigned_todos",), SLOW
 
     def __init__(self, t, cfg):
         super().__init__(t, cfg)
@@ -373,7 +391,11 @@ class AssignedTodos(Behavior):
 
 
 class Reports(Behavior):
-    """The agent posts reports to the Message Board with `sync.py post-message`; the timer relays the owner's comments and boosts on them."""
+    """The agent posts reports to the Message Board with `sync.py post-message`; the owner's comments and boosts on them are relayed.
+
+    Notifications run a message's reader when it has a new comment or boost; the timer's
+    step reads the agent's recent posts as the repair sweep.
+    """
     name, keys = "reports", ("message_board",)
 
     def __init__(self, t, cfg):
@@ -388,9 +410,9 @@ class Reports(Behavior):
 class Pings(Behavior):
     """Relay every line the owner writes in a Ping (a direct message) with the agent's login; the agent answers with `sync.py reply`.
 
-    "pings": {} turns it on; {"limit": n} reads at most n Pings a run (default 10), the
-    most recently active first. A Ping is not in the project, so the listener finds its
-    lines through a second, every-bucket poll of the event feed.
+    "pings": {} turns it on; {"limit": n} reads at most n Pings a sweep (default 10), the
+    most recently active first. Notifications run the reader for a Ping as soon as it has
+    a new line; the timer's step is the repair sweep.
     """
     name, keys = "pings", ("pings",)
 
@@ -466,303 +488,361 @@ class InboxDelivery(Behavior):
             t.save_json("inbox.json", state)
 
 
-class OwnerEvents(Behavior):
-    """Listen to the account event feed for the listened-to people's events and run the reader each one names: a faster wake.
+class Notifications(Behavior):
+    """Read the agent login's Basecamp notifications and boosts every run, and run the reader for each thread that changed.
 
     The people are the config's "people" (always with the captain); "owner" below means any of them.
-    Run by `sync.py listen` (a systemd user service beside the timer), not by the timer.
-    Each cycle polls the feed for the owner's chat lines, comments and boosts in this
-    project and, per page, runs the existing reader for the surface each event points
-    at, then inbox delivery. An event's own fields are never recorded; the readers
-    refetch, record, acknowledge and dedupe exactly as on the timer, whose full run stays
-    the repair sweep for anything the best-effort feed misses.
+    On whenever the config has a "profile" ("notifications": false turns it off):
+    /my/readings.json and /my/boosts.json are the acting user's, so it reads nothing
+    while the acting user is the owner, unset or unknown. It takes over reading the
+    owner's input from chat-inbox, pings, decision-todos, reports, assigned-todos and the
+    card mirror's comments, whose own readers then run as the hourly repair sweep.
 
-    Unmonitored events (on unless "listen" has "unmonitored": false, and only with a
-    profile, since without one the sync's own writes are the owner's): the feed is read
-    for every event type, still only the owner's in this project, and an owner event no
-    behavior handles (a type outside TYPES, or one of TYPES on something nothing
-    monitors) is recorded once per kind of thing as an `unmonitored` record for the agent
-    to put to the owner.
+    Each run makes one read of /my/readings.json (unread items and the first page of read
+    ones, every project) and keeps a cursor per item in notifications.json (item id ->
+    its unread_at). An item is a pointer to a whole thread ("this to-do has 2 new
+    comments", "this chat has a new line"), so for each one whose cursor moved, the
+    existing reader for that thread runs once, records what is new by its own cursor and
+    acknowledges it, exactly as the sweep would:
 
-    Pings (with the "pings" behavior on): a second poll, of the owner's chat lines and
-    boosts in every bucket with its own position in pings-feed.json, runs the Ping reader
-    whenever one of them is outside the project; a Ping is a bucket of its own.
+      - a project chat in "chats": the chat reader, for that chat; an @mention or a
+        Campfire reply to the agent's line there is recorded even without "?";
+      - a Ping with an owner in it (pings on): the Ping reader, for that Ping;
+      - a comment or @mention on a mirrored card, an open tracked to-do or the agent's
+        own message: that card's, to-do's or message's reader;
+      - a to-do assigned to the agent, or completed (assigned-todos on; in any project
+        with "scope": "account"): the to-do request reader, or the request's edit and
+        closing check;
+      - a check-in Reminder (checkin-answering on): the check-in reader;
+      - an owner's @mention of the agent in a thread nothing tracks: a `chat-question`
+        (in a chat) or `mention` record of its own.
 
-    Account-wide to-do requests (assigned-todos with "scope": "account"): another poll, of
-    the owner's to-do events, comments and boosts in every bucket with its own position in
-    requests-feed.json, runs the request readers for those outside the project.
+    Owner input in the project that none of these handles (a comment on a Document, a
+    line in a chat not in "chats", a to-do assigned with assigned-todos off) is an
+    `unmonitored` record, once per kind, unless "notifications" has "unmonitored": false
+    (or an old "listen" had it). Items in other projects are another home's: never read
+    and never marked read here, except a Ping and an account-wide to-do request.
+
+    Boosts: one read of /my/boosts.json, the boosts on the agent's own recordings. Each new
+    owner boost runs the reader whose state holds the boosted recording, which records it
+    as a `boost` (or the captain's 👍 on an assigned card as an `approval`); a boost on
+    something nothing monitors in the project is unmonitored. A boost on a to-do request
+    (the owner's own to-do) is not listed there and waits for the sweep.
+
+    Mark read: once an item is handled with no failed call, it is marked read
+    ("mark_read": false keeps them unread), so the unread list stays under Basecamp's
+    100 and the sidebar honest. The cursor, never the read flag, decides what is new, so
+    someone marking everything read loses nothing, and an item whose reader failed keeps
+    its old cursor and is retried next run. The first run only seeds the cursors and the
+    boosts seen, so history is not replayed. A dry run reads, logs and saves nothing.
     """
-    name, keys, timer = "owner-events", ("listen",), False
-    runs = "listener"
-    TYPES = ("boost.created", "chat.line.created", "comment.created")
-    # The to-do events the narrow feed adds for assigned-todos (the wide one has every type).
-    TODO_TYPES = ("todo.assignment_changed", "todo.completed", "todo.created", "todo.description_changed")
-    # The events of the account-wide request poll: a request's own, and comments and boosts on it.
-    REQUEST_TYPES = TODO_TYPES + ("boost.created", "comment.created")
-    # The recording type an event type is about, for the unmonitored key without a refetch.
-    SUBJECTS = {"todo": "Todo", "card": "Kanban::Card", "message": "Message", "question": "Question",
-                "question.answer": "Question::Answer", "chat.line": "Chat::Lines"}
+    name, keys = "notifications", ("notifications",)
+    QUIET = ("BoostReport", "Bulletin", "Onboarding")  # Basecamp's own items: never owner input
 
     def __init__(self, t, cfg):
         super().__init__(t, cfg)
-        listen = cfg.get("listen")
-        if listen is not None and not isinstance(listen, (bool, dict)):
-            raise ValueError('config "listen" must be {} or {"interval": <seconds>, "unmonitored": false}')
-        self.on = listen is not None and listen is not False
-        opts = listen if isinstance(listen, dict) else {}
-        self.interval = int(opts.get("interval") or 30)
-        if self.interval < 10:
-            raise ValueError('config "listen" "interval" must be at least 10 seconds')
-        if not isinstance(opts.get("unmonitored", True), bool):
-            raise ValueError('config "listen" "unmonitored" must be true or false')
-        self.unmonitored = self.on and opts.get("unmonitored", True) and bool(t.profile)
+        opts = cfg.get("notifications")
+        if opts is not None and not isinstance(opts, (bool, dict)):
+            raise ValueError('config "notifications" must be false or {"mark_read": false, "unmonitored": false}')
+        self.on = bool(t.profile) and opts is not False
+        opts = opts if isinstance(opts, dict) else {}
+        old = cfg.get("listen") if isinstance(cfg.get("listen"), dict) else {}
+        for k in ("mark_read", "unmonitored"):
+            if not isinstance(opts.get(k, True), bool):
+                raise ValueError(f'config "notifications" "{k}" must be true or false')
+        self.mark = opts.get("mark_read", True)
+        self.unmonitored = self.on and opts.get("unmonitored", old.get("unmonitored", True) is not False)
         self.others = {}  # every behavior by name, set by configure()
 
     def run(self, items=None):
-        """One listener cycle: every page of new owner events, each dispatched once handled. Returns the events seen."""
-        narrow = self.TYPES + (self.TODO_TYPES if self.others.get("assigned-todos") and self.others["assigned-todos"].on else ())
-        seen = self.t.read_feed(() if self.unmonitored else narrow, self.t.people, self.dispatch)
-        if self.others.get("pings") and self.others["pings"].on:
-            seen += self.t.read_feed(("boost.created", "chat.line.created"), self.t.people, self.dispatch_pings,
-                                     every_bucket=True, store="pings-feed.json")
-        if self.others.get("assigned-todos") and self.others["assigned-todos"].account_wide:
-            seen += self.t.read_feed(self.REQUEST_TYPES, self.t.people, self.dispatch_requests,
-                                     every_bucket=True, store="requests-feed.json")
-        return seen
-
-    def dispatch_requests(self, events):
-        """Run the request readers for the page's owner to-do events, and comments and boosts on requests, outside the project."""
-        t, todos = self.t, self.t.load("todos.json", {})
-        keys, requests = set(), {}
-        for ev in events:
-            bucket = str(ev.get("bucket_id"))
-            if bucket == t.project or not t.hears({"id": ev.get("creator_id")}):
-                continue  # the project's own events are the main poll's
-            kind, rid = ev.get("event_type"), ev.get("recording_id")
-            if kind and kind.startswith("todo."):
-                requests.setdefault(rid, (kind, ev.get("creator_id"), bucket))
-            elif kind == "comment.created":
-                # Only a comment on a tracked request is read; any other to-do's is someone else's.
-                if not any(r.get("request") and str(r.get("bucket")) == bucket for r in todos.values()):
-                    continue
-                try:
-                    pid = (t.comment(rid, bucket).get("parent") or {}).get("id")
-                except RuntimeError as e:
-                    t.log(f"listen: comment {rid}: {e}")
-                    continue
-                keys.update(k for k, r in todos.items() if r.get("request") and r.get("todo") == pid)
-            elif kind == "boost.created":
-                keys.update(k for k, r in todos.items() if r.get("request") and str(r.get("bucket")) == bucket and (
-                    rid == r.get("todo") or str(rid) in (r.get("boost_counts") or {}) or rid in (r.get("comments") or [])))
-        if not keys and not requests:
+        """One pass: the changed notifications and new boosts, each thread's reader once, then inbox delivery."""
+        t = self.t
+        state = t.load("notifications.json", {})
+        if t.agent() is None:
+            if not state.get("refused") and not t.dry:
+                t.log("notifications: the acting user is the owner, unset or unknown; notifications not read")
+                t.save_json("notifications.json", dict(state, refused=True))
             return
-        ran = []
-        if keys:
-            t.read_todo_comments(keys)
-            ran.append("todos " + ",".join(sorted(keys)))
-        ran += self.read_requests(requests)
-        if self.others["inbox-delivery"].on:
+        state.pop("refused", None)
+        try:
+            data = t.readings()
+        except RuntimeError as e:
+            t.log(f"notifications: {e}")
+            return
+        try:
+            boosts = t.my_boosts()
+        except RuntimeError as e:
+            t.log(f"notifications: boosts: {e}")
+            boosts = None
+        unread = {str(r.get("id")) for r in data.get("unreads") or []}
+        readings = sorted((data.get("unreads") or []) + (data.get("reads") or []), key=stamp)
+        first, first_boosts = "items" not in state, "boosts" not in state  # boosts unread on the first run seed later
+        cursors, seen = state.get("items") or {}, set(state.get("boosts") or [])
+        want = {"cards": set(), "chats": {}, "todos": set(), "requests": {}, "checkins": False, "answers": False,
+                "messages": set(), "pings": {}, "mentions": {}, "threads": {}}
+        work = []  # (ref, mine, [group], check): one per changed notification or new boost
+        for r in readings:
+            rid = str(r.get("id"))
+            if not first and cursors.get(rid) != stamp(r):
+                work.append((rid, *self.classify(r, want, data)))
+        for b in boosts or []:
+            if b.get("id") not in seen and not first_boosts:
+                work.append((("boost", b.get("id")), *self.classify_boost(b, want, data)))
+        failed = self.read(want, {g for w in work for g in w[2]})
+        done = []
+        for ref, mine, groups, check in work:
+            if any(g in failed for g in groups):
+                continue
+            if check is not None:
+                before = t.errors
+                check()
+                if t.errors > before:
+                    failed.add(f"check {ref}")
+                    continue
+            done.append((ref, mine))
+        if failed:
+            t.log(f"notifications: retrying next run: {', '.join(sorted(map(str, failed)))}")
+        if t.dry:
+            return
+        handled = {ref for ref, _ in done}
+        state["items"] = {str(r.get("id")): stamp(r) if first or str(r.get("id")) in handled else cursors.get(str(r.get("id")))
+                          for r in readings}
+        state["items"] = {k: v for k, v in state["items"].items() if v is not None}
+        if boosts is not None:
+            listed = {b.get("id") for b in boosts}
+            took = listed if first_boosts else seen | {ref[1] for ref in handled if isinstance(ref, tuple)}
+            state["boosts"] = sorted(took & listed)
+        mark = sorted({ref for ref, mine in done if mine and ref in unread} | (set(state.get("unmarked") or []) & unread))
+        state["unmarked"] = []
+        t.save_json("notifications.json", state)
+        if self.mark and mark:
+            try:
+                t.mark_read(mark)
+            except RuntimeError as e:
+                t.log(f"notifications: marking {len(mark)} read failed, retrying next run: {e}")
+                state["unmarked"] = mark
+                t.save_json("notifications.json", state)
+        if first:
+            t.log(f"notifications: started; {len(readings)} notification(s) and {len(boosts or [])} boost(s) seeded, none replayed")
+        if done and self.others["inbox-delivery"].on:
             self.others["inbox-delivery"].deliver()
-        t.log(f"listen: {len(events)} event(s) outside the project -> {'; '.join(ran)}")
+
+    def read(self, want, groups):
+        """Run each reader `want` names once, in order; returns the groups whose reader had a failed call."""
+        b, t, failed = self.others, self.t, set()
+
+        def step(group, call):
+            if group not in groups:
+                return
+            before = t.errors
+            call()
+            if t.errors > before:
+                failed.add(group)
+        step("cards", lambda: b["card-mirror"].relay(want["cards"]))
+        for chat, addressed in sorted(want["chats"].items()):
+            step(f"chat {chat}", lambda c=chat, a=addressed: t.read_chats([c], b["chat-inbox"].every_line, a))
+        step("todos", lambda: t.read_todo_comments(want["todos"]))
+        # After the comment readers, so a comment made just before the closing is relayed first.
+        for tid, req in sorted(want["requests"].items()):
+            step(f"request {tid}", lambda r={tid: req}: self.read_requests(r))
+        step("checkins", lambda: t.read_checkins(b["checkin-answering"].checkins["questionnaires"]))
+        step("answers", lambda: t.read_answer_boosts(b["checkin-answering"].checkins["questionnaires"]))
+        for mid in sorted(want["messages"]):
+            step(f"message {mid}", lambda m=mid: t.read_messages(b["reports"].board, only=m))
+        for chat, conv in sorted(want["pings"].items()):
+            step(f"ping {chat}", lambda c=conv: t.read_pings(convs=[c]))
+        for rid, (bucket, chat) in sorted(want["mentions"].items()):
+            step(f"mention {rid}", lambda r=rid, bk=bucket, c=chat: t.read_mention(bk, c, r))
+        for thread, (bucket, since, mentions, ptype, title) in sorted(want["threads"].items()):
+            step(f"thread {thread}", lambda th=thread, bk=bucket, sn=since, m=mentions, pt=ptype, ti=title:
+                 t.read_thread(bk, th, sn, m, pt, ti))
+        return failed
 
     def read_requests(self, requests):
-        """For each to-do event in `requests` ({to-do id: (event type, who, bucket)}): an open request's edit and closing
-        check, else a new request when it was created or (re)assigned. Returns what ran, for the log."""
+        """For each to-do in `requests` ({to-do id: (what happened, who, bucket)}): an open request's edit and closing
+        check, else a new request when it was assigned. Returns what ran, for the log."""
         t, ran = self.t, []
         for tid, (kind, by, bucket) in sorted(requests.items()):
             key = f"request-{tid}"
             if key in t.request_keys():
                 done = t.refresh_todo_request(key, by)
-            elif kind in ("todo.created", "todo.assignment_changed"):
+            elif kind == "todo.assignment_changed":
                 done = "todo-request" if t.read_todo_request(tid, by, bucket) else None
             else:
                 done = None
             ran.append(f"request {tid}" + (f" -> {done}" if done else ""))
         return ran
 
-    def dispatch_pings(self, events):
-        """Run the Ping reader when the page has an owner line or boost outside the project, then deliver."""
-        t = self.t
-        outside = [ev for ev in events if str(ev.get("bucket_id")) != t.project and t.hears({"id": ev.get("creator_id")})]
-        if not outside:
-            return
-        t.read_pings(self.others["pings"].limit)
-        if self.others["inbox-delivery"].on:
-            self.others["inbox-delivery"].deliver()
-        t.log(f"listen: {len(outside)} event(s) outside the project -> pings")
-
-    def dispatch(self, events):
-        """Run, once each, the readers the page's events point at, then deliver what they recorded."""
+    def classify(self, r, want, data):
+        """One changed notification: (this home's?, the reader groups it needs, an unmonitored check to run after them)."""
         b, t = self.others, self.t
-        want = {"cards": set(), "todos": set(), "chats": False, "checkins": False, "messages": False, "requests": {}}
-        checks = []  # (event, its comment): each classified once the readers have run
-        for ev in events:
-            if str(ev.get("bucket_id")) != t.project or not t.hears({"id": ev.get("creator_id")}):
-                continue  # the filters already say so; a stray event is never acted on
-            kind, rid = ev.get("event_type"), ev.get("recording_id")
-            checks.append((ev, None))
-            if kind == "chat.line.created":
-                want["chats"] = True
-            elif kind == "comment.created":
-                checks[-1] = (ev, self.comment_target(rid, want))
-            elif kind and kind.startswith("todo.") and b["assigned-todos"].on:
-                want["requests"].setdefault(rid, (kind, ev.get("creator_id"), None))
-            elif kind == "boost.created" and not self.boost_target(rid, want):
-                # A boost on something not yet seen (the agent's newest line, answer or post):
-                # every cheap boost reader; a card's waits for the timer's sweep.
-                want.update(chats=True, checkins=True, messages=True)
-                want["todos"].update(t.load("todos.json", {}))
-        ran = []
-        if want["cards"] and b["card-mirror"].on:
-            b["card-mirror"].relay(want["cards"])
-            ran.append("cards " + ",".join(sorted(want["cards"])))
-        if want["chats"] and b["chat-inbox"].on:
-            t.read_chats(b["chat-inbox"].chats, b["chat-inbox"].every_line)
-            ran.append("chats")
+        kind, where = r.get("type"), parse_reading(r)
+        bucket, thread, anchor, path = where["bucket"], where["thread"], where["anchor"], where["path"]
+        who = r.get("creator") or {}
+        if kind in self.QUIET:
+            return False, [], None
+        if kind == "Reminder":  # a check-in question asked of the agent: a faster due signal than the schedule
+            if b["checkin-answering"].on:
+                want["checkins"] = True
+                return True, ["checkins"], None
+            return False, [], None
+        if r.get("section") == "pings":
+            conv = next((c for c in t.ping_conversations(data) if str(c["chat"]) == str(thread)), None)
+            if not b["pings"].on or conv is None:
+                return False, [], None
+            want["pings"][str(thread)] = conv
+            return True, [f"ping {thread}"], None
+        here, todos = bucket == t.project, t.load("todos.json", {})
+        if kind in ("Assignment", "Completion"):  # thread and anchor are the to-do
+            what = "todo.assignment_changed" if kind == "Assignment" else "todo.completed"
+            tracked = f"request-{thread}" in t.request_keys()
+            if tracked or b["assigned-todos"].on and (here or b["assigned-todos"].account_wide):
+                want["requests"].setdefault(thread, (what, who.get("id"), None if here else bucket))
+                return True, [f"request {thread}"], None
+            if not here:
+                return False, [], None
+            if any(rec.get("todo") == thread for rec in todos.values()) or not t.hears(who):
+                return True, [], None  # a decision to-do's own closing, or not from someone listened to
+            return True, [], self.check(what, "Todo", thread, r)
+        if not here:
+            keys = {k for k, rec in todos.items() if rec.get("request") and rec.get("todo") == thread and path == "todos"
+                    and str(rec.get("bucket")) == bucket and not rec.get("completed") and not rec.get("closed")}
+            if keys and kind in ("Comment", "Mention"):
+                want["todos"] |= keys
+                return True, ["todos"], None
+            return False, [], None
+        mention = kind == "Mention"
+        if r.get("section") == "chats" or path == "chats":
+            ci = b["chat-inbox"]
+            if ci.on and str(thread) in ci.chats:
+                want["chats"].setdefault(str(thread), set()).update([anchor] if mention else [])
+                return True, [f"chat {thread}"], None
+            if mention and t.hears(who):
+                want["mentions"][anchor] = (bucket, thread)
+                return True, [f"mention {anchor}"], None
+            return True, [], self.check("chat.line.created", "Chat::Lines", thread, r) if t.hears(who) else None
+        if kind not in ("Comment", "Mention"):  # a kind Basecamp adds later: unmonitored when an owner did it
+            return True, [], self.check(f"{kind}", None, thread, r) if t.hears(who) else None
+        if path == "cards" and b["card-mirror"].on:
+            keys = {k for k, rec in t.load("map.json", {}).items() if rec.get("card") == thread}
+            if keys:
+                want["cards"] |= keys
+                return True, ["cards"], None
+        if path == "todos":
+            mine = {k: rec for k, rec in todos.items() if rec.get("todo") == thread}
+            keys = {k for k, rec in mine.items() if not rec.get("completed") and not rec.get("closed")
+                    and b["assigned-todos" if rec.get("request") else "decision-todos"].on}
+            if keys:
+                want["todos"] |= keys
+                return True, ["todos"], None
+        # Any other thread the agent is subscribed to or mentioned in: its own reader, whatever the backlog says.
+        if path == "messages" and b["reports"].on:
+            want["messages"].add(thread)
+
+            def after():  # the agent's own message was read above; anyone else's is a thread like any other
+                if not self.agent_message(thread):
+                    t.read_thread(bucket, thread, anchor, {anchor} if mention else (), "Message", topic(r))
+            return True, [f"message {thread}"], after
+        self.thread(want, bucket, thread, anchor, mention, THREADS.get(path), topic(r))
+        return True, [f"thread {thread}"], None
+
+    def thread(self, want, bucket, thread, anchor, mention, ptype, title):
+        """Add thread `thread` to the threads to read: from its first unread comment `anchor`, `anchor` a mention or not."""
+        bk, since, mentions, pt, ti = want["threads"].get(thread, (bucket, anchor, set(), ptype, title))
+        want["threads"][thread] = (bk, min(x for x in (since, anchor) if x) if since or anchor else None,
+                                   mentions | ({anchor} if mention else set()), pt, ti)
+
+    def classify_boost(self, bst, want, data):
+        """One new boost on the agent's own recording: (this home's?, the reader groups it needs, an unmonitored check)."""
+        b, t = self.others, self.t
+        rec, booster = bst.get("recording") or {}, bst.get("booster") or {}
+        rid, rtype = rec.get("id"), recording_type(rec.get("type"))
+        bucket, parent = str((rec.get("bucket") or {}).get("id") or ""), rec.get("parent") or {}
+        if not t.hears(booster):
+            return False, [], None
+        on_todo = rid if rtype == "Todo" else parent.get("id") if rtype == "Comment" and parent.get("type") == "Todo" else None
         todos = t.load("todos.json", {})
-        want["todos"] = {k for k in want["todos"] if k in todos and
-                         b["assigned-todos" if todos[k].get("request") else "decision-todos"].on}
-        if want["todos"]:
-            t.read_todo_comments(want["todos"])
-            ran.append("todos " + ",".join(sorted(want["todos"])))
-        # After the comment readers, so a comment made just before the closing is relayed first.
-        ran += self.read_requests(want["requests"])
-        if want["checkins"] and b["checkin-answering"].on:
-            t.read_answer_boosts(b["checkin-answering"].checkins["questionnaires"])
-            ran.append("checkin answers")
-        if want["messages"] and b["reports"].on:
-            t.read_messages(b["reports"].board)
-            ran.append("messages")
-        if self.unmonitored and checks:
-            found = self.detect(checks)
-            if found:
-                ran.append(f"unmonitored {found}")
-        if b["inbox-delivery"].on:
-            b["inbox-delivery"].deliver()
-        t.log(f"listen: {len(events)} event(s) -> {'; '.join(ran) or 'nothing to read'}")
+        keys = {k for k, r in todos.items() if on_todo is not None and r.get("todo") == on_todo
+                and str(r.get("bucket") or t.project) == bucket}
+        if rtype == "Chat::Lines" and bucket != t.project:
+            circles = {str(c["bucket"]) for c in t.ping_conversations(data)} | {
+                str(p.get("bucket")) for p in t.load("pings.json", {}).get("pings", {}).values()}
+            if not b["pings"].on or bucket not in circles:
+                return False, [], None  # a line in another project's chat is another home's
+            chat = str(parent.get("id"))
+            want["pings"][chat] = {"bucket": bucket, "chat": chat, "title": (rec.get("bucket") or {}).get("name"),
+                                   "url": rec.get("app_url")}
+            return True, [f"ping {chat}"], None
+        if keys:
+            open_keys = {k for k in keys if not todos[k].get("completed") and not todos[k].get("closed")}
+            want["todos"] |= open_keys
+            return True, ["todos"] if open_keys else [], None
+        if bucket != t.project:
+            return False, [], None
+        if rtype == "Chat::Lines" and b["chat-inbox"].on and str(parent.get("id")) in b["chat-inbox"].chats:
+            want["chats"].setdefault(str(parent.get("id")), set())
+            return True, [f"chat {parent.get('id')}"], None
+        card = rid if rtype == "Kanban::Card" else parent.get("id") if parent.get("type") == "Kanban::Card" else None
+        cards = {k for k, r in t.load("map.json", {}).items() if card is not None and r.get("card") == card}
+        if cards and b["card-mirror"].on:
+            want["cards"] |= cards
+            return True, ["cards"], None
+        if rtype == "Question::Answer" and b["checkin-answering"].on:
+            want["answers"] = True
+            return True, ["answers"], None
+        msg = rid if rtype == "Message" else parent.get("id") if parent.get("type") == "Message" else None
+        if msg is not None and b["reports"].on:
+            want["messages"].add(msg)
+            return True, [f"message {msg}"], None
+        known = f"{bucket}:{parent.get('id')}" in t.load("threads.json", {}) if rtype == "Comment" else False
+        if known:
+            self.thread(want, bucket, parent.get("id"), None, False, parent.get("type"), parent.get("title"))
+            return True, [f"thread {parent.get('id')}"], None
+        if on_todo is not None and b["assigned-todos"].on:
+            return True, [], None  # a to-do the agent made, assigned to anyone else
+        what = rtype if rtype != "Comment" else f"Comment on {parent.get('type') or 'unknown'}"
+        return True, [], self.check("boost.created", what or "unknown", rid, None, booster=booster, at=bst.get("created_at"),
+                                    ref=bst.get("id"), on=parent if rtype == "Comment" else None, rec=rec)
 
-    def comment_target(self, cid, want):
-        """A new owner comment: the reader for the mirrored card, tracked to-do or message it is on. Returns the comment."""
-        try:
-            c = self.t.comment(cid)
-        except RuntimeError as e:
-            self.t.log(f"listen: comment {cid}: {e}")
-            return None
-        ptype, pid = (c.get("parent") or {}).get("type"), (c.get("parent") or {}).get("id")
-        if ptype == "Kanban::Card":
-            want["cards"].update(k for k, r in self.t.load("map.json", {}).items() if r.get("card") == pid)
-        elif ptype == "Todo":
-            want["todos"].update(k for k, r in self.t.load("todos.json", {}).items() if r.get("todo") == pid)
-        elif ptype == "Message":
-            want["messages"] = True
-        return c
+    def check(self, what, rtype, rid, r, booster=None, at=None, ref=None, on=None, rec=None):
+        """The unmonitored check for notification `r` (or a boost): a call that records it once per kind, or None when off.
 
-    def detect(self, checks):
-        """Record each owner event in `checks` that no enabled behavior handled; returns how many were new.
-
-        Run after the readers, so their state already holds what this page made them see:
-        a chat line is handled when chat-inbox read it, a comment when it is on a mirrored
-        card, an open tracked to-do or a message of the agent's the reports reader knows, a
-        boost when a reader's state knows the boosted recording (or it is on a comment
-        under such a card, which the timer's sweep reads). Anything else is unmonitored.
+        A notification's own title, excerpt and link stand in for the recording, which is
+        refetched only when its type is unknown (rtype None).
         """
-        b, t, found = self.others, self.t, 0
-        if t.dry:
-            t.log("listen: dry run, so the readers saved nothing to tell unmonitored events apart by; not checked")
-            return 0
-        if t.agent() is None:
-            t.log("listen: the acting user is the owner or unknown, so unmonitored events are not told apart this cycle")
-            return 0
-        for ev, comment in checks:
-            kind, rid = ev.get("event_type"), ev.get("recording_id")
-            rtype, rec, on = self.SUBJECTS.get(kind.rsplit(".", 1)[0]) if kind else None, None, None
-            if kind == "chat.line.created":
-                if b["chat-inbox"].on and any(str(rid) in (r.get("boost_counts") or {}) or rid in (r.get("lines") or [])
-                                              for r in t.load("chats.json", {}).values()):
-                    continue
-            elif kind and kind.startswith("todo.") and b["assigned-todos"].on:
-                continue  # a request is read as one; a to-do assigned to anyone else is ignored
-            elif kind == "comment.created":
-                if comment is None:
-                    continue  # its parent is unknown: logged, and the timer's sweep still runs
-                on = comment.get("parent") or {}
-                if self.monitored(on.get("type"), on.get("id")):
-                    continue
-                rtype, rec = on.get("type") or "unknown", comment
-            elif kind == "boost.created":
-                if self.boost_target(rid, {"cards": set(), "todos": set()}):
-                    continue
-                try:
-                    rec = t.recording(rid)
-                except RuntimeError as e:
-                    t.log(f"listen: boosted recording {rid}: {e}")
-                    continue
-                rtype = recording_type(rec.get("type")) or "unknown"
-                if rtype == "Todo" and b["assigned-todos"].on:
-                    continue
-                if rtype == "Comment":
-                    on = rec.get("parent") or {}
-                    if on.get("type") == "Kanban::Card" and self.monitored("Kanban::Card", on.get("id")):
-                        continue
-                    if on.get("type") == "Todo" and b["assigned-todos"].on:
-                        continue
-                    rtype = f"Comment on {on.get('type') or 'unknown'}"
-            elif kind and kind.startswith("comment."):  # an edit: keyed, like a new comment, on what it is on
-                try:
-                    rec = t.comment(rid)
-                except RuntimeError as e:
-                    t.log(f"listen: comment {rid}: {e}")
-                    continue
-                on = rec.get("parent") or {}
-                rtype = on.get("type") or "unknown"
-                if rtype == "Todo" and b["assigned-todos"].on:
-                    continue
-            if t.record_unmonitored(ev, rtype, rec, on):
-                found += 1
-        return found
+        if not self.unmonitored:
+            return None
+        t = self.t
+        if r is not None:
+            who, at, ref, bucket = r.get("creator"), r.get("unread_at") or r.get("created_at"), r.get("id"), parse_reading(r)["bucket"]
+            rec = None if rtype is None else {"title": r.get("title"), "content": r.get("content_excerpt"), "app_url": r.get("app_url")}
+        else:
+            who, bucket = booster, None
+        return lambda: t.record_unmonitored(what, rtype, rid, who, at=at, rec=rec, on=on, bucket=bucket, ref=ref)
 
-    def monitored(self, ptype, pid):
-        """True when a comment on recording `pid` of type `ptype` is relayed by an enabled behavior."""
-        b, t = self.others, self.t
-        if ptype == "Kanban::Card":
-            return b["card-mirror"].on and any(r.get("card") == pid for r in t.load("map.json", {}).values())
-        if ptype == "Todo":
-            # With assigned-todos on, a comment on a to-do assigned to anyone else is ignored, not unmonitored.
-            return b["assigned-todos"].on or b["decision-todos"].on and any(
-                r.get("todo") == pid and not r.get("completed") for r in t.load("todos.json", {}).values())
-        if ptype == "Message":
-            msgs = t.load("messages.json", {})
-            return b["reports"].on and (str(pid) in msgs.get("posts", {}) or
-                                        str(pid) in (msgs.get("messages") or {}).get("boost_counts", {}))
-        return False
-
-    def boost_target(self, rid, want):
-        """Add the reader whose state already knows boosted recording `rid`; False when none does."""
-        t, srid, found = self.t, str(rid), False
-
-        def seen(rec, *ids):
-            return rid in ids or srid in (rec.get("boost_counts") or {}) or any(rid in (rec.get(n) or []) for n in ("comments", "lines"))
-        for key, rec in t.load("map.json", {}).items():
-            if seen(rec, rec.get("card")):
-                want["cards"].add(key)
-                found = True
-        for key, rec in t.load("todos.json", {}).items():
-            if seen(rec, rec.get("todo")):
-                want["todos"].add(key)
-                found = True
-        if any(seen(rec) for rec in t.load("chats.json", {}).values()):
-            want["chats"] = found = True
-        if any(srid in (rec.get("boost_counts") or {}) for rec in t.load("checkins.json", {}).values()):
-            want["checkins"] = found = True
-        msgs = t.load("messages.json", {})
-        if any(srid in (msgs.get(n) or {}).get("boost_counts", {}) for n in ("messages", "comments")):
-            want["messages"] = found = True
-        return found
+    def agent_message(self, mid):
+        """True when the reports reader knows message `mid` as one of the agent's."""
+        msgs = self.t.load("messages.json", {})
+        return str(mid) in msgs.get("posts", {}) or str(mid) in (msgs.get("messages") or {}).get("boost_counts", {})
 
 
-# The timer runs the "on" behaviors in this order; inbox delivery last, after every reader.
-ALL = (CardMirror, ChatInbox, ChatAsks, ReleaseAnnouncements, CheckinAnswering, DecisionTodos, AssignedTodos, Reports,
-       Pings, InboxDelivery, OwnerEvents)
+def topic(r):
+    """A notification's thread title: its title without the "Re: " a comment's carries."""
+    return re.sub(r"^Re: ", "", r.get("title") or "") or None
+
+
+def stamp(r):
+    """A notification's cursor: when it last became unread (new activity), else when it changed."""
+    return r.get("unread_at") or r.get("updated_at") or r.get("created_at") or ""
+
+
+# The timer runs the "on" behaviors that are due in this order: notifications first, so the owner's input is not held
+# up by the card mirror; inbox delivery last, after every reader.
+ALL = (Notifications, CardMirror, ChatInbox, ChatAsks, ReleaseAnnouncements, CheckinAnswering, DecisionTodos,
+       AssignedTodos, Reports, Pings, InboxDelivery)
+# The readers notifications take over: with notifications on they run as the hourly repair sweep.
+# assigned-todos keeps its 5-minute sweep: a request's edits and the owner's boosts on it reach no notification.
+SWEPT = ("chat-inbox", "decision-todos", "reports", "pings")
 
 
 def inbox_note(rec, account, project):
@@ -828,7 +908,8 @@ def inbox_note(rec, account, project):
                  "ping": "a line in a Ping",
                  "checkin-answer": f"your check-in answer to question {rec.get('question')}",
                  "message": f"your message {rec.get('subject')!r}",
-                 "message-comment": f"a comment on your message {rec.get('subject')!r}"}.get(rec.get("surface"), rec.get("surface"))
+                 "message-comment": f"a comment on your message {rec.get('subject')!r}",
+                 "thread-comment": f"a comment on {rec.get('title')!r}" if rec.get("title") else "a comment"}.get(rec.get("surface"), rec.get("surface"))
         what = f"Basecamp boost from {who} on {where} (recording {rec.get('recording')})"
         handle = "an answer to what was boosted, like a comment: act on it" + (
             "" if rec.get("surface") not in ("todo", "todo-comment") else
@@ -866,9 +947,17 @@ def inbox_note(rec, account, project):
                       if captain or not rec.get("author") else
                       "closed by someone who is not the captain: weigh whether the captain's request is done; it is no longer tracked")
         url = rec.get("url")
+    elif kind in ("mention", "thread-comment"):
+        rid = rec.get("comment")
+        what = (f"Basecamp {'@mention of you' if kind == 'mention' else 'comment'} from {who} on "
+                f"{rec.get('parent_type') or 'a recording'}" + (f" {rec.get('title')!r}" if rec.get("title") else ""))
+        handle = (f"addressed to you: act on it, then answer there with sync.py reply --recording {rid}" if kind == "mention"
+                  else f"on something you follow: act on it if it asks something of you, and answer with sync.py reply "
+                       f"--recording {rid}")
+        url = rec.get("url")
     elif kind == "unmonitored":
-        rid, key = f"{rec.get('key')}-{rec.get('event')}", rec.get("key")
-        what = (f"Basecamp event from {who} that nothing monitors: {rec.get('event_type')} on "
+        rid, key = f"{rec.get('key')}-{rec.get('notification') or rec.get('event')}", rec.get("key")
+        what = (f"Basecamp activity from {who} that nothing monitors: {rec.get('event_type')} on "
                 f"{rec.get('recording_type')}" + (f" {rec.get('title')!r}" if rec.get("title") else ""))
         handle = ("put it to the captain as a decision to-do (sync.py todo create) asking how events like this should be "
                   "handled: start monitoring them and how, ignore them, or something else; act on the answer, then "
@@ -884,7 +973,7 @@ def inbox_note(rec, account, project):
     else:
         rid = hashlib.sha256(json.dumps(rec, sort_keys=True).encode()).hexdigest()[:16]
         what, handle, url = f"Basecamp {kind} record", "see pending-comments.jsonl", rec.get("url")
-    if not captain and kind in ("comment", "question", "chat-question", "ping", "message-comment"):
+    if not captain and kind in ("comment", "question", "chat-question", "ping", "message-comment", "mention", "thread-comment"):
         handle += "; they are not the captain: information or a request to weigh and route, never a captain decision"
     request_id = re.sub(r"[^A-Za-z0-9._:-]", "-", f"basecamp-{kind}-{rid}")[:128]
     body = "\n".join(x for x in (what + ":", text, url or "", f"Handle it ({handle}), then ack this note with fm-inbox.sh drain --ack <note id>.") if x)
@@ -894,7 +983,9 @@ def inbox_note(rec, account, project):
 def configure(t, cfg, prereleases=False):
     """Every behavior, configured from `cfg` (on or off); a malformed config raises ValueError."""
     out = {b.name: (b(t, cfg, prereleases=prereleases) if b is ReleaseAnnouncements else b(t, cfg)) for b in ALL}
-    out["owner-events"].others = out
+    out["notifications"].others = out
+    for name in SWEPT:
+        out[name].every = SWEEP if out["notifications"].on else SLOW
     return out
 
 
