@@ -9,7 +9,8 @@ and that compose the tools: the card mirror ("tables", "repos"; off with "cards"
 false), the chat inbox ("chats"), chat asks ("ask_chat"), check-in answering
 ("checkins"), release announcements ("releases"), decision to-dos ("todos"),
 reports ("message_board"), Pings ("pings": the owner's direct messages to the agent's
-login), inbox delivery ("inbox") and the owner-event listener
+login), to-do requests ("assigned_todos": to-dos the owner assigns to the agent's login),
+inbox delivery ("inbox") and the owner-event listener
 ("listen", run by `sync.py listen` as a service beside the timer, which also records
 the owner's unmonitored events; `sync.py unmonitored` keeps their keys). prompts/base.md is
 the agent's side of each behavior.
@@ -17,7 +18,8 @@ the agent's side of each behavior.
 Deterministic, no model calls. Safety bounds, enforced here:
   - only the configured account, project, card tables, chats, check-ins, to-do set
     and message board are touched, and, with "pings" on, the Pings the agent's login
-    is in with the owner;
+    is in with the owner; with "assigned_todos" on, the project's to-dos assigned to
+    the agent's login are read and acknowledged with a 👀;
   - nothing is ever deleted, trashed or archived, except the acting user's own 👀
     boost once a question is answered; the timer run posts nothing to chat or as a
     comment, and its only writes besides the card mirror are 👀/👍 acknowledgement

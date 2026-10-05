@@ -342,6 +342,11 @@ class InitTest(unittest.TestCase):
         self.assertEqual(cfg, EXPECTED | {"pings": {}})
         self.assertNotIn("pings", self.init().discover()[0])
 
+    def test_assigned_todos_flag_turns_the_behavior_on(self):
+        cfg, _ = self.init(assigned_todos=True).discover()
+        self.assertEqual(cfg, EXPECTED | {"assigned_todos": {}})
+        self.assertNotIn("assigned_todos", self.init().discover()[0])
+
     def test_listen_installs_the_listener_service_only_when_set(self):
         self.init().main()
         self.assertFalse([c for c in self.system.calls if c[0] == "service"])
