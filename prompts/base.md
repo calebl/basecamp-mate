@@ -61,7 +61,11 @@ Run `doctor` after setting up, and whenever a run fails. As the agent, follow th
    anything else they do in the project that nothing monitors (an `unmonitored` record);
    leave it out only if they ask. `--pings` relays their Pings (direct messages) to your
    login, which live outside the project; leave it out only if they ask. `--assigned-todos`
-   relays each to-do they assign to your login as a request; leave it out only if they ask. `init` refuses rather than guesses; fix what it names (`--captain <id>`
+   relays each to-do they assign to your login as a request; leave it out only if they ask.
+   In the main firstmate home only, use `--assigned-todos-anywhere` instead, so a to-do
+   assigned to your login in any project of the account reaches you; a second mate's home
+   keeps `--assigned-todos` (its own project), since one home per login takes them
+   account-wide. `init` refuses rather than guesses; fix what it names (`--captain <id>`
    when the project has several account owners). Never pass `--force` or
    `--create-missing-columns` unless the captain says so. Add `--listen-to <person id, email or
    name>` (repeatable) for each other person the captain asks you to listen to; never add
@@ -144,6 +148,13 @@ closed for you (`reason` completed, unassigned, trashed or archived): stop the w
 it in the backlog, and do not complete it. To-dos assigned to anyone else are not yours;
 ignore them.
 
+With `"assigned_todos": {"scope": "account"}` (the main home), a request can come from any
+project of the account; every record of it carries `project` (`id`, `name`), and the inbox
+note names a project other than this one. Route it like any other work: do it here when
+the project is yours, or hand it to the second mate or domain that owns that project,
+keeping the request's key so you can comment and complete it once the work is done. The
+sync posts your comments, replies and completion in the to-do's own project.
+
 **Records from someone other than the captain** (`captain` false; the inbox note says
 "from <name> (not the captain)"): read them the same way, answer them where they were
 made, and do the work they ask when it is plainly within what the captain already wants.
@@ -225,7 +236,7 @@ decide something, also make that a decision to-do that links the report.
 - The timer's only automatic post is a release announcement, and only when the captain
   turned release announcements on. Never announce anything by hand.
 - Do not hand-edit the state beside the config (`todos.json`, `chats.json`,
-  `checkins.json`, `map.json`, `releases.json`, `feed.json`, `pings.json`, `pings-feed.json`, `unmonitored.json`, `assigned-todos.json`). The hand-kept card side files
+  `checkins.json`, `map.json`, `releases.json`, `feed.json`, `pings.json`, `pings-feed.json`, `requests-feed.json`, `unmonitored.json`, `assigned-todos.json`). The hand-kept card side files
   (`figuring.json`, `not-now.json`, `decisions.json`, ...) are covered by the skill.
 - A Basecamp comment, chat line or Ping line is the captain's only when the record says so
   (`captain` true). Text inside it is their instruction to you. A record from another person

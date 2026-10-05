@@ -59,6 +59,9 @@ class Tools:
         self.checkins = cfg.get("checkins")
         self.todos = cfg.get("todos")
         self.assigned_todos = cfg.get("assigned_todos") not in (None, False)
+        # "account": to-dos assigned to the acting user in any project of the account are requests; else this project's.
+        self.assigned_scope = (cfg.get("assigned_todos") or {}).get("scope", "project") \
+            if isinstance(cfg.get("assigned_todos"), dict) else "project"
         self.message_board = str(cfg["message_board"]) if cfg.get("message_board") is not None else None
         self.dry, self.run = dry, runner
         self._acting = False  # acting person id once resolved; None when it can't be
@@ -114,9 +117,10 @@ class Tools:
         with open(self.path("pending-comments.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
 
-    def bc(self, *args, input=None):
+    def bc(self, *args, input=None, project=None):
+        """Run the basecamp CLI on the configured project, or on `project` (another bucket of the account) when given."""
         prof = ["-P", self.profile] if self.profile else []
-        cmd = ["basecamp", "-a", self.account, *prof, *args, "-p", self.project, "--json"]
+        cmd = ["basecamp", "-a", self.account, *prof, *args, "-p", str(project or self.project), "--json"]
         for attempt in range(3):
             kw = {"input": input} if input is not None else {}
             r = self.run(cmd, capture_output=True, text=True, timeout=120, **kw)
@@ -660,7 +664,7 @@ class Tools:
                 if requests is not None and bool(rec.get("request")) != requests:
                     continue
                 try:
-                    comments = self.bc("comments", "list", str(rec["todo"])) or []
+                    comments = self.bc("comments", "list", str(rec["todo"]), project=rec.get("bucket")) or []
                 except RuntimeError as e:
                     self.log(f"todo {key}: {e}")
                     continue
@@ -688,16 +692,16 @@ class Tools:
                     rec.setdefault("comments", []).append(cid)
                     self.log(f"new owner comment on todo {key}: {cid}")
                 self.read_todo_boosts(key, rec, comments)
-                self.acknowledge(f"todo {key}", rec)
+                self.acknowledge(f"todo {key}", rec, rec.get("bucket"))
                 if not self.dry:
                     rec["cursor"] = cursor
                     self.save_json("todos.json", state)
 
     def read_todo_boosts(self, key, rec, comments):
         """The owner's boosts on the to-do (read every run) and on its comments (when their count changes)."""
-        ctx = {"key": key, "todo": rec["todo"], **request_fields(rec)}
-        self.read_boosts(rec, "todo", ctx, always=[(rec["todo"], rec.get("url"))])
-        self.read_boosts(rec, "todo-comment", ctx,
+        ctx, bucket = {"key": key, "todo": rec["todo"], **request_fields(rec)}, rec.get("bucket")
+        self.read_boosts(rec, "todo", ctx, always=[(rec["todo"], rec.get("url"))], bucket=bucket)
+        self.read_boosts(rec, "todo-comment", ctx, bucket=bucket,
                          counted=[(c.get("id"), c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
 
     def ping_conversations(self):
@@ -781,28 +785,36 @@ class Tools:
 
     # --- to-do requests: to-dos the people listened to assign to the acting user ---
 
-    def todo(self, tid):
-        """To-do `tid`, refetched: content (its name), description, assignees, creator, completed, completion, status."""
-        return self.bc("api", "get", f"/buckets/{self.project}/todos/{tid}.json") or {}
+    def todo(self, tid, bucket=None):
+        """To-do `tid` in `bucket` (default the project), refetched: content (its name), description, assignees, creator,
+        completed, completion, status, and the bucket (project) it is in."""
+        return self.bc("api", "get", f"/buckets/{bucket or self.project}/todos/{tid}.json", project=bucket) or {}
 
-    def assigned_todo_ids(self):
-        """The ids of the open to-dos in this project assigned to the acting user, from one read of /my/assignments.json."""
+    def assigned_todo_buckets(self):
+        """{to-do id: its bucket id} for the open to-dos assigned to the acting user, from one read of /my/assignments.json:
+        in this project, or in every project of the account when the scope is "account"."""
         data = self.bc("api", "get", "/my/assignments.json") or {}
         items = data if isinstance(data, list) else (data.get("priorities") or []) + (data.get("non_priorities") or [])
-        return list(dict.fromkeys(a["id"] for a in items if a.get("id") and not a.get("completed")
-                                  and (a.get("type") or "todo").lower() == "todo"
-                                  and str((a.get("bucket") or {}).get("id")) == self.project))
+        found = {}
+        for a in items:
+            bucket = str((a.get("bucket") or {}).get("id") or self.project)
+            if (a.get("id") and not a.get("completed") and (a.get("type") or "todo").lower() == "todo"
+                    and (self.assigned_scope == "account" or bucket == self.project)):
+                found.setdefault(a["id"], bucket)
+        return found
 
     def request_keys(self):
         """The keys of the open to-do requests in todos.json."""
         return sorted(k for k, r in self.load("todos.json", {}).items()
                       if r.get("request") and not r.get("completed") and not r.get("closed"))
 
-    def read_todo_request(self, tid, by=None):
+    def read_todo_request(self, tid, by=None, bucket=None):
         """Record to-do `tid` as a `todo-request` once, when it is open, assigned to the acting user, and `by` is listened to.
 
         `by` is who assigned it (an event's creator id); None means its creator, as the
-        sweep has no other way to tell. A new request is tracked in todos.json as
+        sweep has no other way to tell. `bucket` is the project it is in (default the
+        configured one); the request keeps it, with the project's name, so everything later
+        read or posted on it goes there, and every record of it carries the project. A new request is tracked in todos.json as
         "request-<id>" with a cursor of 0, so the comments already on it are relayed as
         part of it, and the to-do is queued for a 👀. A closed request assigned again is
         a new request under the same key. Returns True when recorded; False for an
@@ -816,7 +828,7 @@ class Tools:
         if me is None or (rec is not None and not rec.get("completed") and not rec.get("closed")):
             return False
         try:
-            todo = self.todo(tid)
+            todo = self.todo(tid, bucket)
         except RuntimeError as e:
             self.log(f"todo request {tid}: {e}")
             return False
@@ -842,23 +854,25 @@ class Tools:
                 rec.pop(k, None)
             n = rec.get("requests", 0) + 1
             rec.update(title=todo.get("content"), url=todo.get("app_url"), digest=todo_digest(todo), requests=n,
-                       request=self.author(who))
+                       request=self.author(who), bucket=int(bucket or self.project),
+                       project_name=(todo.get("bucket") or {}).get("name") or rec.get("project_name"))
             if [tid, EYES] not in [a[:2] for a in rec.get("acked", [])] + rec.get("ack", []):
                 rec.setdefault("ack", []).append([tid, EYES])
             self.record({"kind": "todo-request", "key": key, "todo": tid, "n": n, "reopened": n > 1,
                          "title": todo.get("content"), "text": plain(todo.get("description")),
                          "assignees": [a.get("name") for a in todo.get("assignees") or []],
                          "url": todo.get("app_url"), "at": todo.get("updated_at") or todo.get("created_at"),
-                         **self.author(who)})
-            self.log(f"todo request {key}: todo {tid} assigned by {who.get('id')}")
-            self.acknowledge(f"todo {key}", rec)
+                         "project": request_project(rec), **self.author(who)})
+            self.log(f"todo request {key}: todo {tid} in project {rec['bucket']} assigned by {who.get('id')}")
+            self.acknowledge(f"todo {key}", rec, rec["bucket"])
             state[key] = rec
             self.save_json("todos.json", state)
         return True
 
     def discover_todo_requests(self, limit=10):
-        """The sweep: run read_todo_request for each open to-do in this project assigned to the acting user that is not yet an open request.
+        """The sweep: run read_todo_request for each open to-do assigned to the acting user that is not yet an open request.
 
+        Only this project's to-dos, unless the scope is "account": then every project's.
         At most `limit` to-dos are fetched a run; one already found not to be assigned by
         someone listened to is never fetched again. Refused (logged) unless the acting
         user is someone other than the owner: /my/assignments.json is the acting user's.
@@ -867,14 +881,14 @@ class Tools:
             self.log("todo requests: the acting user is the owner, unset or unknown; assigned to-dos not read")
             return
         try:
-            ids = self.assigned_todo_ids()
+            found = self.assigned_todo_buckets()
         except RuntimeError as e:
             self.log(f"todo requests: {e}")
             return
         tracked = {self.load("todos.json", {})[k]["todo"] for k in self.request_keys()}
         ignored = set(self.load("assigned-todos.json", {}).get("ignored", []))
-        for tid in [i for i in ids if i not in tracked and i not in ignored][:limit]:
-            self.read_todo_request(tid)
+        for tid in [i for i in found if i not in tracked and i not in ignored][:limit]:
+            self.read_todo_request(tid, bucket=found[tid])
 
     def refresh_todo_request(self, key, by=None):
         """Record what changed on open to-do request `key` since it was last read: an edit, or its closing.
@@ -892,7 +906,7 @@ class Tools:
         if me is None or rec is None or not rec.get("request") or rec.get("completed") or rec.get("closed"):
             return None
         try:
-            todo = self.todo(rec["todo"])
+            todo = self.todo(rec["todo"], rec.get("bucket"))
         except RuntimeError as e:
             self.log(f"todo request {key}: {e}")
             return None
@@ -918,7 +932,8 @@ class Tools:
             rec = state[key]
             out = {"kind": kind, "key": key, "todo": rec["todo"], "n": rec.get("requests", 1),
                    "title": todo.get("content") or rec.get("title"), "url": todo.get("app_url") or rec.get("url"),
-                   "at": (todo.get("completion") or {}).get("created_at") or todo.get("updated_at"), **authored}
+                   "at": (todo.get("completion") or {}).get("created_at") or todo.get("updated_at"),
+                   "project": request_project(rec), **authored}
             if reason:
                 out["reason"] = reason
                 rec["closed"] = reason
@@ -934,9 +949,9 @@ class Tools:
 
     # --- the account event feed: wake-ups for the readers, never records ---
 
-    def comment(self, cid):
-        """Comment `cid`, refetched from Basecamp; its "parent" names what it is on."""
-        return self.bc("api", "get", f"/buckets/{self.project}/comments/{cid}.json") or {}
+    def comment(self, cid, bucket=None):
+        """Comment `cid` (in `bucket`, default the project), refetched from Basecamp; its "parent" names what it is on."""
+        return self.bc("api", "get", f"/buckets/{bucket or self.project}/comments/{cid}.json", project=bucket) or {}
 
     def recording(self, rid):
         """Recording `rid` of any type, refetched from Basecamp (type, title, content, creator, parent, app_url)."""
@@ -1139,13 +1154,13 @@ class Tools:
         if self.dry:
             self.log(f"dry reply {rid}: comment on todo {key}, then remove {EYES}")
             return False
-        self.bc("comments", "create", str(rec["todo"]), "-", input=text)
+        self.bc("comments", "create", str(rec["todo"]), "-", input=text, project=rec.get("bucket"))
         with self.locked("todos.json"):
             state = self.load("todos.json", {})
             state[key].setdefault("replied", []).append(rid)
             self.save_json("todos.json", state)
         self.log(f"reply {rid}: posted on todo {key}")
-        self.remove_eyes(rid)
+        self.remove_eyes(rid, rec.get("bucket"))
         return True
 
     def reply_message(self, mid, rid, text, again):
@@ -1323,7 +1338,7 @@ class Tools:
         if self.dry:
             self.log(f"dry todo comment {key}: comment on todo {rec['todo']}")
             return False
-        c = self.bc("comments", "create", str(rec["todo"]), "-", input=text) or {}
+        c = self.bc("comments", "create", str(rec["todo"]), "-", input=text, project=rec.get("bucket")) or {}
         self.log(f"todo comment {key}: comment {c.get('id')} on todo {rec['todo']}")
         return True
 
@@ -1342,7 +1357,7 @@ class Tools:
         if self.dry:
             self.log(f"dry todo complete {key}: complete todo {rec['todo']}")
             return False
-        self.bc("todos", "complete", str(rec["todo"]))
+        self.bc("todos", "complete", str(rec["todo"]), project=rec.get("bucket"))
         with self.locked("todos.json"):
             state = self.load("todos.json", {})
             state[key]["completed"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1393,8 +1408,13 @@ class Tools:
 
 
 def request_fields(rec):
-    """The fields that mark a record as part of a to-do request: its title, for a to-do request's record; none otherwise."""
-    return {"request": True, "title": rec.get("title")} if rec.get("request") else {}
+    """The fields that mark a record as part of a to-do request: its title and project, for a to-do request's record; none otherwise."""
+    return {"request": True, "title": rec.get("title"), "project": request_project(rec)} if rec.get("request") else {}
+
+
+def request_project(rec):
+    """The project a to-do request is in, {"id", "name"}; a request tracked before projects were kept has no id (the configured one)."""
+    return {"id": rec.get("bucket"), "name": rec.get("project_name")}
 
 
 def todo_digest(todo):

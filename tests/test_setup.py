@@ -326,6 +326,28 @@ class DoctorTest(Base):
         self.assertEqual(self.doctor(), 1)
         self.assertIn("is not a firstmate home", self.text())
 
+    def anywhere(self, config):
+        cfg = json.load(open(config))
+        cfg["assigned_todos"] = {"scope": "account"}
+        json.dump(cfg, open(config, "w"))
+
+    def test_one_home_taking_todos_anywhere_is_fine(self):
+        self.healthy()
+        self.anywhere(self.config)
+        self.assertEqual(self.doctor(), 0, self.text())
+
+    def test_two_homes_taking_todos_anywhere_with_one_login_warns(self):
+        self.healthy()
+        self.anywhere(self.config)
+        home2 = os.path.join(self.tmp, "home2")
+        shutil.copytree(self.home, home2)
+        config2 = os.path.join(home2, "data", "basecamp-sync", "config.json")
+        d = doctor.Doctor(runner=self.stub, system=self.system, which=lambda n: "/usr/bin/" + n, out=self.printed.append)
+        d.homes = lambda: [(self.home, self.config), (home2, config2)]
+        self.assertEqual(d.main(), 1)
+        self.assertIn(f"2 homes take to-dos assigned anywhere in account {ACCOUNT} with the sign-in 'firstmate'", self.text())
+        self.assertIn('keep "assigned_todos": {"scope": "account"} only in the main home', self.text())
+
     def test_stale_sync(self):
         self.healthy()
         with open(os.path.join(os.path.dirname(self.config), "sync.log"), "a") as f:

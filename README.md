@@ -61,7 +61,7 @@ policy. Each does one thing to the configured account and project:
 | check-in reader | reader | records each check-in question due today as `checkin` |
 | to-do comment reader | reader | records the owner's new comments on tracked open to-dos as `todo-comment` |
 | Ping reader | reader | finds the Pings (direct messages) the agent's login is in with the owner through `/my/readings.json` and records each new line the owner writes there as `ping` |
-| to-do request readers | reader | find the open to-dos in the project assigned to the agent's login (`/my/assignments.json`, or a to-do event) and record each one a listened-to person assigned as `todo-request`, once; then its edits and closing as `todo-request-update` and `todo-request-closed` |
+| to-do request readers | reader | find the open to-dos in the project (or, with `"scope": "account"`, any project of the account) assigned to the agent's login (`/my/assignments.json`, or a to-do event) and record each one a listened-to person assigned as `todo-request`, once; then its edits and closing as `todo-request-update` and `todo-request-closed` |
 | message comment reader | reader | records the owner's new comments on the agent's own recent Message Board posts as `message-comment` |
 | boost readers | reader | record the owner's new boosts, with their text, on every monitored surface as `boost` (below) |
 | event-feed reader | reader | polls Basecamp's account event feed (`/events.json`) for this project (or every bucket, for Pings) from a saved position and hands each page of thin events to a behavior; records nothing itself |
@@ -96,7 +96,7 @@ listener service; the others are carried out by the agent with the commands. The
 | `release-announcements` | `releases` | default, when the dock has one message board | post one message per new GitHub release | none |
 | `checkin-answering` | `checkins` | `--checkins <time zone>` | check-in reader | `answer` |
 | `decision-todos` | `todos` | `--todos` | to-do comment reader | `todo create`, `reply`/`todo comment`, `todo complete` |
-| `assigned-todos` | `assigned_todos` | `--assigned-todos` | to-do request readers, then the to-do comment reader for the requests | take each request on; `todo comment`/`reply`; `todo complete` when done |
+| `assigned-todos` | `assigned_todos` | `--assigned-todos` (`--assigned-todos-anywhere`: account-wide) | to-do request readers, then the to-do comment reader for the requests | take each request on; `todo comment`/`reply`; `todo complete` when done |
 | `reports` | `message_board` | `--reports` | comment and boost readers on the agent's messages | `post-message`; `reply` to feedback |
 | `pings` | `pings` | `--pings` | Ping reader | `reply` to each line, in the Ping |
 | `inbox-delivery` | `inbox` | `--inbox` | deliver each new pending record as a firstmate inbox note | handle the note, then `fm-inbox.sh drain --ack` |
@@ -179,6 +179,7 @@ reader for the surface each event points at:
 | an owner comment | refetches the comment for its parent, then that mirrored card's comment and 👍 readers, that tracked to-do's reader, or the reader for the agent's messages |
 | an owner boost | the reader whose state already knows the boosted recording (a card, a to-do, a chat line, a check-in answer, a message); for a recording none has seen yet, every reader that reads boosts except the card mirror's |
 | an owner to-do event (`todo.created`, `todo.assignment_changed`, `todo.description_changed`, `todo.completed`, ...), with `assigned_todos` on | for an open request, its edit and closing check; otherwise, for a to-do created or reassigned, the to-do request reader (see To-do requests) |
+| an owner to-do event, comment or boost in another project, with `assigned_todos` `"scope": "account"` | a third poll, of every bucket (position in `requests-feed.json`): the request's edit and closing check or the to-do request reader, and, for a comment or boost on a tracked request, that request's comment and boost reader; anything else there is ignored |
 
 Then it records unmonitored events (below) and runs inbox delivery, when that is on. An event is a thin pointer and only says
 which reader to run: records, 👀/👍 acknowledgements, seen-lists and inbox notes are the
@@ -288,10 +289,29 @@ longer records to-do events, or comments and boosts on to-dos, as unmonitored.
 Who assigned it decides how the agent treats it: from the captain it is captain work; from
 another listed person it is information or a request to weigh, never a captain decision.
 
+**Anywhere in the account.** With `"assigned_todos": {"scope": "account"}` (`init
+--assigned-todos-anywhere`), a to-do assigned to the agent's login in *any* project of the
+account is a request, not just one in the configured project. Every record of a request
+(`todo-request`, `todo-request-update`, `todo-request-closed`, and its `todo-comment` and
+`boost` records) carries `project`: `{"id", "name"}` of the project the to-do is in, and
+the inbox note names a project other than the configured one, so the agent can route the
+work. Everything later read or posted on it (comments, boosts, 👀, `reply`, `todo
+comment`, `todo complete`) goes to that project. The listener adds a poll of every bucket
+for the owner's to-do events, comments and boosts (its own position in
+`requests-feed.json`) and acts only on to-dos assigned to the agent and on tracked
+requests; the timer's sweep reads every project's assignments. The default scope,
+`"project"`, is unchanged: only the configured project's to-dos.
+
+Run the account-wide scope in **one home per Basecamp login**: the main home (firstmate's
+own), which routes each request to the home or domain that owns its project. Every other
+home on that login keeps `"assigned_todos": {}`, or leaves it off; two homes running it
+would each relay the same to-do. `basecamp-mate doctor` flags two homes on this computer
+that run it with the same account and `profile`; it cannot see homes on other computers.
+
 The listener sees the to-do events within about a minute, and knows who assigned the
 to-do from the event. The timer's sweep is the backup: one read of `GET
 /my/assignments.json` as the acting login (the agent's open assignments in every project,
-filtered to this one) finds a to-do the feed missed, attributed to its creator, since
+filtered to this one unless the scope is `account`) finds a to-do the feed missed, attributed to its creator, since
 Basecamp does not say who assigned it; at most `limit` new to-dos are fetched a sweep
 (`{"limit": <n>}`, default 10), and a to-do whose creator is not listened to is fetched
 once and remembered in `assigned-todos.json`. Each sweep then reads every open request's
@@ -303,7 +323,8 @@ one that signs in as the owner, nothing is read: the assignments would be the ow
 - Only the configured account, project, card tables, chats, check-ins, to-do set and
   message board are touched, and, with `pings` on, the Pings the acting login is in with
   the owner; with `assigned_todos` on, the project's to-dos assigned to the acting login are
-  read and acknowledged with a 👀. The listener only reads (the feed, a comment's parent, an
+  read and acknowledged with a 👀 (with `"scope": "account"`, those in any project of the
+  account, and the comments and boosts on them). The listener only reads (the feed, a comment's parent, an
   unmonitored event's recording, a to-do) and runs the same readers; it posts nothing beyond their
   👀/👍 acknowledgements.
 - Cards are never deleted, trashed or archived. Cards whose task left the backlog are
@@ -498,7 +519,9 @@ after 30s, running this checkout's `sync.py listen`), restarting it when its uni
 changed; without `listen` in the config no service is installed. `--pings` adds
 `"pings": {}`: the owner's Pings to the `--login` are relayed (see Pings).
 `--assigned-todos` adds `"assigned_todos": {}`: a to-do the owner assigns to the
-`--login` is a request (see To-do requests).
+`--login` is a request (see To-do requests). `--assigned-todos-anywhere` adds
+`"assigned_todos": {"scope": "account"}` instead: one in any project of the account is (only
+in the main home; see To-do requests).
 
 `--no-cards` sets a home up without the card mirror: it reads no card tables (the project
 need not have any), writes a config without `tables` or `repos`, creates only
@@ -590,9 +613,11 @@ or by hand from
   three handled types.
 - `pings` (optional): `{}` or `{"limit": <n>}`: relay the owner's Pings (direct messages)
   to the acting login, reading at most `n` Pings a run (default 10).
-- `assigned_todos` (optional): `{}` or `{"limit": <n>}`: treat a to-do a listened-to person
-  assigns to the acting login as a request, fetching at most `n` newly assigned to-dos a
-  sweep (default 10). See To-do requests.
+- `assigned_todos` (optional): `{}` or `{"limit": <n>, "scope": "project" | "account"}`:
+  treat a to-do a listened-to person assigns to the acting login as a request, fetching at
+  most `n` newly assigned to-dos a sweep (default 10); `"scope": "account"` takes them from
+  every project of the account (one home per login), the default `"project"` only from this
+  one. See To-do requests.
 - `chats` (optional): chat (Campfire) ids whose owner questions are relayed.
   An entry may be `{"chat": <id>, "every_line": true}` to relay every owner line in that chat.
 - `ask_chat` (optional): the chat id `sync.py ask` posts in.
@@ -622,9 +647,10 @@ Everything else lives beside the config, never in this repo:
 | `feed.json` | the listener | the event feed's position, the last event id handled and the filters they belong to |
 | `pings.json` | the script | `since` (the Ping reader's first run) and, per Ping chat id, its bucket, title, URL, line cursor, owner lines recorded, acknowledgement boosts queued and done, boost counts and boosts seen, lines replied to |
 | `pings-feed.json` | the listener | the every-bucket Ping poll's position, last event id and filters |
+| `requests-feed.json` | the listener | the every-bucket to-do request poll's position, last event id and filters (`assigned_todos` `"scope": "account"`) |
 | `unmonitored.json` | the listener | unmonitored-event key -> the first event and recording recorded, when, how many were seen, and the owner's decision once handled |
 | `sync.lock` | the script | the shared state lock held by a timer run, a listener cycle or a command |
-| `todos.json` | the script | to-do key -> to-do id, title, URL, created and completed times, comment cursor, owner comments recorded, acknowledgement boosts queued and done, comments replied to; for a to-do request (`request-<id>`), also who assigned it (`request`), how many times it was assigned (`requests`), a digest of its name and description, and why it closed (`closed`) |
+| `todos.json` | the script | to-do key -> to-do id, title, URL, created and completed times, comment cursor, owner comments recorded, acknowledgement boosts queued and done, comments replied to; for a to-do request (`request-<id>`), also who assigned it (`request`), how many times it was assigned (`requests`), a digest of its name and description, the project it is in (`bucket`, `project_name`), and why it closed (`closed`) |
 | `assigned-todos.json` | the script | `ignored`: to-dos assigned to the acting login whose creator is not listened to, so the sweep fetches each once |
 | `sync.log` | the script | one line per action, plus a counts line per run |
 | `pending-comments.jsonl` | the script | captain comments and approvals waiting to be relayed, one JSON record per line (see below) |
@@ -731,13 +757,15 @@ unchanged single-captain config and `init --listen-to`; `tests/test_pings.py` co
 `/my/readings.json`, the reply in a Ping, and the listener's every-bucket poll;
 `tests/test_assigned_todos.py` covers to-do requests with a stubbed `/my/assignments.json`:
 the sweep, who assigned it, comments, boosts, edits and closing, reassignment, the agent
-completing it, the to-do events in the listener, and their notes. The `basecamp`, `gh` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
+completing it, the to-do events in the listener, and their notes, plus the account-wide
+scope (a request in another project carrying its project, its comments, boosts, replies,
+edits and closing in that project, the every-bucket poll) and the unchanged project default. The `basecamp`, `gh` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
 registration sit behind a fake; tests make no network calls and touch no real home.
 `tests/test_setup.py` covers `setup` (defaults, a project URL, interactive picks, the card
 mirror creating tables and columns, the device-code sign-in, refusals, re-runs and a failed
 test sync) and `doctor` (a healthy home and each failure: no config, a locked keyring, an
 expired login, a missing column, a stopped listener, a failed or stale sync, an unregistered
-wake check, a missing home) with the CLIs, `systemctl` and `run.sh` stubbed.
+wake check, a missing home, two homes taking to-dos account-wide with one login) with the CLIs, `systemctl` and `run.sh` stubbed.
 
 ## Pending records
 
@@ -764,14 +792,15 @@ Only a record with `captain: true` can be a decision or an approval.
   with `sync.py reply --recording <comment>`.
 - `todo-request`: `key` (`request-<to-do id>`), `todo` (id), `n` (how many times it was
   assigned; `reopened` when more than once), `title`, `text` (the description), `assignees`
-  (names), `url`, `at`; `author` is who assigned it. A to-do assigned to the agent's login is
+  (names), `url`, `at`, `project` (`{"id", "name"}`, the project it is in); `author` is who
+  assigned it. A to-do assigned to the agent's login is
   a request: captain work when `captain` is true, a request to weigh otherwise. Complete it
   with `sync.py todo complete --todo <key>` when the work is done. Its later comments and
-  boosts are `todo-comment` and `boost` records with `request: true` and `title`.
-- `todo-request-update`: `key`, `todo`, `n`, `title`, `text` (the new description), `url`,
+  boosts are `todo-comment` and `boost` records with `request: true`, `title` and `project`.
+- `todo-request-update`: `key`, `todo`, `n`, `title`, `project`, `text` (the new description), `url`,
   `at`; `author` is who edited it when the listener saw the event, else null. The request's
   name or description changed.
-- `todo-request-closed`: `key`, `todo`, `n`, `title`, `reason` (`completed`, `trashed`,
+- `todo-request-closed`: `key`, `todo`, `n`, `title`, `project`, `reason` (`completed`, `trashed`,
   `archived` or `unassigned`), `url`, `at`; `author` is who completed it, when known, else
   null. The request is closed and no longer read; nothing is left to complete.
 - `message-comment`: `message` (id), `subject`, `comment` (id), `question`, `url` (the

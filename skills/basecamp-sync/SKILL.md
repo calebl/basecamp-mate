@@ -13,7 +13,7 @@ config turns on, each composed from tools: the card mirror (`tables`, `repos`; o
 check-in answering (`checkins`), release announcements (`releases`), decision to-dos
 (`todos`), reports (`message_board`), Pings (`pings`: the owner's direct messages to the
 agent's login, outside the project), to-do requests (`assigned_todos`: to-dos the owner
-assigns to the agent's login), inbox delivery (`inbox`) and the owner-event
+assigns to the agent's login, in the project or, with `"scope": "account"`, anywhere in the account), inbox delivery (`inbox`) and the owner-event
 listener (`listen`: a `sync.py listen` service beside the timer that polls Basecamp's event
 feed and runs the same readers within about a minute of the captain posting; the records
 are the same, plus an `unmonitored` record when the captain does something nothing
@@ -53,6 +53,9 @@ board that is really a repo's. When the owner wants only chat, check-ins or rele
 announcements, or the project has no card tables, pass `--no-cards`. `--todos`,
 `--reports`, `--every-line`, `--pings`, `--assigned-todos`, `--inbox`, `--listen` and `--checkins <time zone>` turn on decision
 to-dos, reports, every-line chat, Ping relaying, to-do requests, inbox delivery, the listener service and check-in answering; `--no-releases` leaves announcements out.
+`--assigned-todos-anywhere` takes to-do requests from every project of the account
+(`"assigned_todos": {"scope": "account"}`); only the main firstmate home uses it, and a
+second mate's home keeps `--assigned-todos`.
 `--listen-to <person id, email or name>` (repeatable) adds someone the sync listens to
 besides the captain (the config's `people`); add only the people the owner names. Never pass `--force` or `--create-missing-columns`
 without the main firstmate's go-ahead.
@@ -116,6 +119,16 @@ unassigned, trashed or archived: stop, note it in the backlog, nothing to comple
 work is done, comment what was done with full links, then
 `sync.py todo complete --todo <key>` (the key is `request-<to-do id>`). To-dos assigned to
 anyone else are ignored.
+
+**Account-wide** (`"assigned_todos": {"scope": "account"}`, `init --assigned-todos-anywhere`):
+a to-do assigned to the login in any project of the account is a request, and every record
+of it carries `project` (`id`, `name`); comments, boosts, edits and closing follow it there,
+and `reply`, `todo comment` and `todo complete` post in its project. Run it in **one home
+per Basecamp login**: the main firstmate home, which routes each request to the second mate
+or domain that owns its project (keeping the key, to comment and complete it when done).
+Every other home on that login keeps `"assigned_todos": {}` (its own project), or the same
+to-do reaches several homes; `basecamp-mate doctor` flags two homes on this computer doing
+it with the same account and `profile`.
 
 ## Pending records
 
@@ -192,7 +205,7 @@ The main firstmate's own home answers its questions itself rather than relaying.
 
 - Post, comment, complete, delete, archive or trash anything in Basecamp outside `sync.py`
   and its commands (`reply`, `ask`, `answer`, `todo create|track|comment|complete`,
-  `post-message`), or hand-edit `todos.json`, `feed.json`, `pings.json`, `assigned-todos.json` or `unmonitored.json`.
+  `post-message`), or hand-edit `todos.json`, `feed.json`, `pings.json`, `requests-feed.json`, `assigned-todos.json` or `unmonitored.json`.
   The sync's one automatic post is a release announcement: releases only (GitHub releases
   of the repos in `releases`, never merges or PRs), Message Board only. Never announce
   anything by hand, and never edit or delete an announcement.

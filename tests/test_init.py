@@ -347,6 +347,10 @@ class InitTest(unittest.TestCase):
         self.assertEqual(cfg, EXPECTED | {"assigned_todos": {}})
         self.assertNotIn("assigned_todos", self.init().discover()[0])
 
+    def test_assigned_todos_anywhere_takes_them_account_wide(self):
+        cfg, _ = self.init(assigned_anywhere=True).discover()
+        self.assertEqual(cfg["assigned_todos"], {"scope": "account"})
+
     def test_listen_installs_the_listener_service_only_when_set(self):
         self.init().main()
         self.assertFalse([c for c in self.system.calls if c[0] == "service"])

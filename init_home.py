@@ -28,7 +28,9 @@ in the chats) and --checkins <time zone> (the one Automatic Check-ins questionna
 as a firstmate inbox note, and the wake check then watches only failures. --pings
 relays the owner's Pings (direct messages) to the --login, which live outside the
 project. --assigned-todos treats a to-do the owner assigns to the --login in the
-project as a request: relayed, acknowledged and tracked until done. --listen-to <person> (repeatable: a person id, email or exact name) adds
+project as a request: relayed, acknowledged and tracked until done;
+--assigned-todos-anywhere does so in every project of the account (only one home per
+login should: the main one, which routes each request to the right domain). --listen-to <person> (repeatable: a person id, email or exact name) adds
 people the sync listens to besides the captain, as "people"; their input is relayed
 with who wrote it, but only the captain decides or approves. --listen
 turns on the owner-event listener and installs and enables its systemd user service
@@ -223,7 +225,7 @@ class System:
 class Init:
     def __init__(self, url, login, home, captain=None, listen_to=(), repo_map=(), create_missing=False, dry=False,
                  force=False, cards=True, todos=False, reports=False, every_line=False, checkins=None, releases=True, inbox=False,
-                 listen=False, pings=False, assigned_todos=False, chats=True, no_keyring=None, runner=subprocess.run, system=None, sync_dir=HERE, out=print):
+                 listen=False, pings=False, assigned_todos=False, assigned_anywhere=False, chats=True, no_keyring=None, runner=subprocess.run, system=None, sync_dir=HERE, out=print):
         self.account, self.project = parse_url(url)
         self.login, self.home = login, os.path.abspath(home)
         self.captain_arg, self.listen_to = captain, list(listen_to)
@@ -238,7 +240,7 @@ class Init:
             raise Refuse("--no-cards cannot be combined with --repo-map or --create-missing-columns")
         self.todos, self.reports, self.every_line, self.checkins = todos, reports, every_line, checkins
         self.releases, self.inbox, self.listen, self.pings = releases, inbox, listen, pings
-        self.assigned_todos = assigned_todos
+        self.assigned_todos, self.assigned_anywhere = assigned_todos or assigned_anywhere, assigned_anywhere
         self.chats = chats
         self.no_keyring = bool(os.environ.get("BASECAMP_NO_KEYRING")) if no_keyring is None else no_keyring
         if checkins is not None:
@@ -368,7 +370,7 @@ class Init:
         if self.pings:
             cfg["pings"] = {}
         if self.assigned_todos:
-            cfg["assigned_todos"] = {}
+            cfg["assigned_todos"] = {"scope": "account"} if self.assigned_anywhere else {}
         if self.listen:
             cfg["listen"] = {}
         if problems:
@@ -578,6 +580,9 @@ def cli(argv, **kw):
     ap.add_argument("--assigned-todos", action="store_true",
                     help="treat a to-do the owner assigns to the --login as a request: relayed, acknowledged with a 👀 "
                          "and tracked; the agent completes it with sync.py todo complete")
+    ap.add_argument("--assigned-todos-anywhere", action="store_true",
+                    help="--assigned-todos in every project of the account, not just this one; run it in one home per "
+                         "login only (the main home, which routes each request to the right domain)")
     ap.add_argument("--no-chats", action="store_true", help="leave the dock's chats out: no chat inbox")
     ap.add_argument("--no-keyring", action="store_true", default=None,
                     help="run the units with BASECAMP_NO_KEYRING=1 (the file credential store); "
@@ -591,7 +596,7 @@ def cli(argv, **kw):
              create_missing=a.create_missing_columns, dry=a.dry_run, force=a.force,
              cards=not a.no_cards, todos=a.todos, reports=a.reports, every_line=a.every_line,
              checkins=a.checkins, releases=not a.no_releases, inbox=a.inbox, listen=a.listen, pings=a.pings,
-             assigned_todos=a.assigned_todos, chats=not a.no_chats, no_keyring=a.no_keyring, **kw).main()
+             assigned_todos=a.assigned_todos, assigned_anywhere=a.assigned_todos_anywhere, chats=not a.no_chats, no_keyring=a.no_keyring, **kw).main()
     except Refuse as e:
         print(e, file=sys.stderr)
         return 2
