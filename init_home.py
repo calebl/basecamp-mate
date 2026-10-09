@@ -34,7 +34,12 @@ project as a request: relayed, acknowledged and tracked until done;
 --assigned-todos-anywhere does so in every project of the account (only one home per
 login should: the main one, which routes each request to the right domain). --listen-to <person> (repeatable: a person id, email or exact name) adds
 people the sync listens to besides the captain, as "people"; their input is relayed
-with who wrote it, but only the captain decides or approves. --listen is accepted for
+with who wrote it, but only the captain decides or approves. --operator <person> (the same
+forms) names someone whose word authorizes the agent as the captain's does, as
+"operators"; --participants-project (anyone on the project who is not a client) and
+--participants-domain <domain> (anyone whose email is at it; Basecamp shows other people's
+emails only to account admins, so for most logins it admits nobody) admit participants,
+who may ask the agent things but whose word never authorizes it. --listen is accepted for
 old scripts and does nothing: notifications on the timer replaced the event listener,
 and an existing config's "listen" key is dropped without --force. --no-chats leaves the
 dock's chats out. --no-keyring (on by default when BASECAMP_NO_KEYRING is set) gives the
@@ -213,12 +218,18 @@ class System:
 
 
 class Init:
-    def __init__(self, url, login, home, captain=None, listen_to=(), repo_map=(), create_missing=False, dry=False,
+    def __init__(self, url, login, home, captain=None, listen_to=(), operators=(), participants_project=False,
+                 participants_domains=(), repo_map=(), create_missing=False, dry=False,
                  force=False, cards=True, todos=False, reports=False, every_line=False, checkins=None, releases=True, inbox=False,
                  pings=False, assigned_todos=False, assigned_anywhere=False, chats=True, no_keyring=None, runner=subprocess.run, system=None, sync_dir=HERE, out=print):
         self.account, self.project = parse_url(url)
         self.login, self.home = login, os.path.abspath(home)
-        self.captain_arg, self.listen_to = captain, list(listen_to)
+        self.captain_arg, self.listen_to, self.operator_args = captain, list(listen_to), list(operators)
+        self.participants_project = participants_project
+        self.participants_domains = sorted({str(d).strip().lower().lstrip("@") for d in participants_domains})
+        bad = [d for d in self.participants_domains if "." not in d or "@" in d or " " in d]
+        if bad:
+            raise Refuse(f"--participants-domain takes a domain like example.com, got {', '.join(bad)}")
         self.repo_map = {}
         for pair in repo_map:
             name, sep, repo = pair.partition("=")
@@ -327,11 +338,21 @@ class Init:
         people = self.bc("api", "get", f"/projects/{self.project}/people.json") or []
         captain = self.find_captain(people, acting, problems)
         listened = self.find_people(people, acting, problems)
+        operators = self.find_people(people, acting, problems, self.operator_args, "--operator")
         if problems:
             raise Refuse("init refused, nothing was written:\n  - " + "\n  - ".join(problems))
         cfg = {"account": self.account, "project": self.project, "captain": captain, "profile": self.login}
         if listened:
             cfg["people"] = [captain] + sorted(set(listened) - {captain})
+        if set(operators) - {captain}:
+            cfg["operators"] = sorted(set(operators) - {captain})
+        if self.participants_project or self.participants_domains:
+            cfg["participants"] = {**({"project": True} if self.participants_project else {}),
+                                   **({"domains": self.participants_domains} if self.participants_domains else {})}
+            if self.participants_domains and not any(visible(p) for p in people if p.get("id") != acting):
+                self.out(f"warning: the login {self.login} sees no one else's email address on this project (Basecamp "
+                         "shows them only to account admins), so --participants-domain admits nobody; use "
+                         "--participants-project or --listen-to instead")
         if self.cards:
             cfg.update(repos=dict(sorted(repos.items())), tables=cfg_tables)
         chats = [d["id"] for d in dock if d.get("name") == "chat"] if self.chats else []
@@ -421,10 +442,12 @@ class Init:
             return None
         return hits[0]["id"]
 
-    def find_people(self, people, acting, problems):
-        """The person ids each --listen-to names (an id, an email or an exact name), refusing a miss, a tie or the login."""
+    def find_people(self, people, acting, problems, args=None, flag="--listen-to"):
+        """The person ids each --listen-to (or `flag`, naming `args`) names (an id, an email or an exact name), refusing a
+        miss, a tie or the login. An email matches only when the login can see it: Basecamp masks other people's
+        email addresses unless the login is an account admin."""
         found = []
-        for arg in (str(a).strip() for a in self.listen_to):
+        for arg in (str(a).strip() for a in (self.listen_to if args is None else args)):
             if arg.isdigit():
                 hits = [p for p in people if p.get("id") == int(arg)]
             else:
@@ -432,11 +455,15 @@ class Init:
                 hits = hits or [p for p in people if (p.get("name") or "").strip().lower() == arg.lower()]
             if len(hits) != 1:
                 names = ", ".join(f"{p.get('name')} ({p.get('id')})" for p in hits)
-                problems.append(f"--listen-to {arg} matches " + (f"several people on the project: {names}; pass the person id"
-                                                                  if hits else "no person on the project"))
+                masked = "@" in arg and not hits and any(not visible(p) for p in people if p.get("id") != acting)
+                problems.append(f"{flag} {arg} matches " + (f"several people on the project: {names}; pass the person id"
+                                                            if hits else "no person on the project" + (
+                                                                " (Basecamp hides other people's email addresses unless the "
+                                                                "login is an account admin; pass the person id or exact name)"
+                                                                if masked else "")))
                 continue
             if hits[0].get("id") == acting:
-                problems.append(f"--listen-to {arg} is the login {self.login} itself; the agent never listens to its own lines")
+                problems.append(f"{flag} {arg} is the login {self.login} itself; the agent never listens to its own lines")
                 continue
             found.append(hits[0]["id"])
         return found
@@ -529,6 +556,12 @@ class Init:
         return done
 
 
+def visible(person):
+    """True when `person`'s email address is shown in full, not masked (Basecamp shows it only to them and to admins)."""
+    email = str(person.get("email_address") or "")
+    return "@" in email and "\u2022" not in email
+
+
 def cli(argv, **kw):
     ap = argparse.ArgumentParser(prog="sync.py init", description="Set a firstmate home up to mirror into one Basecamp project.")
     ap.add_argument("url", help="the Basecamp project URL, e.g. https://app.basecamp.com/<account>/projects/<project>")
@@ -538,6 +571,15 @@ def cli(argv, **kw):
     ap.add_argument("--listen-to", action="append", default=[], metavar="PERSON",
                     help="also relay this person's lines, comments and boosts as information, never as the captain's "
                          "decisions: a person id, email or exact name on the project (repeatable; the captain is always listened to)")
+    ap.add_argument("--operator", action="append", default=[], metavar="PERSON",
+                    help="someone whose word authorizes the agent as the captain's does (approvals, decisions): a person "
+                         "id, email or exact name on the project (repeatable)")
+    ap.add_argument("--participants-project", action="store_true",
+                    help="also relay what anyone on the project (not a client) writes to the agent, as questions whose "
+                         "word never authorizes it")
+    ap.add_argument("--participants-domain", action="append", default=[], metavar="DOMAIN",
+                    help="the same for anyone whose email is at DOMAIN (repeatable); Basecamp shows other people's emails "
+                         "only to account admins, so for most logins this admits nobody")
     ap.add_argument("--repo-map", action="append", default=[], metavar="TABLE=REPO",
                     help="map a card table to a backlog repo when their names differ (repeatable)")
     ap.add_argument("--create-missing-columns", action="store_true",
@@ -572,7 +614,8 @@ def cli(argv, **kw):
     if a.listen:
         print("--listen is no longer needed: notifications on the timer replaced the event listener", file=sys.stderr)
     try:
-        Init(a.url, a.login, a.home, captain=a.captain, listen_to=a.listen_to, repo_map=a.repo_map,
+        Init(a.url, a.login, a.home, captain=a.captain, listen_to=a.listen_to, operators=a.operator,
+             participants_project=a.participants_project, participants_domains=a.participants_domain, repo_map=a.repo_map,
              create_missing=a.create_missing_columns, dry=a.dry_run, force=a.force,
              cards=not a.no_cards, todos=a.todos, reports=a.reports, every_line=a.every_line,
              checkins=a.checkins, releases=not a.no_releases, inbox=a.inbox, pings=a.pings,

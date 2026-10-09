@@ -68,7 +68,7 @@ policy. Each does one thing to the configured account and project:
 | thread reader | reader | records the owner's new comments on any other thread the agent's login follows or is @mentioned in (a card whatever its backlog state, a document, an upload, someone else's to-do or message) as `thread-comment` or `mention`, and a mention in a chat nothing relays as `chat-question` |
 | to-do request readers | reader | find the open to-dos in the project (or, with `"scope": "account"`, any project of the account) assigned to the agent's login (`/my/assignments.json`, or a to-do event) and record each one a listened-to person assigned as `todo-request`, once; then its edits and closing as `todo-request-update` and `todo-request-closed` |
 | message comment reader | reader | records the owner's new comments on the agent's own recent Message Board posts as `message-comment` |
-| boost readers | reader | record the owner's new boosts, with their text, on every monitored surface as `boost` (below) |
+| boost readers | reader | record the owner's new boosts, with their text, on every monitored surface as `boost` (below); a boost on the agent login's own recording only once its received-boosts feed lists it |
 | unmonitored recorder | reader | records owner input that no behavior handles as `unmonitored`, once per kind of thing (below) |
 | `sync.py reply` | command | answers a recorded comment, chat line, Ping line, to-do comment, thread comment or mention where it was made, then removes the 👀 |
 | `sync.py ask` | command | posts a new chat line @mentioning the owner |
@@ -78,6 +78,7 @@ policy. Each does one thing to the configured account and project:
 | `sync.py todo comment` | command | comments on a tracked to-do |
 | `sync.py todo complete` | command | completes a tracked to-do (a decision to-do, or a to-do request when the work is done) |
 | `sync.py post-message` | command | posts a message (subject and body) on the configured message board |
+| `sync.py status` | command | lists the sync runs on this computer, what each watches and with which login, and any `sync.py` running unrecorded (see "One home per project and login") |
 | `sync.py unmonitored list\|handle\|forget` | command | lists the unmonitored-event keys, marks one handled with the owner's decision, or drops one so it is raised again |
 | inbox note | primitive | queues a note in a firstmate home's inbox through its `bin/fm-inbox.sh note --request-id` |
 | card, Message Board and boost primitives | primitive | create, update, move, assign and unassign a card; post a board message; add an acknowledgement boost |
@@ -125,25 +126,54 @@ behaviors run the same either way. Set such a home up with `sync.py init --no-ca
 
 ## People the sync listens to
 
-By default the sync listens only to the captain. The optional `people` list (Basecamp
-person ids, set with `sync.py init --listen-to <person>`) adds others: every reader that
-relays the captain (chat lines, every-line chats, card, to-do, message and thread
-comments, mentions, boosts on every surface, Pings, to-do requests and unmonitored input)
-then relays them too. The captain is always on the list, whether or not
-`people` names them, and the acting login never is: its own lines only move cursors.
-"Owner" below means anyone on the list.
+By default the sync listens only to the captain. The agent acts with the captain's
+authority, so who else reaches it, and whose word counts, is widened only deliberately,
+in the config (or with `init`'s flags), in three ways:
 
-Every record says who wrote it (`author`: `id`, `name`) and whether that is the captain
-(`captain`: true or false), and so does its inbox note ("from the captain" or "from
-<name> (not the captain)"). Authority stays with the captain alone:
+- **Operators** (`operators`: person ids, `init --operator <person>`) are named people
+  whose word authorizes the agent as the captain's does. They are listened to everywhere
+  the captain is.
+- **People** (`people`: person ids, `init --listen-to <person>`) are named people the agent
+  listens to as **participants**: every reader that relays the captain (chat lines,
+  every-line chats, card, to-do, message and thread comments, mentions, boosts on every
+  surface, Pings, to-do requests and unmonitored input) relays them too.
+- **Participants by rule** (`participants`: `{"project": true}`, `init
+  --participants-project`, and/or `{"domains": ["example.com"]}`, `init
+  --participants-domain <domain>`): anyone on the project who is not a client, or anyone
+  whose email address is at a listed domain. They may ask the agent things: their chat
+  lines (in a relayed chat), Pings, comments and @mentions are relayed as a participant's.
+  Their boosts, to-do assignments and unmonitored input are not: a boost or an assignment
+  reads as a decision, which a participant cannot make, and a whole project's unrelated
+  activity is not something to ask the captain about.
 
-- only the captain's 👍 on an assigned card is an `approval`; anyone else's is a `boost`;
-- only the captain's comment or boost on a decision to-do is the decision; another
-  person's is input to weigh, and the to-do stays open for the captain;
-- a check-in question's instruction is the captain's only when they wrote it;
+The captain always counts, whether or not a list names them, and the acting login never
+does: its own lines only move cursors. "Owner" below means anyone the sync listens to.
+
+**One caveat decides which to use.** Basecamp shows a person's email address only to
+themselves and to account admins; everyone else sees it masked (`r••••@•••.•••`). Unless
+the agent's login is an account admin, a domain matches no one and an email passed to
+`--operator` or `--listen-to` matches no one (`init` says why). `"project": true` and the
+named lists are keyed on person ids, which every login sees. `init` warns, and `doctor`
+flags, domains that can admit nobody. The project's people are read once a run, only when
+someone not named writes, and kept in `participants.json`, whose last list stands in when
+that read fails.
+
+Every record says who wrote it (`author`: `id`, `name`), whether that is the captain
+(`captain`: true or false) and their `role` (`captain`, `operator` or `participant`), and
+so does its inbox note ("from the captain", "from <name> (an operator: their word counts
+as the captain's)" or "from <name> (not the captain)"). A record **authorizes** when its
+`role` is `captain` or `operator`; a participant's never does:
+
+- only the captain's or an operator's 👍 on an assigned card is an `approval`; a
+  participant's is a `boost`;
+- only the captain's or an operator's comment or boost on a decision to-do is the
+  decision; a participant's is input to weigh, and the to-do stays open;
+- a check-in question's instruction counts only when the captain or an operator wrote it;
+- a to-do request from the captain or an operator is captain work; a participant's is a
+  request to weigh and route;
 - decision to-dos, assigned cards and `sync.py ask` mentions are still the captain's alone.
 
-A config with only `captain` behaves exactly as before.
+A config with only `captain` behaves exactly as before; its records gain only `role`.
 
 ## Card mirror
 
@@ -220,6 +250,19 @@ recording (the chat, Ping, mirrored card, tracked to-do, message, check-in answe
 followed thread), which records it as a `boost` (or the captain's 👍 on an assigned card as
 an `approval`). A boost on a to-do request, which the owner created, is not listed there;
 the `assigned-todos` sweep reads those every 5 minutes.
+
+**Boost confirmation.** `/my/boosts.json` is read once a run, and that one read serves
+both the notifications and every boost reader. A boost a reader finds on one of the
+agent login's own recordings (its chat or Ping line, comment, card, decision to-do,
+message or check-in answer) is recorded, approval included, only when that read lists it
+on the same recording by the same booster: Basecamp files a boost there under the person
+it was aimed at, so the listing proves both that the boost exists and that it was aimed
+at the agent, and the record's booster, text and time are taken from it. A boost the read
+does not list is retried while it is under 5 minutes old (it may have landed after the
+read; a failed read retries too), then dropped with a line in `sync.log`. A boost on
+anyone else's recording (the owner's own to-do request, a colleague's chat line) is not
+aimed at the agent and is recorded as read, as before; so is every boost with no
+`profile`, or one that signs in as the owner, since there is then no agent feed.
 
 **Mark read.** Once an item is handled with no failed Basecamp call, it is marked read
 (`basecamp notifications read <ids>`), after its records are written; `"notifications":
@@ -458,7 +501,9 @@ one that signs in as the owner, nothing is read: the assignments would be the ow
   `message` and `message-comment` (the agent's own posts on `message_board` from the last
   14 days, and their comments). The first time a surface's state has no boost counts,
   they are seeded without recording, so turning this on (or upgrading) never replays old
-  boosts. The acting user's own boosts are never recorded.
+  boosts. The acting user's own boosts are never recorded, and a boost on the acting
+  user's own recording only once its received-boosts feed lists it (see "Boost
+  confirmation" under Notifications).
 - Inbox delivery: with `inbox` set (`{}` for the `--home`, or `{"fm_home": "<home>"}`),
   each run ends by delivering every record appended to `pending-comments.jsonl` since the
   last delivery as a note through `<fm_home>/bin/fm-inbox.sh note --request-id
@@ -508,6 +553,39 @@ one that signs in as the owner, nothing is read: the assignments would be the ow
   would add) and leaves `map.json` and the pending file alone; it logs, per card,
   whether it would be created, updated, moved, assigned or unassigned, and a total.
 
+## One home per project and login
+
+Two homes whose configs watch the same project with the same Basecamp login would each
+read the same notifications, record the same input, acknowledge it twice and wake two
+agents. The shared state lock cannot stop that, since it is per config, so every timer run
+first claims what its config watches ([`runs.py`](runs.py)): its project, and,
+account-wide, its login's Pings (with `pings`) and the to-dos assigned to it anywhere
+(with `"assigned_todos": {"scope": "account"}`). Two claims overlap when they share one of
+those with the same login: the same Basecamp person when both runs know it, else the same
+`profile`. A run beside another config's live claim that overlaps is refused: it reads
+nothing, exits 1 and logs `FAILED duplicate run`, naming the other home, its config and
+login, when it last ran or its pid if it is running now (once, then hourly, so the wake
+check and `doctor` see it without flooding the log). When the other run stops, the next
+run says `duplicate run cleared` and carries on. Two runs of the same config are never
+duplicates: they share one claim and the state lock serializes them, and the explicit
+commands (`reply`, `todo ...`) never claim.
+
+Each config's claim is a file in `$BASECAMP_MATE_RUNS` (default
+`~/.local/state/basecamp-mate/runs/`): the config and home, the login, what it watches, the
+run's pid and process start time, and when it last ran. A claim is live while its run is
+going (the pid, checked against its start time since pids are recycled) or for 10 minutes
+after it last ran while its config still exists. The timer runs every 30 seconds, so a
+killed run, a stopped timer or a removed config stops blocking within 10 minutes, and a
+claim whose config is gone is removed. Checking and claiming are one step under a lock, so
+two homes starting together cannot both claim. A dry run checks and claims nothing.
+
+`basecamp-mate status` (`sync.py status`) lists every claim, live or stale, what it
+watches and with which login, the live claims it overlaps, and any `sync.py` process
+running (from `/proc`) whose config holds no claim. To run two homes on the same thing on
+purpose, set `"allow_duplicate": true` in the config (or pass `--allow-duplicate` to one
+run); the run then notes the overlap once and goes ahead. `doctor` flags homes on this
+computer whose configs overlap, unless all of them allow it.
+
 ## Set up a home
 
 ```sh
@@ -526,7 +604,11 @@ email>` names the captain; by default it is the project's one account owner othe
 login. `--listen-to <person>` (repeatable: a person id, email or exact name on the
 project) adds someone the sync listens to besides the captain, written as `people` (the
 captain first); a name or email matching no one or several people, or the login itself,
-is refused. `--repo-map <table>=<repo>` (repeatable) maps a table whose title is not a
+is refused. `--operator <person>` (repeatable, the same forms) names an operator, written
+as `operators`; `--participants-project` and `--participants-domain <domain>` (repeatable)
+admit participants, written as `participants` (see "People the sync listens to"; an email
+the login sees masked matches no one, and `init` says so, and warns when a domain can admit
+nobody). `--repo-map <table>=<repo>` (repeatable) maps a table whose title is not a
 registered project's name. A table whose title matches no registered project and that
 `--repo-map` does not name (a general "Ideas" board, say) is skipped: `init` prints a line
 for it, leaves it out of the config, never reads its columns, and the sync never touches
@@ -605,9 +687,11 @@ expired token as `run.sh` would), the project and the dock tools the config name
 table's columns by id and title, the agent's notifications (`/my/readings.json` readable,
 and fewer than Basecamp's 100 unread), the timer units (installed, pointing at files that
 exist, enabled and active) and a leftover listener service, the last `sync.log` line
-(FAILED, or older than 20 minutes),
-and the wake check's registration. Each problem prints with its fix; it exits 1 when anything
-is broken.
+(FAILED, or older than 20 minutes; a `FAILED duplicate run` names `basecamp-mate status`),
+the wake check's registration, and, with `participants` domains, that the login sees anyone's
+email address; then, across the homes checked, that no two watch the same project, Pings or
+account-wide to-do requests with the same login (unless all set `"allow_duplicate"`). Each
+problem prints with its fix; it exits 1 when anything is broken.
 
 ### The base prompt and the agent skill
 
@@ -634,9 +718,18 @@ or by hand from
 - `account`, `project`: Basecamp ids.
 - `captain`: the captain's Basecamp person id: the assignee, and the only person whose
   word is a decision or approval.
+- `operators` (optional): Basecamp person ids whose word authorizes the agent as the
+  captain's does (approvals, decisions); they are listened to like the captain. Default:
+  none. See "People the sync listens to".
 - `people` (optional): the Basecamp person ids whose lines, comments and boosts are
-  relayed; the captain is always included. Default: just the captain. See "People the
-  sync listens to".
+  relayed, as participants; the captain is always included. Default: just the captain.
+- `participants` (optional): `{"project": true}` and/or `{"domains": ["<domain>", ...]}`:
+  also relay what anyone on the project (not a client), or with an email at a domain,
+  writes to the agent, as a participant's. Domains need a login that sees email addresses
+  (an account admin).
+- `allow_duplicate` (optional): `true` lets a timer run go ahead beside another home's live
+  run that watches the same thing with the same login. See "One home per project and
+  login".
 - `profile` (optional): the `basecamp` CLI login every call runs as (`-P <profile>`),
   including `run.sh`'s token refresh. Absent means the CLI's default login. It changes
   only who acts; `captain` stays the assignee and the only person whose 👍 approves, and
@@ -676,7 +769,8 @@ or by hand from
 - `tables` (card mirror): per board, the card table id (`table`) and a column id for each of
   `Triage`, `Not now`, `Figuring it out`, `In progress`, `Ready for QA`, `Done`.
 
-Everything else lives beside the config, never in this repo:
+Everything else lives beside the config, never in this repo (except each config's run
+claim, in `~/.local/state/basecamp-mate/runs/`; see "One home per project and login"):
 
 | File | Kept by | Purpose |
 | --- | --- | --- |
@@ -687,11 +781,12 @@ Everything else lives beside the config, never in this repo:
 | `inbox.json` | the script | the line cursor of `pending-comments.jsonl` delivered to the inbox, and request ids whose failure was logged |
 | `messages.json` | the script | per agent message: comment cursor, owner comments recorded, acknowledgement boosts queued and done, comments replied to; boost counts and boosts seen on the messages and their comments |
 | `notifications.json` | the script | per notification id, its cursor (`unread_at` when last handled); the boost ids seen in `/my/boosts.json`; ids whose mark-read failed, to retry |
-| `timer.json` | the script | when each behavior's timer step last ran (`ran`), for its cadence |
+| `timer.json` | the script | when each behavior's timer step last ran (`ran`), for its cadence; while refused as a duplicate run, the homes it overlaps and when that was last logged (`duplicate`) |
 | `threads.json` | the script | per followed thread (`<bucket>:<recording>`): its type and title, comment cursor, owner comments recorded, acknowledgement boosts queued and done, boost counts and boosts seen, comments replied to |
 | `pings.json` | the script | `since` (the Ping reader's first run) and, per Ping chat id, its bucket, title, URL, line cursor, owner lines recorded, acknowledgement boosts queued and done, boost counts and boosts seen, lines replied to |
 | `unmonitored.json` | the script | unmonitored key -> the first notification (or boost) and recording recorded, when, how many were seen, and the owner's decision once handled |
 | `sync.lock` | the script | the shared state lock held by a timer run or a command |
+| `participants.json` | the script | the project's non-client person ids, as last read for `"participants": {"project": true}` |
 | `todos.json` | the script | to-do key -> to-do id, title, URL, created and completed times, comment cursor, owner comments recorded, acknowledgement boosts queued and done, comments replied to; for a to-do request (`request-<id>`), also who assigned it (`request`), how many times it was assigned (`requests`), a digest of its name and description, the project it is in (`bucket`, `project_name`), and why it closed (`closed`) |
 | `assigned-todos.json` | the script | `ignored`: to-dos assigned to the acting login whose creator is not listened to, so the sweep fetches each once |
 | `sync.log` | the script | one line per action, plus a counts line per run |
@@ -731,7 +826,9 @@ A run from the command line runs only the steps that are due, like the timer; ad
 to run every step now. Drop `--dry-run` to apply. `run.sh <home> <config> [--dry-run]` is
 the scheduled entry point: it refreshes the Basecamp OAuth token when under three days remain (logging a
 failure to `sync.log`), then runs `sync.py`, all within a 240-second cap (each token
-call gets at most 30 seconds).
+call gets at most 30 seconds). A run first claims what its config watches and refuses to
+run beside another home's live run on the same thing with the same login;
+`--allow-duplicate` overrides that for one run (see "One home per project and login").
 
 ### A dedicated Basecamp user
 
@@ -801,6 +898,19 @@ config; `tests/test_people.py` covers the `people` list: relaying
 several people with who wrote each record, captain-only approvals and decisions, an
 unchanged single-captain config and `init --listen-to`; `tests/test_pings.py` covers the Ping reader with a stubbed
 `/my/readings.json`, the reply in a Ping, and a Ping's notification and boosts;
+`tests/test_trust.py` covers operators and participants: roles, an operator's line,
+decision, approval and to-do request authorizing, project members and email domains heard
+as participants (clients, strangers and masked emails not), never through boosts,
+assignments or unmonitored input, the project's people read once a run with its last list
+standing in, a participant's Ping, `init`'s flags and `doctor`'s domain check;
+`tests/test_received_boosts.py` covers boost confirmation: a listed boost recorded with
+the feed's booster and text from one feed read a run, an unlisted one retried while recent
+and then dropped, a feed entry by another booster or on another recording, a failed feed
+read, a boost on someone else's recording, an assigned card's approval, and no feed without
+a profile; `tests/test_runs.py` covers the run guard: claiming, refusing and naming another
+home's live overlapping run (project, login by person or profile, Pings), logging it once
+then hourly, stale, removed and recycled-pid claims, the override, dry runs, commands,
+`sync.py status`, and `doctor`'s overlap check;
 `tests/test_assigned_todos.py` covers to-do requests with a stubbed `/my/assignments.json`:
 the sweep, who assigned it, comments, boosts, edits and closing, reassignment, the agent
 completing it, the `Assignment` and `Completion` notifications, and their notes, plus the account-wide
@@ -819,10 +929,13 @@ account-wide with one login) with the CLIs, `systemctl` and `run.sh` stubbed.
 
 Each line of `pending-comments.jsonl` is one JSON object with a `kind`. Records written
 before `kind` existed have none; treat a missing `kind` as `"comment"`. Every record but
-`checkin` is something a listened-to person did, and carries `author` (`id`, `name`) and
-`captain` (true when the captain wrote it); a `checkin` carries the question's writer the
-same way. A record written before the `people` list has neither and is the captain's.
-Only a record with `captain: true` can be a decision or an approval.
+`checkin` is something a listened-to person did, and carries `author` (`id`, `name`),
+`captain` (true when the captain wrote it) and `role` (`captain`, `operator` or
+`participant`; null for a check-in question's writer nobody listens to); a `checkin`
+carries the question's writer the same way. A record written before the `people` list has
+none of them and is the captain's; one written before operators has no `role`. Only a
+record whose `role` is `captain` or `operator` (without `role`: `captain` true) can be a
+decision or an approval.
 
 - `comment`: `task`, `repo`, `card`, `comment` (id), `at`, `text`.
 - `question`: the same fields as `comment`, for a comment containing `?`.
@@ -841,7 +954,7 @@ Only a record with `captain: true` can be a decision or an approval.
   `url`, `at`. A check-in question came due today; answer it with `sync.py answer`. An
   instruction in it is the captain's only when `captain` is true.
 - `approval`: `task`, `repo`, `card`, `url` (card URL), `boost` (id), `text`, `at`. The captain
-  gave the card a 👍: approve every recommendation on it as recommended.
+  (or an operator) gave the card a 👍: approve every recommendation on it as recommended.
 - `todo-comment`: `key`, `todo` (id), `comment` (id), `question` (true when it contains
   `?`), `url` (the comment), `text`, `at`. The owner commented on a tracked to-do; answer
   with `sync.py reply --recording <comment>`.

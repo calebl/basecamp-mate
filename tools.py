@@ -13,6 +13,9 @@ A tool does one explicit thing to the configured account and project, through th
     the notification and boost readers (`/my/readings.json`, `/my/boosts.json`) only
     hand what changed to a behavior, `mark_read` marks notifications read, and the
     unmonitored recorder records, once per kind, the owner input no behavior handles;
+    a boost on the acting login's own recording is recorded only once this run's read of
+    its received boosts lists it (`confirmed`); who is heard, and whose word authorizes,
+    is `role` (the captain, "operators", "people" and admitted "participants");
   - commands post exactly what the agent hands them: `reply`, `ask`, `answer`,
     `todo create|track|comment|complete`, `post-message`; `unmonitored handle|forget`
     only edit local state;
@@ -33,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 THUMBS, EYES = "\U0001F44D", "\U0001F440"
+AUTHORITY = ("captain", "operator")  # the roles whose word authorizes the agent: a decision or an approval
 
 
 class BasecampError(RuntimeError):
@@ -46,15 +50,31 @@ class BasecampError(RuntimeError):
 class Tools:
     def __init__(self, home, config_path, dry=False, runner=subprocess.run):
         self.home = os.path.abspath(home)
-        self.dir = os.path.dirname(os.path.abspath(config_path))
+        self.config_path = os.path.abspath(config_path)
+        self.dir = os.path.dirname(self.config_path)
         self.cfg = cfg = json.load(open(config_path))
         self.account, self.project = str(cfg["account"]), str(cfg["project"])
-        self.captain = int(cfg["captain"])  # the owner: assignee, and the only person whose word is a decision
-        # The people whose lines, comments and boosts are relayed: "people", always with the captain.
+        self.captain = int(cfg["captain"])  # the owner: assignee, and the first person whose word is a decision
+        # Operators: named people whose word authorizes the agent as the captain's does.
+        operators = cfg.get("operators", [])
+        if not isinstance(operators, list):
+            raise ValueError('config "operators" must be a list of Basecamp person ids')
+        self.operators = {int(p) for p in operators} - {self.captain}
+        # The people whose lines, comments and boosts are relayed: "people", always with the captain and the operators.
         people = cfg.get("people", [])
         if not isinstance(people, list):
             raise ValueError('config "people" must be a list of Basecamp person ids')
-        self.people = {self.captain, *(int(p) for p in people)}
+        self.people = {self.captain, *self.operators, *(int(p) for p in people)}
+        # Participants admitted by rule: anyone on the project, or with an email at a domain. They may ask; never decide.
+        parts = cfg.get("participants")
+        if parts is not None and (not isinstance(parts, dict) or set(parts) - {"project", "domains"}
+                                  or not isinstance(parts.get("project", False), bool)
+                                  or not isinstance(parts.get("domains", []), list)):
+            raise ValueError('config "participants" must be {"project": true} and/or {"domains": ["example.com", ...]}')
+        parts = parts or {}
+        self.participant_project = parts.get("project", False)
+        self.participant_domains = {str(d).strip().lower().lstrip("@") for d in parts.get("domains", []) if str(d).strip()}
+        self._members = None  # the project's non-client person ids, for "participants": {"project": true}
         self.profile = cfg.get("profile")
         self.ask_chat = str(cfg["ask_chat"]) if cfg.get("ask_chat") is not None else None
         self.checkins = cfg.get("checkins")
@@ -67,6 +87,8 @@ class Tools:
         self.dry, self.run = dry, runner
         self._acting = False  # acting person id once resolved; None when it can't be
         self._acting_sgid = None  # the acting person's mention sgid, to spot @mentions in chat
+        self._received = False  # this run's read of the acting person's received boosts, by id; None when it failed
+        self._creators = {}  # (bucket, recording id) -> its creator's id, refetched once a run to tell the agent's own
         self.errors = 0  # failed basecamp calls this run, so a caller can tell whether a reader it ran fully worked
         self.data = os.path.join(self.home, "data")
         self.state = os.path.join(self.home, "state")
@@ -310,18 +332,20 @@ class Tools:
     def read_boosts(self, rec, surface, context, counted=None, always=(), bucket=None):
         """Record the owner's new boosts on recordings as `boost` records: a boost is an answer.
 
-        `counted` is [(recording id, url, boosts_count)], each read only when its count
-        differs from rec["boost_counts"]; `always` is [(recording id, url)], read every
-        run. Boost ids already recorded are in rec["boost_seen"]. The first time a record
-        has no "boost_counts" (for counted) or no "boost_seen" (for always), they are
-        seeded without recording, so turning this on never replays history. `bucket` is
-        where the recordings are (default the project). A dry run records nothing.
+        `counted` is [(recording id, url, boosts_count, creator id)] (see `boost_items`), each
+        read only when its count differs from rec["boost_counts"]; `always` is [(recording
+        id, url)], read every run. Boost ids already recorded are in rec["boost_seen"]. The
+        first time a record has no "boost_counts" (for counted) or no "boost_seen" (for
+        always), they are seeded without recording, so turning this on never replays
+        history. Each new boost is recorded only as `confirmed` allows: one to retry leaves
+        its recording to be read again next run. `bucket` is where the recordings are
+        (default the project). A dry run records nothing.
         """
         counts, seen = rec.get("boost_counts"), rec.get("boost_seen")
         seed_counts, seed_seen = counts is None, seen is None
         counts, seen = dict(counts or {}), list(seen or [])
-        items = [(rid, url, None) for rid, url in always] + list(counted or [])
-        for rid, url, count in items:
+        items = [(rid, url, None, None) for rid, url in always] + list(counted or [])
+        for rid, url, count, creator in items:
             if count is not None:
                 if seed_counts:
                     counts[str(rid)] = count
@@ -333,26 +357,85 @@ class Tools:
             except RuntimeError as e:
                 self.log(f"boosts {surface} {rid}: {e}")
                 continue
+            retry = False
             for b in sorted(boosts, key=lambda b: b.get("id", 0)):
                 bid = b.get("id")
-                if bid in seen or not self.hears(b.get("booster")):
+                if bid in seen or not self.hears(b.get("booster"), admitted=False):
                     continue
                 if self.dry:
                     self.log(f"dry {surface} {rid}: owner boost {bid}")
                     continue
+                if not (count is None and seed_seen):
+                    b = self.confirmed(b, rid, creator, bucket)
+                    if b == "retry":
+                        retry = True
+                        continue
                 seen.append(bid)
-                if count is None and seed_seen:
+                if count is None and seed_seen or b is None:
                     continue
                 self.record({"kind": "boost", "surface": surface, **context, "recording": rid, "boost": bid,
                              "text": html.unescape(re.sub(r"<[^>]+>", "", b.get("content", ""))).strip(),
                              "url": url, "at": b.get("created_at"), **self.author(b.get("booster"))})
                 self.log(f"new owner boost on {surface} {rid}: {bid}")
-            if count is not None:
+            if count is not None and not retry:
                 counts[str(rid)] = count
         if counted is not None:
             rec["boost_counts"] = counts
         if always or seen != list(rec.get("boost_seen") or []):
             rec["boost_seen"] = seen
+
+    def received(self):
+        """The acting person's received boosts by id: one fresh read of /my/boosts.json a run, shared by notifications
+        and every boost reader; None when that read failed (logged)."""
+        if self._received is False:
+            try:
+                self._received = {b.get("id"): b for b in self.my_boosts()}
+            except RuntimeError as e:
+                self.log(f"boosts: the agent's received boosts could not be read: {e}")
+                self._received = None
+        return self._received
+
+    def creator_of(self, rid, bucket=None):
+        """The id of recording `rid`'s creator, refetched once a run; "retry" when the read failed."""
+        key = (str(bucket or self.project), rid)
+        if key not in self._creators:
+            try:
+                self._creators[key] = ((self.recording(rid, bucket) or {}).get("creator") or {}).get("id")
+            except RuntimeError as e:
+                self.log(f"boosts: recording {rid}: {e}")
+                return "retry"
+        return self._creators[key]
+
+    def confirmed(self, b, rid, creator=None, bucket=None):
+        """Boost `b`, read from recording `rid`'s boosts, as it may be recorded: the boost, None to drop it, or "retry".
+
+        A boost on the acting person's own recording counts only when this run's fresh read
+        of its received boosts (/my/boosts.json) lists it, on that recording and by the same
+        booster. Basecamp files a boost there under the person it was aimed at, so that
+        proves both that the boost exists and that it was aimed at the agent; the booster,
+        content and time are then taken from that read. One it does not list is retried
+        while it is younger than RECENT seconds (it may have landed after the read), and
+        then dropped, logged. A boost on anyone else's recording is not aimed at the agent
+        and is recorded as read, and so is every boost when no agent acts (no profile, or the
+        owner's). `creator` is the recording's creator id when the caller knows it; else the
+        recording is refetched, only for a boost the read does not list.
+        """
+        me = self.agent()
+        if me is None:
+            return b
+        feed = self.received()
+        got = (feed or {}).get(b.get("id")) or {}
+        if (got.get("recording") or {}).get("id") == rid and (got.get("booster") or {}).get("id") == (b.get("booster") or {}).get("id"):
+            return {**b, "booster": got["booster"], "content": got.get("content", ""), "created_at": got.get("created_at")}
+        creator = self.creator_of(rid, bucket) if creator is None else creator
+        if creator == "retry":
+            return "retry"
+        if creator != me:
+            return b
+        if feed is None or recent(b.get("created_at")):
+            return "retry"
+        self.log(f"boost {b.get('id')} on {rid} is not among the agent's received boosts; not recorded")
+        return None
 
     def read_card_comments(self, task, repo, key, rec):
         """Record the new comments of the people listened to on card rec["card"]: "question" when it has "?", else "comment"."""
@@ -374,14 +457,17 @@ class Tools:
                 rec.setdefault("ack", []).append([cid, EYES if kind == "question" else THUMBS])
                 self.log(f"new captain {kind} on {key}: {cid}")
         self.read_boosts(rec, "card-comment", {"task": task, "repo": repo, "card": rec["card"]},
-                         counted=[(c.get("id"), c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
+                         counted=boost_items(comments))
 
     def read_card_boosts(self, task, repo, key, rec):
-        """Record the captain's 👍 on card rec["card"] as an approval, and any other boost by someone listened to as a `boost`.
+        """Record the captain's or an operator's 👍 on card rec["card"] as an approval, and any other boost by someone
+        listened to as a `boost`.
 
-        Only the captain approves: another listed person's 👍 is a `boost` like any other.
+        Only the captain and the operators approve: a participant's 👍 is a `boost` like any other.
         A dry run reads and logs only. Other boosts already on the card the first time
-        it is read (no rec["card_boost_seen"]) are seeded, not recorded.
+        it is read (no rec["card_boost_seen"]) are seeded, not recorded. Every other boost,
+        an approval included, is recorded only as `confirmed` allows; one dropped there is
+        kept in rec["card_boost_seen"].
         """
         path = f"/buckets/{self.project}/recordings/{rec['card']}/boosts.json"
         try:
@@ -395,14 +481,17 @@ class Tools:
             bid = b.get("id")
             if bid in rec.get("boosts", []) or bid in rec.get("card_boost_seen", []):
                 continue
-            if not self.hears(b.get("booster")):
+            if not self.hears(b.get("booster"), admitted=False):
                 continue
-            if not is_thumbs_up(b.get("content", "")) or (b.get("booster") or {}).get("id") != self.captain:
+            if not is_thumbs_up(b.get("content", "")) or self.role(b.get("booster"), admitted=False) not in AUTHORITY:
                 if self.dry:
                     self.log(f"dry {key}: owner boost {bid}")
                     continue
+                b = b if seed else self.confirmed(b, rec["card"])
+                if b == "retry":
+                    continue
                 rec.setdefault("card_boost_seen", []).append(bid)
-                if not seed:
+                if not seed and b is not None:
                     self.record({"kind": "boost", "surface": "card", "task": task, "repo": repo, "card": rec["card"],
                                  "recording": rec["card"], "boost": bid,
                                  "text": html.unescape(re.sub(r"<[^>]+>", "", b.get("content", ""))).strip(),
@@ -412,6 +501,12 @@ class Tools:
             if self.dry:
                 self.log(f"dry {key}: captain approval boost {bid}")
                 self.acknowledge(key, dict(rec, ack=[*rec.get("ack", []), [rec["card"], THUMBS]]))
+                continue
+            b = self.confirmed(b, rec["card"])
+            if b == "retry":
+                continue
+            if b is None:
+                rec.setdefault("card_boost_seen", []).append(bid)
                 continue
             rec.setdefault("boosts", []).append(bid)
             self.record({"kind": "approval", "task": task, "repo": repo, "card": rec["card"], "url": url,
@@ -471,7 +566,7 @@ class Tools:
                 rec.setdefault("ack", []).append([lid, EYES])
                 self.log(f"new captain chat question in {chat}: {lid}")
             self.read_boosts(rec, "chat", {"chat": int(chat)},
-                             counted=[(ln.get("id"), ln.get("app_url"), ln.get("boosts_count") or 0) for ln in lines])
+                             counted=boost_items(lines))
             if self.dry:
                 if first:
                     self.log(f"dry chat {chat}: would start the cursor at {cursor}")
@@ -535,21 +630,65 @@ class Tools:
         me = self.acting_id()
         return None if me in (None, "retry", self.captain) else me
 
-    def hears(self, person):
-        """True when `person` (a creator or booster object) is someone the sync listens to.
+    def role(self, person, admitted=True):
+        """Who `person` (a creator or booster object) is to the sync: "captain", "operator", "participant", or None.
 
-        The captain always is. Another listed person is, unless they are the acting user
-        itself, so the agent's own lines are never relayed back to it even when listed.
+        The captain's and an operator's word authorizes the agent; a participant's never
+        does. A participant is someone in "people", or, when `admitted` (what they wrote, not
+        a boost, an assignment or unmonitored input), someone "participants" admits: on the
+        project (not a client), or with an email at a listed domain. Anyone but the captain
+        is None when they are the acting user itself, so the agent's own lines are never
+        relayed back to it even when listed.
         """
-        pid = (person or {}).get("id")
+        person = person or {}
+        pid = person.get("id")
         if pid == self.captain:
+            return "captain"
+        role = "operator" if pid in self.operators else "participant" if pid in self.people else None
+        if role is None and not (admitted and (self.participant_project or self.participant_domains)):
+            return None
+        if pid == self.acting_id():
+            return None
+        return role or ("participant" if self.admitted(person) else None)
+
+    def hears(self, person, admitted=True):
+        """True when `person` is someone the sync listens to (see role); `admitted` False hears only named people."""
+        return self.role(person, admitted) is not None
+
+    def admitted(self, person):
+        """True when "participants" admits `person`: an email at a listed domain, or (with "project") a project member.
+
+        Basecamp masks other people's email addresses unless the login is an account admin,
+        so a masked address matches no domain. A client is never admitted.
+        """
+        pid = person.get("id")
+        if pid is None or person.get("client") is True:
+            return False
+        email = str(person.get("email_address") or "").lower()
+        if self.participant_domains and "@" in email and email.rsplit("@", 1)[1] in self.participant_domains:
             return True
-        return pid in self.people and pid != self.acting_id()
+        return self.participant_project and pid in self.members()
+
+    def members(self):
+        """The project's people who are not clients, as ids: read at most once a run, when first needed, and kept in
+        participants.json, whose last list stands in when the read fails."""
+        if self._members is None:
+            try:
+                people = self.bc("api", "get", f"/projects/{self.project}/people.json") or []
+                self._members = {p.get("id") for p in people if p.get("client") is False}
+                if not self.dry:
+                    self.save_json("participants.json", sorted(self._members))
+            except RuntimeError as e:
+                self._members = set(self.load("participants.json", []))
+                self.log(f"participants: the project's people could not be read, using the last list "
+                         f"({len(self._members)} people): {e}")
+        return self._members
 
     def author(self, person):
-        """A record's author fields: who wrote it ({"id", "name"}) and whether that is the captain."""
+        """A record's author fields: who wrote it ({"id", "name"}), whether that is the captain, and their role."""
         person = person or {}
-        return {"author": {"id": person.get("id"), "name": person.get("name")}, "captain": person.get("id") == self.captain}
+        return {"author": {"id": person.get("id"), "name": person.get("name")}, "captain": person.get("id") == self.captain,
+                "role": self.role(person) if person.get("id") is not None else None}
 
     def read_answer_boosts(self, questionnaires, days=7):
         """The owner's boosts on check-in answers the acting user posted in the last `days` days.
@@ -573,7 +712,7 @@ class Tools:
                             and (a.get("group_on") or (a.get("created_at") or "")[:10]) >= since]
                     rec = state.setdefault(str(q["id"]), {})
                     self.read_boosts(rec, "checkin-answer", {"question": q["id"]},
-                                     counted=[(a["id"], a.get("app_url"), a.get("boosts_count") or 0) for a in mine])
+                                     counted=boost_items(mine))
             except RuntimeError as e:
                 self.log(f"checkin answer boosts {qn}: {e}")
         if not self.dry:
@@ -611,7 +750,7 @@ class Tools:
             for m in mine:
                 ctx = {"message": m["id"], "subject": m.get("subject")}
                 self.read_boosts(state.setdefault("messages", {}), "message", ctx,
-                                 counted=[(m["id"], m.get("app_url"), m.get("boosts_count") or 0)])
+                                 counted=boost_items([m]))
                 if not m.get("comments_count"):
                     continue
                 try:
@@ -643,7 +782,7 @@ class Tools:
                 if not self.dry:
                     post["cursor"] = cursor
                 self.read_boosts(state.setdefault("comments", {}), "message-comment", ctx,
-                                 counted=[(c["id"], c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
+                                 counted=boost_items(comments))
             if not self.dry:
                 self.save_json("messages.json", state)
 
@@ -715,7 +854,7 @@ class Tools:
         ctx, bucket = {"key": key, "todo": rec["todo"], **request_fields(rec)}, rec.get("bucket")
         self.read_boosts(rec, "todo", ctx, always=[(rec["todo"], rec.get("url"))], bucket=bucket)
         self.read_boosts(rec, "todo-comment", ctx, bucket=bucket,
-                         counted=[(c.get("id"), c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
+                         counted=boost_items(comments))
 
     def readings(self):
         """The acting user's notifications, one read of /my/readings.json: {"unreads": [...], "reads": [first page], ...}."""
@@ -743,8 +882,8 @@ class Tools:
         found = {}
         for r in (data.get("unreads") or []) + (data.get("reads") or []):
             m = re.search(r"/buckets/(\d+)/recordings/(\d+)/", r.get("subscription_url") or "")
-            people = [p.get("id") for p in r.get("participants") or []] + [(r.get("creator") or {}).get("id")]
-            if r.get("section") != "pings" or r.get("type") != "Chat" or not m or not self.people & set(people):
+            people = (r.get("participants") or []) + [r.get("creator") or {}]
+            if r.get("section") != "pings" or r.get("type") != "Chat" or not m or not any(self.hears(p) for p in people):
                 continue
             found.setdefault(m.group(2), {"bucket": m.group(1), "chat": m.group(2), "title": r.get("bucket_name"),
                                           "url": r.get("app_url"), "updated_at": r.get("updated_at") or ""})
@@ -803,7 +942,7 @@ class Tools:
                 rec.setdefault("ack", []).append([lid, EYES])
                 self.log(f"new owner ping line in {chat}: {lid}")
             self.read_boosts(rec, "ping", {"bucket": int(bucket), "chat": int(chat)}, bucket=bucket,
-                             counted=[(ln.get("id"), ln.get("app_url"), ln.get("boosts_count") or 0) for ln in lines])
+                             counted=boost_items(lines))
             self.acknowledge(f"ping {chat}", rec, bucket)
             if not self.dry:
                 rec["cursor"] = cursor
@@ -866,7 +1005,7 @@ class Tools:
             return False
         creator = todo.get("creator") or {}
         who = creator if by is None or by == creator.get("id") else {"id": by, "name": None}
-        if not self.hears(who):
+        if not self.hears(who, admitted=False):
             if by is None and not self.dry:
                 state = self.load("assigned-todos.json", {})
                 state["ignored"] = sorted({*state.get("ignored", []), tid})
@@ -1065,7 +1204,7 @@ class Tools:
             rec.setdefault("ack", []).append([cid, EYES if mention or "?" in text else THUMBS])
             self.log(f"new owner {'mention' if mention else 'comment'} on {rec.get('parent_type') or 'thread'} {thread}: {cid}")
         self.read_boosts(rec, "thread-comment", {"bucket": int(bucket), "parent": thread, "title": rec.get("title")},
-                         bucket=bucket, counted=[(c.get("id"), c.get("app_url"), c.get("boosts_count") or 0) for c in comments])
+                         bucket=bucket, counted=boost_items(comments))
         self.acknowledge(f"thread {thread}", rec, bucket)
         if not self.dry:
             rec["cursor"] = cursor
@@ -1504,6 +1643,25 @@ def todo_digest(todo):
 def plain(content):
     """Basecamp rich text as one line of plain text."""
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", content or ""))).strip()
+
+
+def boost_items(recordings):
+    """[(id, url, boosts_count, creator id)] of listed recordings (lines, comments, answers, messages), for read_boosts."""
+    return [(r.get("id"), r.get("app_url"), r.get("boosts_count") or 0, (r.get("creator") or {}).get("id")) for r in recordings]
+
+
+RECENT = 300  # seconds a boost the received-boosts read does not list yet is retried before it is dropped
+
+
+def recent(at, now=None):
+    """True when ISO time `at` is less than RECENT seconds ago; False when it is unreadable."""
+    try:
+        when = datetime.fromisoformat(str(at).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return ((now or datetime.now(timezone.utc)) - when).total_seconds() < RECENT
 
 
 def recording_type(t):

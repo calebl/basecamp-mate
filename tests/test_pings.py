@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_sync import ACTING, CAPTAIN  # noqa: E402
-from test_tools import boost  # noqa: E402
+from test_tools import boost, received  # noqa: E402
 from test_notifications import NotifStub, NotifBase, PROJECT  # noqa: E402
 import behaviors  # noqa: E402
 import sync  # noqa: E402
@@ -118,6 +118,7 @@ class Reader(PingBase):
         self.poll()  # seeds the boost counts
         mine["boosts_count"] = 1
         self.stub.boosts["2"] = [boost(42, content="🎉")]
+        self.stub.my_boosts = received(2, boost(42, content="🎉"))
         self.poll()
         [rec] = self.pending()
         self.assertEqual((rec["kind"], rec["surface"], rec["recording"], rec["chat"], rec["text"]), ("boost", "ping", 2, CHAT, "🎉"))

@@ -4,9 +4,11 @@ Checks, in order: Python, the basecamp CLI and its version, systemd user service
 firstmate home, the config, the Basecamp sign-in (every call under a timeout and the
 file credential store, so a locked system keyring cannot hang it), the project and the
 dock tools the config uses, each mirrored card table and its columns, the agent's
-notifications (readable, and under Basecamp's 100 unread), the background timer (and
-that the retired event listener is gone), the last sync, and the wake check; across the homes checked, that only one per
-Basecamp login takes to-do requests account-wide. A check whose prerequisite failed is
+notifications (readable, and under Basecamp's 100 unread), that email-keyed participants
+can admit anyone (the login sees email addresses), the background timer (and that the
+retired event listener is gone), the last sync, and the wake check; across the homes
+checked, that no two watch the same project, Pings or account-wide to-do requests with
+the same Basecamp login (runs.py). A check whose prerequisite failed is
 skipped. Each problem is printed with the exact fix; the exit status is 1 when anything
 is broken, 0 otherwise.
 
@@ -16,7 +18,7 @@ expired sign-in is renewed the way each sync run renews it.
 """
 import argparse, calendar, os, re, shlex, shutil, subprocess, sys, time
 
-import init_home
+import init_home, runs
 from behaviors import COLUMNS
 from init_home import CHECK, CHECK_ID, CHECK_INBOX, unit_name
 from setup_home import Basecamp, INSTALL_CLI, default_home
@@ -237,6 +239,24 @@ class Doctor:
         else:
             self.ok(f"the agent's Basecamp notifications ({unread} unread)")
 
+    def participants(self, bc, cfg):
+        """Participants by email domain admit someone only when the login sees email addresses (an account admin)."""
+        if not (cfg.get("participants") or {}).get("domains"):
+            return
+        out = bc.call("api", "get", f"/projects/{cfg['project']}/people.json")
+        me = bc.call("api", "get", "/my/profile.json")
+        if not (out.get("ok") and me.get("ok")):
+            self.skip("could not read the project's people to check the participants' domains")
+            return
+        others = [p for p in out.get("data") or [] if p.get("id") != (me.get("data") or {}).get("id")]
+        if others and not any(init_home.visible(p) for p in others):
+            self.bad("The participants' email domains admit nobody: Basecamp hides other people's email addresses from "
+                     "this sign-in (it shows them only to account admins).",
+                     'Fix: use "participants": {"project": true} (anyone on the project), or name people in "people",\n'
+                     "     or make the agent's Basecamp person an account admin.")
+        else:
+            self.ok("the participants' email domains can be matched")
+
     def services(self, home, config, cfg):
         name = unit_name(home)
         units = [(f"{name}.timer", "the sync timer (every 30 seconds)", f"{name}.service")]
@@ -290,6 +310,9 @@ class Doctor:
             return f"Fix: the Basecamp sign-in needs renewing; run  {SETUP}  and sign in again."
         if "timeout" in low or "timed out" in low:
             return "Fix: Basecamp was slow or the keyring is locked; run  " + SETUP + "  again to use the file store."
+        if "duplicate run" in low:
+            return ("Fix: another home here watches the same Basecamp with this sign-in, so only one may run; see\n"
+                    "     basecamp-mate status  and turn the other home's timer off, or set \"allow_duplicate\": true to run both.")
         if "tasks-axi" in low:
             return "Fix: install tasks-axi (the card mirror reads the task list with it), or turn the card mirror off with  " + SETUP
         return "Fix: read the lines before it in sync.log; if it keeps failing, run  " + SETUP + "  again."
@@ -314,7 +337,7 @@ class Doctor:
             else self.homes()
         if not homes:
             self.bad("No basecamp-mate setup was found on this computer.", f"Fix: run  {SETUP}")
-        anywhere = {}  # (account, profile) -> the homes taking to-do requests account-wide with that login
+        watching = []  # (home, cfg) of each home whose config loaded, for the overlap check
         for h, c in homes:
             self.out(f"\n{h}")
             if not self.home(h):
@@ -322,36 +345,51 @@ class Doctor:
             cfg = self.config(h, c)
             if cfg is None:
                 continue
-            opts = cfg.get("assigned_todos")
-            if isinstance(opts, dict) and opts.get("scope") == "account":
-                anywhere.setdefault((str(cfg.get("account")), cfg.get("profile")), []).append(h)
+            watching.append((h, cfg))
             bc = self.login(cfg) if cli_ok else None
             if bc and self.project(bc, cfg):
                 self.card_tables(bc, cfg)
                 self.notifications(bc, cfg)
+                self.participants(bc, cfg)
             elif cli_ok:
                 self.skip("skipped the project and card table checks until the problems above are fixed")
             if sd_ok:
                 self.services(h, c, cfg)
             self.last_sync(c)
             self.wake_check(h, cfg)
-        self.account_wide(anywhere)
+        self.overlaps(watching)
         self.out("\n" + (f"{self.problems} problem(s) found; fix them in order, then run  basecamp-mate doctor  again."
                          if self.problems else "Everything looks good."))
         return 1 if self.problems else 0
 
 
-    def account_wide(self, anywhere):
-        """Warn when more than one home here takes to-do requests account-wide with the same Basecamp login."""
-        for (account, profile), hs in sorted(anywhere.items(), key=str):
-            if len(hs) < 2:
+    def overlaps(self, homes):
+        """Warn when more than one home here watches the same thing with the same Basecamp login (runs.watches): the
+        same project, the login's Pings, or to-dos assigned to it anywhere. Homes that all set "allow_duplicate" pass."""
+        groups = {}  # (profile, watch) -> [(home, cfg)]
+        for h, cfg in homes:
+            for w in runs.watches(cfg):
+                groups.setdefault((cfg.get("profile") or "", w), []).append((h, cfg))
+        for (profile, w), group in sorted(groups.items()):
+            if len(group) < 2 or all(cfg.get("allow_duplicate") is True for _, cfg in group):
                 continue
             login = f"the sign-in {profile!r}" if profile else "the default sign-in"
+            kind, where = w.split(" ", 1)
+            hs = ", ".join(h for h, _ in group)
             self.out("")
-            self.bad(f"{len(hs)} homes take to-dos assigned anywhere in account {account} with {login}, so each such "
-                     f"to-do would reach all of them: {', '.join(hs)}",
-                     'Fix: keep "assigned_todos": {"scope": "account"} only in the main home\'s settings, and set the '
-                     'others to "assigned_todos": {} (their own project only).')
+            if kind == "requests":
+                self.bad(f"{len(group)} homes take to-dos assigned anywhere in account {where} with {login}, so each such "
+                         f"to-do would reach all of them: {hs}",
+                         'Fix: keep "assigned_todos": {"scope": "account"} only in the main home\'s settings, and set the '
+                         'others to "assigned_todos": {} (their own project only).')
+            elif kind == "pings":
+                self.bad(f"{len(group)} homes read the Pings of {login} in account {where}, so each Ping would reach all "
+                         f"of them: {hs}", 'Fix: keep "pings" in one home\'s settings only.')
+            else:
+                self.bad(f"{len(group)} homes watch Basecamp project {where.split('/')[1]} with {login}, so only one of "
+                         f"them can run (the others are refused as duplicates): {hs}",
+                         "Fix: turn the extra home's timer off, or connect it to its own project with its own sign-in;\n"
+                         '     to run both on purpose, set "allow_duplicate": true in each one\'s settings.')
 
 
 def cli(argv, **kw):
