@@ -166,7 +166,7 @@ class TodoComments(ToolBase):
         self.poll()
         [rec] = self.pending()
         self.assertEqual(rec, {"kind": "todo-comment", "key": "ta-x", "todo": self.tid, "comment": 1, "question": False,
-                               "url": "https://x/todos/c1", "text": "Merge it & ship", "at": "t", "author": {"id": CAPTAIN, "name": None}, "captain": True})
+                               "url": "https://x/todos/c1", "text": "Merge it & ship", "at": "t", "author": {"id": CAPTAIN, "name": None}, "captain": True, "role": "captain"})
         self.assertEqual(self.todos()["ta-x"]["cursor"], 3)
         self.assertEqual(self.stub.posted(), [("1", "👍")])
 
@@ -315,6 +315,11 @@ def boost(id, who=CAPTAIN, content="a"):
     return {"id": id, "booster": {"id": who}, "content": content, "created_at": "tb"}
 
 
+def received(rid, *boosts):
+    """The /my/boosts.json items that confirm `boosts` on the agent's own recording `rid`."""
+    return [dict(b, recording={"id": rid}) for b in boosts]
+
+
 class TodoBoosts(ToolBase):
     def setUp(self):
         super().setUp()
@@ -332,13 +337,14 @@ class TodoBoosts(ToolBase):
         [rec] = self.pending()
         self.assertEqual(rec, {"kind": "boost", "surface": "todo", "key": "ta-x", "todo": self.tid, "boost": 70,
                                "recording": self.tid, "text": "yes", "url": f"https://x/todos/{self.tid}", "at": "tb",
-                               "author": {"id": CAPTAIN, "name": None}, "captain": True})
+                               "author": {"id": CAPTAIN, "name": None}, "captain": True, "role": "captain"})
         self.assertEqual(self.todos()["ta-x"]["boost_seen"], [70])
 
     def test_owner_boost_on_the_agents_own_comment_is_an_answer(self):
         mine = dict(comment(5, who=ACTING, content="<p>Ready again</p>"), boosts_count=1)
         self.stub.comments[self.c] = [mine]
         self.stub.boosts["5"] = [boost(80)]
+        self.stub.my_boosts = received(5, boost(80))
         self.poll()
         self.assertEqual([(r["kind"], r["surface"], r["boost"], r["recording"], r["text"], r["url"]) for r in self.pending()],
                          [("boost", "todo-comment", 80, 5, "a", "https://x/todos/c5")])
@@ -347,6 +353,7 @@ class TodoBoosts(ToolBase):
         self.assertEqual(self.boost_reads()[reads:], [self.c])
         mine["boosts_count"] = 2
         self.stub.boosts["5"].append(boost(81, content="b"))
+        self.stub.my_boosts += received(5, boost(81, content="b"))
         self.poll()
         self.assertEqual([r["boost"] for r in self.pending()], [80, 81])
 
@@ -467,6 +474,7 @@ class Boosts(ToolBase):
         mine = dict(line(2, who=ACTING, content="Done, see the PR."), boosts_count=1)
         self.stub.lines["77"].append(mine)
         self.stub.boosts["2"] = [boost(60, content="thanks"), boost(61, who=ACTING)]
+        self.stub.my_boosts = received(2, boost(60, content="thanks"))
         self.poll()
         self.poll()
         self.assertEqual(self.boosts(), [("chat", 2, 60, "thanks")])
@@ -494,6 +502,7 @@ class Boosts(ToolBase):
         self.stub.boosts["501"] = [boost(7, content="👍"), boost(8, content="later please")]
         self.stub.comments = {"501": [dict(comment(9, who=ACTING, content="my reply"), boosts_count=1)]}
         self.stub.boosts["9"] = [boost(10, content="ok")]
+        self.stub.my_boosts = received(9, boost(10, content="ok"))
         self.sync().main([item("a", hold="q", hold_kind="captain")])
         self.sync().main([item("a", hold="q", hold_kind="captain")])
         approvals = [(r["boost"], r["text"]) for r in self.pending() if r["kind"] == "approval"]
@@ -516,6 +525,7 @@ class Boosts(ToolBase):
         run()  # seeds
         self.stub.answers["1"][0]["boosts_count"] = 1
         self.stub.boosts.update({"30": [boost(40, content="good")], "31": [boost(41)], "32": [boost(42)]})
+        self.stub.my_boosts = received(30, boost(40, content="good"))
         run()
         run()
         self.assertEqual(self.boosts(), [("checkin-answer", 30, 40, "good")])
@@ -533,6 +543,7 @@ class Boosts(ToolBase):
         msgs[0]["boosts_count"] = 1
         self.stub.comments["20"][0]["boosts_count"] = 1
         self.stub.boosts.update({"20": [boost(50, content="agree")], "25": [boost(51)], "21": [boost(52)], "22": [boost(53)]})
+        self.stub.my_boosts = received(20, boost(50, content="agree"))
         self.poll()
         self.poll()
         self.assertEqual(self.boosts(), [("message", 20, 50, "agree"), ("message-comment", 25, 51, "a")])
@@ -564,7 +575,7 @@ class MessageComments(ToolBase):
         [rec] = [r for r in self.pending() if r["kind"] == "message-comment"]
         self.assertEqual(rec, {"kind": "message-comment", "message": 20, "subject": "Report: deploy", "comment": 30,
                                "question": False, "url": "https://x/todos/c30", "text": "Rerun it with the new flag", "at": "t",
-                               "author": {"id": CAPTAIN, "name": None}, "captain": True})
+                               "author": {"id": CAPTAIN, "name": None}, "captain": True, "role": "captain"})
         self.assertEqual(self.stub.posted(), [("30", "👍")])
         self.assertFalse([c for c in self.stub.calls if c[:3] in (["comments", "list", "21"], ["comments", "list", "22"])])
 

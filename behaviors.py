@@ -16,7 +16,7 @@ write goes through a Tools method.
 import hashlib, html, json, os, re
 from datetime import datetime, timezone
 
-from tools import THREADS, parse_reading, recording_type
+from tools import AUTHORITY, THREADS, parse_reading, recording_type
 
 COLUMNS = ("Triage", "Not now", "Figuring it out", "In progress", "Ready for QA", "Done")
 SLOW, SWEEP = 300, 3600  # seconds: the card mirror's, releases' and check-ins' cadence; the hourly repair sweep's
@@ -43,7 +43,8 @@ class Behavior:
 
 
 class CardMirror(Behavior):
-    """Mirror the backlog onto card tables; relay the listened-to people's card comments and the captain's 👍 approvals."""
+    """Mirror the backlog onto card tables; relay the listened-to people's card comments and the captain's (or an
+    operator's) 👍 approvals."""
     name, keys, every = "card-mirror", ("tables", "repos", "cards"), SLOW
 
     def __init__(self, t, cfg):
@@ -491,7 +492,7 @@ class InboxDelivery(Behavior):
 class Notifications(Behavior):
     """Read the agent login's Basecamp notifications and boosts every run, and run the reader for each thread that changed.
 
-    The people are the config's "people" (always with the captain); "owner" below means any of them.
+    "Owner" below means anyone the sync listens to (the captain, "operators", "people" and admitted "participants").
     On whenever the config has a "profile" ("notifications": false turns it off):
     /my/readings.json and /my/boosts.json are the acting user's, so it reads nothing
     while the acting user is the owner, unset or unknown. It takes over reading the
@@ -525,7 +526,8 @@ class Notifications(Behavior):
 
     Boosts: one read of /my/boosts.json, the boosts on the agent's own recordings. Each new
     owner boost runs the reader whose state holds the boosted recording, which records it
-    as a `boost` (or the captain's 👍 on an assigned card as an `approval`); a boost on
+    as a `boost` (or the captain's 👍 on an assigned card as an `approval`) once this same
+    read lists it (Tools.confirmed); a boost on
     something nothing monitors in the project is unmonitored. A boost on a to-do request
     (the owner's own to-do) is not listed there and waits for the sweep.
 
@@ -569,11 +571,8 @@ class Notifications(Behavior):
         except RuntimeError as e:
             t.log(f"notifications: {e}")
             return
-        try:
-            boosts = t.my_boosts()
-        except RuntimeError as e:
-            t.log(f"notifications: boosts: {e}")
-            boosts = None
+        received = t.received()  # the same read the boost readers confirm boosts against this run
+        boosts = None if received is None else list(received.values())
         unread = {str(r.get("id")) for r in data.get("unreads") or []}
         readings = sorted((data.get("unreads") or []) + (data.get("reads") or []), key=stamp)
         first, first_boosts = "items" not in state, "boosts" not in state  # boosts unread on the first run seed later
@@ -701,7 +700,7 @@ class Notifications(Behavior):
                 return True, [f"request {thread}"], None
             if not here:
                 return False, [], None
-            if any(rec.get("todo") == thread for rec in todos.values()) or not t.hears(who):
+            if any(rec.get("todo") == thread for rec in todos.values()) or not t.hears(who, admitted=False):
                 return True, [], None  # a decision to-do's own closing, or not from someone listened to
             return True, [], self.check(what, "Todo", thread, r)
         if not here:
@@ -720,9 +719,9 @@ class Notifications(Behavior):
             if mention and t.hears(who):
                 want["mentions"][anchor] = (bucket, thread)
                 return True, [f"mention {anchor}"], None
-            return True, [], self.check("chat.line.created", "Chat::Lines", thread, r) if t.hears(who) else None
+            return True, [], self.check("chat.line.created", "Chat::Lines", thread, r) if t.hears(who, admitted=False) else None
         if kind not in ("Comment", "Mention"):  # a kind Basecamp adds later: unmonitored when an owner did it
-            return True, [], self.check(f"{kind}", None, thread, r) if t.hears(who) else None
+            return True, [], self.check(f"{kind}", None, thread, r) if t.hears(who, admitted=False) else None
         if path == "cards" and b["card-mirror"].on:
             keys = {k for k, rec in t.load("map.json", {}).items() if rec.get("card") == thread}
             if keys:
@@ -758,7 +757,7 @@ class Notifications(Behavior):
         rec, booster = bst.get("recording") or {}, bst.get("booster") or {}
         rid, rtype = rec.get("id"), recording_type(rec.get("type"))
         bucket, parent = str((rec.get("bucket") or {}).get("id") or ""), rec.get("parent") or {}
-        if not t.hears(booster):
+        if not t.hears(booster, admitted=False):
             return False, [], None
         on_todo = rid if rtype == "Todo" else parent.get("id") if rtype == "Comment" and parent.get("type") == "Todo" else None
         todos = t.load("todos.json", {})
@@ -852,11 +851,14 @@ def inbox_note(rec, account, project):
     text = " ".join(str(rec.get("text") or "").split())
     if len(text) > 600:
         text = text[:600] + "..."
-    # A record without "captain" predates the people list, when only the captain was relayed.
-    captain = rec.get("captain", True)
+    # A record without "captain" predates the people list, when only the captain was relayed; one without "role" predates
+    # operators, when only the captain's word counted. `captain` below means the word authorizes: the captain's or an operator's.
+    role = rec.get("role", "captain" if rec.get("captain", True) else None)
+    captain = role in AUTHORITY
     author = rec.get("author") or {}
     name = author.get("name") or (f"person {author['id']}" if author.get("id") else "someone")
-    who = "the captain" if captain else f"{name} (not the captain)"
+    who = ("the captain" if role == "captain" else f"{name} (an operator: their word counts as the captain's)"
+           if role == "operator" else f"{name} (not the captain)")
     # A to-do request in another project of the account (assigned-todos "scope": "account") names it, for routing.
     proj = rec.get("project") or {}
     elsewhere = (f" in project {proj.get('name') or proj.get('id')!r} ({proj.get('id')})"
@@ -869,7 +871,8 @@ def inbox_note(rec, account, project):
         url = card_url
     elif kind == "approval":
         rid = rec.get("boost")
-        what = f"Basecamp card approval (the captain's 👍) on task {rec.get('task')}"
+        mark = f"the 👍 of {who}" if role == "operator" else "the captain's 👍"
+        what = f"Basecamp card approval ({mark}) on task {rec.get('task')}"
         text = text or "approve every recommendation on the card as recommended"
         handle, url = "record the decision in the backlog", rec.get("url") or card_url
     elif kind == "chat-question":

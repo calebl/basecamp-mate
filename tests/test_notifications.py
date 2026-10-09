@@ -342,7 +342,7 @@ class Boosts(NotifBase):
         self.poll()  # seeds the to-do's boosts
         self.stub.calls.clear()
         self.stub.boosts[str(tid)] = [boost(70, content="yes")]
-        self.stub.my_boosts = [my_boost(70, tid, "Todo", parent={"id": 66, "type": "Todoset"})]
+        self.stub.my_boosts = [my_boost(70, tid, "Todo", parent={"id": 66, "type": "Todoset"}, content="yes")]
         self.sync().behaviors["notifications"].run()
         self.assertEqual([(r["kind"], r["surface"], r["text"]) for r in self.pending()], [("boost", "todo", "yes")])
         self.assertEqual([c[2] for c in self.stub.calls if c[:2] == ["comments", "list"]], [str(tid)])
@@ -438,7 +438,7 @@ class Unmonitored(NotifBase):
         self.assertEqual(rec, {"kind": "unmonitored", "key": "chat.line.created/Chat::Lines", "event_type": "chat.line.created",
                                "recording_type": "Chat::Lines", "notification": 10, "recording": 78, "title": "Chat",
                                "text": "tighten the intro", "creator": {"id": CAPTAIN, "name": "Cap"},
-                               "author": {"id": CAPTAIN, "name": "Cap"}, "captain": True,
+                               "author": {"id": CAPTAIN, "name": "Cap"}, "captain": True, "role": "captain",
                                "url": f"{APP}/buckets/{PROJECT}/chats/78", "at": "2099-01-01T00:00:01Z"})
         [(rid, body, *_)] = self.stub.notes
         self.assertEqual(rid, "basecamp-unmonitored-chat.line.created-Chat::Lines-10")

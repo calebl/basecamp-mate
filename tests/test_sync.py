@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+# Timer runs claim their watches in the run registry (runs.py); never the real one.
+os.environ["BASECAMP_MATE_RUNS"] = tempfile.mkdtemp(prefix="basecamp-mate-runs-")
 import sync  # noqa: E402
 
 CAPTAIN = 33333333
@@ -117,6 +119,7 @@ def item(id, section="Queued", repo="srv", hold=None, hold_kind=None, until=None
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        os.environ["BASECAMP_MATE_RUNS"] = os.path.join(self.tmp, "runs")
         self.home = os.path.join(self.tmp, "home")
         os.makedirs(os.path.join(self.home, "state"))
         self.cfgdir = os.path.join(self.tmp, "cfg")

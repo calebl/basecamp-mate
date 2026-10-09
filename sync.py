@@ -37,9 +37,13 @@ Deterministic, no model calls. Safety bounds, enforced here:
     profile is set or the profile signs in as the owner;
   - id maps (map.json, todos.json, ...) make re-runs update or skip instead of
     duplicating.
-All runtime state lives in the directory that holds the config file.
+All runtime state lives in the directory that holds the config file, except each config's
+run claim (runs.py): a timer run refuses to run beside another home's live run that watches
+the same project (or Pings, or account-wide to-do requests) with the same login, unless
+"allow_duplicate" or --allow-duplicate; `sync.py status` lists the runs.
 
-Usage: sync.py --home <home> --config <config.json> [--all] [--dry-run] [--include-prereleases]
+Usage: sync.py --home <home> --config <config.json> [--all] [--dry-run] [--include-prereleases] [--allow-duplicate]
+       sync.py status      (the runs recorded on this computer; also bin/basecamp-mate status)
        sync.py reply --home <home> --config <config.json> --recording <comment, chat line or Ping line id> --body-file <file> [--again] [--dry-run]
        sync.py ask --home <home> --config <config.json> --body-file <file> [--dry-run]
        sync.py answer --home <home> --config <config.json> --question <check-in question id> --body-file <file> [--dry-run]
@@ -57,7 +61,7 @@ Usage: sync.py --home <home> --config <config.json> [--all] [--dry-run] [--inclu
 import argparse, json, subprocess, sys
 from datetime import datetime, timezone
 
-import behaviors
+import behaviors, runs
 from behaviors import COLUMNS, render_decision, render_release, inline_md  # noqa: F401
 from tools import (Tools, THUMBS, EYES, is_due, render_reply, is_emoji, is_thumbs_up,  # noqa: F401
                    parse_lavish, parse_show, task_item, none)
@@ -129,8 +133,43 @@ class Sync(Tools):
                 self.save_json("timer.json", timer)
         return plan
 
+    def claim(self, allow=False):
+        """Claim what this config watches for this run (runs.py): False when another home's live run overlaps.
+
+        Refused, it logs a FAILED line naming the other run, when the overlap is new and then
+        at most hourly, and the run reads nothing. "allow_duplicate": true in the config (or
+        `allow`) runs anyway, noting the overlap once. A dry run checks and claims nothing,
+        and only prints.
+        """
+        allow = allow or self.cfg.get("allow_duplicate") is True
+        me = self.acting_id()
+        reg = runs.Registry()
+        others = reg.claim(self.config_path, self.home, self.cfg, me if isinstance(me, int) else None, allow=allow, dry=self.dry)
+        now, say = reg.now(), print if self.dry else self.log
+        homes = sorted(c.get("home") or "?" for c, _ in others)
+        with self.locked("sync"):
+            timer = self.load("timer.json", {})
+            dup = timer.get("duplicate") or {}
+            hourly = not allow and now - dup.get("noted", 0) >= DUPLICATE_NOTE
+            if others and (dup.get("with") != homes or dup.get("allowed") != allow or hourly):
+                said = "; ".join(f"{runs.describe(c, now)}, also watching {', '.join(shared)}" for c, shared in others)
+                say(f"running beside another home's live run (allow_duplicate): {said}" if allow else
+                    f"FAILED duplicate run: another home's live run watches the same Basecamp with this login: {said}. "
+                    "Stop that home's timer (or drop the overlapping setting from one config), or set "
+                    '"allow_duplicate": true to run both on purpose; `basecamp-mate status` lists the runs')
+                timer["duplicate"] = {"with": homes, "allowed": allow, "noted": now}
+            elif not others and dup:
+                say("duplicate run cleared: no other home's live run overlaps this one now")
+                timer.pop("duplicate")
+            else:
+                return allow or not others
+            if not self.dry:
+                self.save_json("timer.json", timer)
+        return allow or not others
+
 
 SLACK = 20  # seconds: a step comes due this much early, so timer jitter never pushes it a whole run later
+DUPLICATE_NOTE = 3600  # seconds between the FAILED lines of a run refused as a duplicate
 
 
 def listen(a, runner):
@@ -265,6 +304,10 @@ def cli(argv=None, runner=subprocess.run):
         ap.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
         ap.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
         return listen(ap.parse_args(argv[1:]), runner)
+    if argv[:1] == ["status"]:
+        argparse.ArgumentParser(prog="sync.py status", description="List the sync runs recorded on this computer (live or "
+                                "stale, what each watches and with which login) and any sync.py running unrecorded.").parse_args(argv[1:])
+        return runs.status()
     if argv[:1] == ["behaviors"]:
         a = common("sync.py behaviors", "List the behaviors and whether this config turns each on.").parse_args(argv[1:])
         s = Sync(a.home, a.config, runner=runner)
@@ -277,9 +320,13 @@ def cli(argv=None, runner=subprocess.run):
     ap.add_argument("--all", action="store_true", help="run every behavior's step now, whether or not it is due")
     ap.add_argument("--dry-run", action="store_true", help="plan only: no Basecamp writes, map.json untouched")
     ap.add_argument("--include-prereleases", action="store_true", help="also announce GitHub prereleases")
+    ap.add_argument("--allow-duplicate", action="store_true",
+                    help="run even beside another home's live run that watches the same Basecamp with this login")
     a = ap.parse_args(argv)
     s = Sync(a.home, a.config, dry=a.dry_run, runner=runner, prereleases=a.include_prereleases)
     try:
+        if not s.claim(allow=a.allow_duplicate):
+            return 1
         s.main(due=not a.all)
     except Exception as e:
         s.log(f"FAILED {type(e).__name__}: {e}")

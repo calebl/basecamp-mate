@@ -2,6 +2,7 @@
 # basecamp-mate: one command for people, the same as `python3 sync.py <args>`.
 #   basecamp-mate setup     guided setup, step by step
 #   basecamp-mate doctor    check everything and explain any problem with its fix
+#   basecamp-mate status    list the sync runs on this computer and what each watches
 # Symlink it onto your PATH (e.g. ~/.local/bin) to run it from anywhere.
 self=$(readlink -f "$0" 2>/dev/null || echo "$0")
 here=$(cd "$(dirname "$self")/.." && pwd)
@@ -15,6 +16,6 @@ if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
 fi
 [ $# -gt 0 ] || set -- --help
 case $1 in
-  -h|--help) echo "usage: basecamp-mate setup | doctor | <any sync.py command>"; exit 0 ;;
+  -h|--help) echo "usage: basecamp-mate setup | doctor | status | <any sync.py command>"; exit 0 ;;
 esac
 exec python3 "$here/sync.py" "$@"
