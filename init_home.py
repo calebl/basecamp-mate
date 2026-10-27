@@ -35,7 +35,9 @@ relays the owner's Pings (direct messages) to the --login, which live outside th
 project. --assigned-todos treats a to-do the owner assigns to the --login in the
 project as a request: relayed, acknowledged and tracked until done;
 --assigned-todos-anywhere does so in every project of the account (only one home per
-login should: the main one, which routes each request to the right domain). --assigned-cards
+login should: the main one, which routes each request to the right domain). --mentions-anywhere
+relays the owner's @mentions of the --login, and comments on threads it follows, in every
+project of the account, not just this one (the same one home per login). --assigned-cards
 does the same for a card the owner assigns to the --login in the project (never a card the
 sync mirrors from the backlog). --advisories
 <owner/name> (repeatable) records each new GitHub security advisory of that repository once. --backup
@@ -248,7 +250,7 @@ class Init:
     def __init__(self, url, login, home, captain=None, listen_to=(), operators=(), participants_project=False,
                  participants_domains=(), participants_company=None, repo_map=(), create_missing=False, dry=False,
                  force=False, cards=True, assign_captain=True, todos=False, reports=False, every_line=False, checkins=None, releases=True, inbox=False,
-                 session_alert=None, pings=False, assigned_todos=False, assigned_anywhere=False, assigned_cards=False, advisories=(), backup=None, chats=True, no_keyring=None,
+                 session_alert=None, pings=False, assigned_todos=False, assigned_anywhere=False, assigned_cards=False, mentions_anywhere=False, advisories=(), backup=None, chats=True, no_keyring=None,
                  blocked=None, replace_people=False, runner=subprocess.run, system=None, sync_dir=HERE, out=print):
         self.account, self.project = parse_url(url)
         self.login, self.home = login, os.path.abspath(home)
@@ -276,7 +278,7 @@ class Init:
         if session_alert is not None and (not inbox or session_alert < 0):
             raise Refuse("--session-alert needs --inbox (it watches the inbox's notes) and a number of minutes, 0 or more")
         self.assigned_todos, self.assigned_anywhere = assigned_todos or assigned_anywhere, assigned_anywhere
-        self.assigned_cards = assigned_cards
+        self.assigned_cards, self.mentions_anywhere = assigned_cards, mentions_anywhere
         self.chats = chats
         self.advisories = sorted(set(advisories))
         bad = [r for r in self.advisories if not re.fullmatch(r"[^/\s]+/[^/\s]+", r)]
@@ -454,6 +456,8 @@ class Init:
             cfg["assigned_todos"] = {"scope": "account"} if self.assigned_anywhere else {}
         if self.assigned_cards:
             cfg["assigned_cards"] = {}
+        if self.mentions_anywhere:
+            cfg["mentions"] = {"scope": "account"}
         if self.advisories:
             cfg["advisories"] = {"repos": self.advisories}
         if self.backup:
@@ -786,6 +790,9 @@ def cli(argv, **kw):
     ap.add_argument("--assigned-todos-anywhere", action="store_true",
                     help="--assigned-todos in every project of the account, not just this one; run it in one home per "
                          "login only (the main home, which routes each request to the right domain)")
+    ap.add_argument("--mentions-anywhere", action="store_true",
+                    help="relay the owner's @mentions of the --login, and comments on threads it follows, in every "
+                         "project of the account, not just this one; run it in one home per login only (the main home)")
     ap.add_argument("--assigned-cards", action="store_true",
                     help="treat a card the owner assigns to the --login in the project as a request, like --assigned-todos; "
                          "cards the sync mirrors from the backlog never are")
@@ -821,7 +828,7 @@ def cli(argv, **kw):
              create_missing=a.create_missing_columns, dry=a.dry_run, force=a.force,
              cards=not a.no_cards, assign_captain=not a.no_assign_captain, todos=a.todos, reports=a.reports, every_line=a.every_line,
              checkins=a.checkins, releases=not a.no_releases, inbox=a.inbox, session_alert=a.session_alert, pings=a.pings,
-             assigned_todos=a.assigned_todos, assigned_anywhere=a.assigned_todos_anywhere, assigned_cards=a.assigned_cards, advisories=a.advisories, backup=a.backup, chats=not a.no_chats, no_keyring=a.no_keyring,
+             assigned_todos=a.assigned_todos, assigned_anywhere=a.assigned_todos_anywhere, assigned_cards=a.assigned_cards, mentions_anywhere=a.mentions_anywhere, advisories=a.advisories, backup=a.backup, chats=not a.no_chats, no_keyring=a.no_keyring,
              blocked=False if a.no_blocked_reply else a.blocked_reply, replace_people=a.replace_people, **kw).main()
     except Refuse as e:
         print(e, file=sys.stderr)

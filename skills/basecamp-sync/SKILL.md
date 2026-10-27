@@ -262,7 +262,11 @@ that read.
   on, something it follows that nothing else tracks (a card whose task left the backlog, a
   document, someone else's to-do). A mention is addressed to you; a thread comment is said
   to you. Handle it like a card `comment` (relay outside the main firstmate's home), and
-  answer there with `sync.py reply --recording <comment id>`.
+  answer there with `sync.py reply --recording <comment id>`. With `"mentions": {"scope":
+  "account"}` (`init --mentions-anywhere`, the main home only, like account-wide to-do
+  requests), one from any project of the account arrives too, and it and a `chat-question`
+  from another project's chat carry `project` (`id`, `name`); route it like an account-wide
+  request, and `reply` still answers in that project.
 - `todo-comment`: the captain commented on a tracked to-do; see "Decisions as to-dos", or,
   with `request: true`, "To-do requests".
 - `todo-request`, `todo-request-update`, `todo-request-closed`: a to-do assigned to this

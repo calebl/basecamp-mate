@@ -77,7 +77,7 @@ policy. Each does one thing to the configured account and project:
 | boost reader | reader | reads the boosts on the agent login's own recordings (`/my/boosts.json`, one call) and hands each new one to a behavior; records nothing itself |
 | mark read | primitive | marks the agent login's notifications read (`basecamp notifications read`, i.e. `PUT /my/unreads.json`) |
 | Ping reader | reader | finds the Pings (direct messages) the agent's login is in with the owner through `/my/readings.json` and records each new line the owner writes there as `ping` |
-| thread reader | reader | records the owner's new comments on any other thread the agent's login follows or is @mentioned in (a card whatever its backlog state, a document, an upload, someone else's to-do or message) as `thread-comment` or `mention`, and a mention in a chat nothing relays as `chat-question` |
+| thread reader | reader | records the owner's new comments on any other thread the agent's login follows or is @mentioned in (a card whatever its backlog state, a document, an upload, someone else's to-do or message) as `thread-comment` or `mention`, and a mention in a chat nothing relays as `chat-question`; in the project, or, with `"mentions": {"scope": "account"}`, any project of the account |
 | to-do request readers | reader | find the open to-dos in the project (or, with `"scope": "account"`, any project of the account) assigned to the agent's login (`/my/assignments.json`, or a to-do event) and record each one a listened-to person assigned as `todo-request`, once; then its edits and closing as `todo-request-update` and `todo-request-closed` |
 | message comment reader | reader | records the owner's new comments on the agent's own recent Message Board posts as `message-comment` |
 | boost readers | reader | record the owner's new boosts, with their text, on every monitored surface as `boost` (below); a boost on the agent login's own recording only once its received-boosts feed lists it |
@@ -119,7 +119,7 @@ Without `notifications` (no `profile`, or `"notifications": false`) those four r
 
 | Behavior | Config keys | `init` flag | Timer step | Agent side |
 | --- | --- | --- | --- | --- |
-| `notifications` | `profile` (off with `"notifications": false`) | default | every run: the notification and boost readers, then the reader for each thread that changed; mark read | records arrive within about 30 seconds; an `unmonitored` record becomes a decision to-do |
+| `notifications` | `profile` (off with `"notifications": false`), `mentions` | default (`--mentions-anywhere`: @mentions and followed threads account-wide) | every run: the notification and boost readers, then the reader for each thread that changed; mark read | records arrive within about 30 seconds; an `unmonitored` record becomes a decision to-do |
 | `card-mirror` | `tables`, `repos` (off with `"cards": false`), `assign_captain` | default (`--no-cards` to leave off; `--no-assign-captain` never assigns the owner) | mirror the backlog; card comment and 👍 readers (5 min) | relay comments and approvals; `reply`; with `"assign_captain": false`, send each decision to the main home instead |
 | `chat-inbox` | `chats` | default; `--every-line` | chat reader (hourly sweep) | `reply` to each line |
 | `chat-asks` | `ask_chat` | by hand | none | `ask` |
@@ -182,7 +182,8 @@ counts, is widened only deliberately, in the config (or with `init`'s flags), in
   invited to one project, say. Elsewhere, including Pings (a Ping is a bucket of its own,
   not a project), they are not heard. With account-wide to-do requests (`"scope":
   "account"`), a to-do they assign the agent in their project is a request; in any other
-  project it is not.
+  project it is not. With account-wide mentions (`"mentions": {"scope": "account"}`), the
+  same holds for their @mentions and comments.
 - **Participants by rule** (`participants`: `{"project": true}`, `init
   --participants-project`, `{"company": true}`, `init --participants-company`, and/or
   `{"domains": ["example.com"]}`, `init --participants-domain <domain>`): anyone on the
@@ -338,6 +339,7 @@ own:
 | a comment on one of the agent's own messages (with `reports` on) | that message's reader, whatever its age |
 | a comment or @mention on any other thread in the project (a document, an upload, someone else's to-do or message, a card nothing mirrors, a tracked to-do once completed or closed) | the thread reader: `thread-comment` or `mention` records. A thread's first read starts at the notification's first unread comment (or, when it names none, at when it became unread), and never before the newest comment a to-do, card or message reader already read there; a comment one of them recorded or answered is never recorded again |
 | an @mention of the agent in a chat nothing relays | a `chat-question` for that line |
+| with `"mentions": {"scope": "account"}`, a comment or @mention on a thread in another project of the account, or an @mention of the agent in a chat there | the thread reader, or the chat mention reader, as in the project (see "Mentions anywhere in the account" below) |
 | `Assignment` or `Completion` of a to-do (with `assigned_todos` on; in any project with `"scope": "account"`) | the to-do request reader, or the request's edit and closing check; the notification says who assigned or completed it |
 | any other event on a card (an `Event`: assigned, moved, edited, completed), with `assigned_cards` on, unless the card mirror made it | the card request reader, or the request's edit and closing check; an event that leaves no request stays unmonitored |
 | a check-in `Reminder` (with `checkins` on) | the check-in reader: a faster signal than the 5-minute schedule check |
@@ -375,8 +377,28 @@ had a failed call keeps its old cursor and is not marked: the next run retries i
 readers' own cursors make that harmless. A failed mark is retried next run.
 
 **Scope.** Items in other projects are another home's: they are never read, acted on or
-marked read here, except a Ping (with `pings` on) and a to-do request with `"scope":
-"account"`. Basecamp's own items (`BoostReport`, `Bulletin`, `Onboarding`) are ignored.
+marked read here, except a Ping (with `pings` on), a to-do request with `"scope":
+"account"`, and, with `"mentions": {"scope": "account"}`, an @mention of the agent or a
+comment on a thread it follows. Basecamp's own items (`BoostReport`, `Bulletin`,
+`Onboarding`) are ignored.
+
+**Mentions anywhere in the account.** With `"mentions": {"scope": "account"}` (`init
+--mentions-anywhere`), an @mention of the agent's login, or a comment on a thread it follows
+(one it created, commented on or was @mentioned in), in *any* project of the account reaches
+it as one in the configured project would: the thread reader records a `mention` or
+`thread-comment`, and an @mention in a chat there is a `chat-question`. Each such record
+carries `project`: `{"id", "name"}` of the project it is in, and its inbox note names that
+project, so the agent can route it. Who is heard is decided exactly as in the project (the
+captain, operators, `people`, participants by rule, and `project_people` for that project),
+a blocked sender gets the automatic reply there, the 👀 and the owner's boosts on the agent's
+replies in that thread are read there, `sync.py reply --recording <id>` answers in that
+project, and a notification handled this way is marked read. A chat line in another
+project's chat that does not @mention the agent is still another home's and is left alone
+(a Campfire reply to the agent's line there, which carries no mention, included). It needs
+notifications (a `profile`). The default, `{}` or `"scope": "project"`, or no `mentions` key,
+is unchanged: only the configured project's. Like account-wide to-do requests, run it in
+**one home per Basecamp login** (the main home); `basecamp-mate doctor` flags two homes on
+this computer that run it with the same account and `profile`.
 
 The first run only seeds the cursors and the boosts seen, so no history is replayed; the
 repair sweep reads the configured surfaces the same run. Later, an item with no cursor that
@@ -550,8 +572,9 @@ one that signs in as the owner, nothing is read: the assignments would be the ow
   read and acknowledged with a 👀 (with `"scope": "account"`, those in any project of the
   account, and the comments and boosts on them). Notifications and boosts are read for the
   whole account, but only this project's items (and those Pings and requests) are acted on;
-  in the project, any thread the acting login follows or is @mentioned in is read for the
-  owner's comments, and `reply` answers there. Their only writes are the readers' 👀/👍
+  in the project (with `"mentions": {"scope": "account"}`, any project of the account), any
+  thread the acting login follows or is @mentioned in is read for the owner's comments, and
+  `reply` answers there. Their only writes are the readers' 👀/👍
   acknowledgements and marking handled notifications read; never another home's.
 - Cards are never deleted, trashed or archived. Cards whose task left the backlog are
   left as they are (the run logs how many).
@@ -767,8 +790,9 @@ Two homes whose configs watch the same project with the same Basecamp login woul
 read the same notifications, record the same input, acknowledge it twice and wake two
 agents. The shared state lock cannot stop that, since it is per config, so every timer run
 first claims what its config watches ([`runs.py`](runs.py)): its project, and,
-account-wide, its login's Pings (with `pings`) and the to-dos assigned to it anywhere
-(with `"assigned_todos": {"scope": "account"}`). Two claims overlap when they share one of
+account-wide, its login's Pings (with `pings`), the to-dos assigned to it anywhere
+(with `"assigned_todos": {"scope": "account"}`) and its @mentions and followed threads
+anywhere (with `"mentions": {"scope": "account"}`). Two claims overlap when they share one of
 those with the same login: the same Basecamp person when both runs know it, else the same
 `profile`. A run beside another config's live claim that overlaps is refused: it reads
 nothing, exits 1 and logs `FAILED duplicate run`, naming the other home, its config and
@@ -863,6 +887,9 @@ replaced the event listener); a config that differs from the discovered one only
 `"assigned_todos": {"scope": "account"}` instead: one in any project of the account is (only
 in the main home; see To-do requests). `--assigned-cards` adds `"assigned_cards": {}`: a
 card the owner assigns to the `--login` in the project is a request (see To-do requests).
+`--mentions-anywhere` adds `"mentions": {"scope": "account"}`: the owner's @mentions of the
+`--login`, and comments on threads it follows, in any project of the account are relayed
+(only in the main home; see Notifications).
 
 `--no-cards` sets a home up without the card mirror: it reads no card tables (the project
 need not have any), writes a config without `tables` or `repos`, creates only
@@ -910,8 +937,8 @@ and fewer than Basecamp's 100 unread), the timer units (installed, pointing at f
 exist, enabled and active) and a leftover listener service, the last `sync.log` line
 (FAILED, or older than 20 minutes; a `FAILED duplicate run` names `basecamp-mate status`),
 the wake check's registration, and, with `participants` domains, that the login sees anyone's
-email address; then, across the homes checked, that no two watch the same project, Pings or
-account-wide to-do requests with the same login (unless all set `"allow_duplicate"`). Each
+email address; then, across the homes checked, that no two watch the same project, Pings,
+account-wide to-do requests or account-wide mentions with the same login (unless all set `"allow_duplicate"`). Each
 problem prints with its fix; it exits 1 when anything is broken.
 
 ### The base prompt and the agent skill
@@ -998,6 +1025,10 @@ or by hand from
 - `notifications` (optional): on whenever `profile` is set. `false` turns it off;
   `{"mark_read": false}` leaves handled notifications unread; `{"unmonitored": false}`
   turns off `unmonitored` records. See Notifications.
+- `mentions` (optional): `{}` or `{"scope": "project" | "account"}`: `"account"` relays the
+  owner's @mentions of the acting login, and comments on threads it follows, from every
+  project of the account (one home per login); the default `"project"` only from this one.
+  Needs notifications. See Notifications (Mentions anywhere in the account).
 - `listen` (retired): ignored, with one note in `sync.log`; its `"unmonitored": false` still
   applies. See "Upgrading from the event listener".
 - `pings` (optional): `{}` or `{"limit": <n>}`: relay the owner's Pings (direct messages)
@@ -1244,7 +1275,16 @@ and repeating to-dos (`due_on` and `repeats` on the records, a moved due date or
 as an update, Basecamp's next occurrence recorded once as a request that `follows` the
 completed one, a reused to-do, `todo show`), plus the account-wide
 scope (a request in another project carrying its project, its comments, boosts, replies,
-edits and closing in that project) and the unchanged project default. The `basecamp`, `gh` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
+edits and closing in that project) and the unchanged project default;
+`tests/test_mentions_anywhere.py` covers `"mentions": {"scope": "account"}`: a mention on a
+document and comments on a followed card in another project recorded with their project,
+acknowledged, marked read, noted and answered there, the owner's boost on the agent's reply
+there, a chat mention there answered in that chat and a chat line without one ignored, the
+access list (a blocked stranger answered there, `people` heard everywhere and
+`project_people` only in their project), off by default and with the project scope, a
+malformed setting refused, the configured project's records unchanged, the run claim and
+`doctor`'s check for two homes running it with one login, and the inbox note naming the
+project. The `basecamp`, `gh` and `lavish-axi` CLIs are stubbed, and `init`'s systemd and check
 registration sit behind a fake; tests make no network calls and touch no real home.
 `tests/test_init.py` also covers removing the retired listener service and `"listen"` key.
 `tests/test_setup.py` covers `setup` (defaults, a project URL, interactive picks, the card
@@ -1275,13 +1315,16 @@ stay in UTC.
 - `comment`: `task`, `repo`, `card`, `comment` (id), `at`, `text`.
 - `question`: the same fields as `comment`, for a comment containing `?`.
 - `chat-question`: `chat` (id), `line` (id), `url`, `text`, `at`; `mention: true` when it
-  @mentions the agent (or replies to its line) in a chat nothing else relays.
+  @mentions the agent (or replies to its line) in a chat nothing else relays; `project`
+  (`id`, `name`) when that chat is in another project (`"mentions": {"scope": "account"}`).
 - `thread-comment`: `bucket`, `parent` (the thread's id), `parent_type` (e.g. `Document`,
   `Kanban::Card`, `Todo`), `title`, `comment` (id), `question`, `url`, `text`, `at`. A
   listened-to person commented on a thread the agent follows that no other reader tracks
   (a card nothing mirrors, a document, someone else's to-do). Answer with `sync.py reply
   --recording <comment>`, which comments on the thread.
 - `mention`: the same fields, for a comment that @mentions the agent: addressed to it.
+  Either carries `project` (`id`, `name`) when the thread is in another project of the
+  account (`"mentions": {"scope": "account"}`).
 - `ping`: `bucket` (the Ping's circle), `chat`, `line` (ids), `title` (the Ping's name),
   `url`, `text`, `at`. The owner wrote to the agent's login in a Ping; answer there with
   `sync.py reply --recording <line>`.

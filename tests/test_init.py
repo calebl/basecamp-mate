@@ -368,6 +368,10 @@ class InitTest(unittest.TestCase):
         cfg, _ = self.init(assigned_anywhere=True).discover()
         self.assertEqual(cfg["assigned_todos"], {"scope": "account"})
 
+    def test_mentions_anywhere_takes_them_account_wide(self):
+        self.assertEqual(self.init(mentions_anywhere=True).discover()[0], EXPECTED | {"mentions": {"scope": "account"}})
+        self.assertNotIn("mentions", self.init().discover()[0])
+
     def test_advisories_flag_lists_the_repositories_and_refuses_a_bad_one(self):
         cfg, _ = self.init(advisories=["acme/server", "acme/app", "acme/server"]).discover()
         self.assertEqual(cfg, EXPECTED | {"advisories": {"repos": ["acme/app", "acme/server"]}})

@@ -27,7 +27,9 @@ Deterministic, no model calls. Safety bounds, enforced here:
     the agent's login (with "scope": "account", any project's) are read and
     acknowledged with a 👀; the agent login's notifications and boosts are read across
     the account, but only this project's (and those Pings and requests) are acted on,
-    and an owner's @mention of the agent anywhere in the project is relayed; with
+    and an owner's @mention of the agent anywhere in the project is relayed (with
+    "mentions": {"scope": "account"}, anywhere in the account, and comments on threads
+    it follows there); with
     "backup" on, the config and state files are uploaded to its Docs & Files folder
     (a changed file as a new version of its upload there);
   - nothing is ever deleted, trashed or archived, except the acting user's own 👀
@@ -42,7 +44,7 @@ Deterministic, no model calls. Safety bounds, enforced here:
     duplicating.
 All runtime state lives in the directory that holds the config file, except each config's
 run claim (runs.py): a timer run refuses to run beside another home's live run that watches
-the same project (or Pings, or account-wide to-do requests) with the same login, unless
+the same project (or Pings, account-wide to-do requests or account-wide mentions) with the same login, unless
 "allow_duplicate" or --allow-duplicate; `sync.py status` lists the runs.
 
 Usage: sync.py --home <home> --config <config.json> [--all] [--dry-run] [--include-prereleases] [--allow-duplicate]

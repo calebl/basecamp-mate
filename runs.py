@@ -8,7 +8,8 @@ beside a live claim that overlaps, naming the other home. Two runs of the same c
 never collide here: they share one claim, and the state lock serializes them.
 
 What a config watches (`watches`): its project, and, account-wide, the Pings of its login
-("pings") and the to-dos assigned to its login anywhere ("assigned_todos" with "scope":
+("pings"), the to-dos assigned to its login anywhere ("assigned_todos" with "scope":
+"account") and its @mentions and followed threads anywhere ("mentions" with "scope":
 "account"). Two claims overlap when they share one of those with the same login: the same
 Basecamp person when both know it, else the same CLI profile.
 
@@ -48,6 +49,9 @@ def watches(cfg):
     opts = cfg.get("assigned_cards")
     if isinstance(opts, dict) and opts.get("scope") == "account":
         out.append(f"card-requests {account}")
+    opts = cfg.get("mentions")
+    if isinstance(opts, dict) and opts.get("scope") == "account":
+        out.append(f"mentions {account}")
     return out
 
 

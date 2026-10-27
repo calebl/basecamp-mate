@@ -881,7 +881,10 @@ class Notifications(Behavior):
     line in a chat not in "chats", a to-do assigned with assigned-todos off) is an
     `unmonitored` record, once per kind, unless "notifications" has "unmonitored": false
     (or an old "listen" had it). Items in other projects are another home's: never read
-    and never marked read here, except a Ping and an account-wide to-do request.
+    and never marked read here, except a Ping and an account-wide to-do request, and, with
+    "mentions": {"scope": "account"}, an @mention of the agent or a comment on a thread it
+    follows there, which its thread reader (or, for a chat line, the mention reader)
+    records as it would in the project, carrying that project.
 
     Boosts: one read of /my/boosts.json, the boosts on the agent's own recordings. Each new
     owner boost runs the reader whose state holds the boosted recording, which records it
@@ -915,6 +918,11 @@ class Notifications(Behavior):
                 raise ValueError(f'config "notifications" "{k}" must be true or false')
         self.mark = opts.get("mark_read", True)
         self.unmonitored = self.on and opts.get("unmonitored", old.get("unmonitored", True) is not False)
+        mentions = cfg.get("mentions")
+        if mentions is not None and (not isinstance(mentions, dict) or set(mentions) - {"scope"}
+                                     or mentions.get("scope", "project") not in ("project", "account")):
+            raise ValueError('config "mentions" must be {} or {"scope": "project" | "account"}')
+        self.anywhere = self.on and (mentions or {}).get("scope") == "account"
         self.others = {}  # every behavior by name, set by configure()
 
     def run(self, items=None):
@@ -1095,7 +1103,17 @@ class Notifications(Behavior):
             if keys and kind in ("Comment", "Mention"):
                 want["todos"] |= keys
                 return True, ["todos"], None
-            return False, [], None
+            if not self.anywhere or kind not in ("Comment", "Mention"):
+                return False, [], None
+            # "mentions": {"scope": "account"}: an @mention of the agent, or a comment on a thread it follows, read as in
+            # the project; a chat line there that does not mention the agent stays another home's.
+            if r.get("section") == "chats" or path == "chats":
+                if kind != "Mention":
+                    return False, [], None
+                want["mentions"][anchor] = (bucket, thread)
+                return True, [f"mention {anchor}"], None
+            self.thread(want, bucket, thread, anchor, kind == "Mention", THREADS.get(path), topic(r), stamp(r))
+            return True, [f"thread {thread}"], None
         mention = kind == "Mention"
         if r.get("section") == "chats" or path == "chats":
             ci = b["chat-inbox"]
@@ -1172,8 +1190,12 @@ class Notifications(Behavior):
             open_keys = {k for k in keys if not todos[k].get("completed") and not todos[k].get("closed")}
             want["todos"] |= open_keys
             return True, ["todos"] if open_keys else [], None
+        known = f"{bucket}:{parent.get('id')}" in t.load("threads.json", {}) if rtype == "Comment" else False
+        if bucket != t.project and not (known and self.anywhere):
+            return False, [], None  # another project's, unless a thread followed there with "mentions" account-wide
         if bucket != t.project:
-            return False, [], None
+            self.thread(want, bucket, parent.get("id"), None, False, parent.get("type"), parent.get("title"))
+            return True, [f"thread {parent.get('id')}"], None
         if rtype == "Chat::Lines" and b["chat-inbox"].on and str(parent.get("id")) in b["chat-inbox"].chats:
             want["chats"].setdefault(str(parent.get("id")), set())
             return True, [f"chat {parent.get('id')}"], None
@@ -1189,7 +1211,6 @@ class Notifications(Behavior):
         if msg is not None and b["reports"].on:
             want["messages"].add(msg)
             return True, [f"message {msg}"], None
-        known = f"{bucket}:{parent.get('id')}" in t.load("threads.json", {}) if rtype == "Comment" else False
         if known:
             self.thread(want, bucket, parent.get("id"), None, False, parent.get("type"), parent.get("title"))
             return True, [f"thread {parent.get('id')}"], None
@@ -1284,7 +1305,8 @@ def inbox_note(rec, account, project):
     name = author.get("name") or (f"person {author['id']}" if author.get("id") else "someone")
     who = ("the captain" if role == "captain" else f"{name} (an operator: their word counts as the captain's)"
            if role == "operator" else f"{name} (not the captain)")
-    # A to-do request in another project of the account (assigned-todos "scope": "account") names it, for routing.
+    # A record from another project of the account (a to-do request with assigned-todos "scope": "account", or a mention
+    # or followed thread with "mentions" "scope": "account") names it, for routing.
     proj = rec.get("project") or {}
     elsewhere = (f" in project {proj.get('name') or proj.get('id')!r} ({proj.get('id')})"
                  if proj.get("id") and str(proj.get("id")) != str(project) else "")
@@ -1303,7 +1325,7 @@ def inbox_note(rec, account, project):
         facts, url = ["a 👍 on an assigned card approves every recommendation on it"], rec.get("url") or card_url
     elif kind == "chat-question":
         rid = rec.get("line")
-        what, cmds, url = f"Basecamp chat line from {who}", [f"sync.py reply --recording {rid} (answers in the chat)"], rec.get("url")
+        what, cmds, url = f"Basecamp chat line from {who}{elsewhere}", [f"sync.py reply --recording {rid} (answers in the chat)"], rec.get("url")
     elif kind == "ping":
         rid = rec.get("line")
         what = f"Basecamp Ping (a direct message) from {who}" + (f" in {rec.get('title')!r}" if rec.get("title") else "")
@@ -1396,7 +1418,7 @@ def inbox_note(rec, account, project):
     elif kind in ("mention", "thread-comment"):
         rid = rec.get("comment")
         what = (f"Basecamp {'@mention of you' if kind == 'mention' else 'comment'} from {who} on "
-                f"{rec.get('parent_type') or 'a recording'}" + (f" {rec.get('title')!r}" if rec.get("title") else ""))
+                f"{rec.get('parent_type') or 'a recording'}" + (f" {rec.get('title')!r}" if rec.get("title") else "") + elsewhere)
         facts = ["addressed to you" if kind == "mention" else "on something you follow"]
         cmds, url = [f"sync.py reply --recording {rid} (answers there)"], rec.get("url")
     elif kind == "decision-step-done":

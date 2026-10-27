@@ -118,7 +118,9 @@ home), a request can come from any project of the account; every record of it ca
 like any other work: do it here when the project is yours, or hand it to the second mate or
 domain that owns that project, keeping the request's key so you can comment and complete it
 once the work is done. The sync posts your comments, replies and completion in the to-do's
-own project.
+own project. With `"mentions": {"scope": "account"}`, a `mention`, `thread-comment` or
+`chat-question` can come from another project the same way, carrying `project`; route it
+alike, and `reply` answers in its own project.
 
 ## Operators and participants
 

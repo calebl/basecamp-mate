@@ -1525,7 +1525,8 @@ class Tools:
     def read_mention(self, bucket, chat, rid):
         """Record a listened-to person's line `rid` in chat `chat` that @mentions the acting user (or is a Campfire reply
         to one of its lines) when no chat reader relays that chat, once, as a `chat-question` kept in chats.json, so
-        `reply` answers it there; queued for a 👀. Returns True when recorded. A dry run records nothing."""
+        `reply` answers it there; queued for a 👀. In another project ("mentions": {"scope": "account"}) the record
+        carries that `project` and chats.json its bucket. Returns True when recorded. A dry run records nothing."""
         if self.agent() is None or rid in self.load("chats.json", {}).get(str(chat), {}).get("lines", []):
             return False
         try:
@@ -1533,7 +1534,7 @@ class Tools:
         except RuntimeError as e:
             self.log(f"mention {rid} in chat {chat}: {e}")
             return False
-        if not self.hears(ln.get("creator")):
+        if not self.hears(ln.get("creator"), bucket=bucket):
             self.block(ln.get("creator"), bucket, chat, rid, ln.get("created_at"), chat=True, what="chat line")
             return False
         if self.dry:
@@ -1541,13 +1542,17 @@ class Tools:
             return False
         state = self.load("chats.json", {})
         rec = state.setdefault(str(chat), {})
+        elsewhere = self.elsewhere(bucket, ln)
+        if elsewhere:
+            rec.update(bucket=int(bucket), project_name=elsewhere["project"]["name"])
         self.record({"kind": "chat-question", "chat": int(chat), "line": rid, "mention": True,
                      "url": ln.get("app_url") or f"https://3.basecamp.com/{self.account}/buckets/{bucket}/chats/{chat}@{rid}",
-                     "text": plain(ln.get("content")), "at": ln.get("created_at"), **self.author(ln.get("creator"))})
+                     "text": plain(ln.get("content")), "at": ln.get("created_at"), **elsewhere,
+                     **self.author(ln.get("creator"), bucket)})
         rec.setdefault("lines", []).append(rid)
         rec.setdefault("ack", []).append([rid, self.read_ack()])
         self.log(f"new owner mention in chat {chat}: {rid}")
-        self.acknowledge(f"chat {chat}", rec)
+        self.acknowledge(f"chat {chat}", rec, bucket)
         self.save_json("chats.json", state)
         return True
 
@@ -1569,7 +1574,9 @@ class Tools:
         contains "?", a 👍 otherwise. `reply` answers either with a comment on the thread.
         `ptype` and `title` name the thread when the comments do not. The owner's boosts on
         its comments (the agent's replies included) are `boost` records with surface
-        `thread-comment`. A dry run reads and logs only.
+        `thread-comment`. A thread in another project ("mentions": {"scope": "account"}) is
+        read the same way, the people heard as in "project_people" for that project, and its
+        records carry that `project`. A dry run reads and logs only.
         """
         if self.agent() is None:
             return
@@ -1598,7 +1605,7 @@ class Tools:
             if cid in known:
                 continue
             mention = cid in mentions or self.addressed(c.get("content"))
-            if not self.hears(c.get("creator")):
+            if not self.hears(c.get("creator"), bucket=bucket):
                 if mention:
                     self.block(c.get("creator"), bucket, thread, cid, c.get("created_at"), what="comment")
                 continue
@@ -1608,10 +1615,13 @@ class Tools:
                 self.log(f"dry thread {thread}: owner {'mention' if mention else 'comment'} {cid}")
                 continue
             rec.update(parent_type=on.get("type") or rec.get("parent_type"), title=on.get("title") or rec.get("title"))
+            elsewhere = self.elsewhere(bucket, c, rec)
+            if elsewhere:
+                rec["project_name"] = elsewhere["project"]["name"]
             self.record({"kind": "mention" if mention else "thread-comment", "bucket": int(bucket), "parent": thread,
                          "parent_type": rec.get("parent_type"), "title": rec.get("title"), "comment": cid,
                          "question": "?" in text, "url": c.get("app_url") or on.get("app_url"), "text": text,
-                         "at": c.get("created_at"), **self.author(c.get("creator"))})
+                         "at": c.get("created_at"), **elsewhere, **self.author(c.get("creator"), bucket)})
             rec.setdefault("comments", []).append(cid)
             rec.setdefault("ack", []).append([cid, self.read_ack(mention or "?" in text)])
             self.log(f"new owner {'mention' if mention else 'comment'} on {rec.get('parent_type') or 'thread'} {thread}: {cid}")
@@ -1622,6 +1632,14 @@ class Tools:
             rec["cursor"] = cursor
             state[key] = rec
             self.save_json("threads.json", state)
+
+    def elsewhere(self, bucket, recording, rec=None):
+        """{"project": {"id", "name"}} for a record of `recording` in `bucket` when that is another project of the account
+        ("mentions": {"scope": "account"}), its name from the recording (else `rec`'s "project_name"); {} in the project."""
+        if str(bucket) == str(self.project):
+            return {}
+        name = ((recording or {}).get("bucket") or {}).get("name") or (rec or {}).get("project_name")
+        return {"project": {"id": int(bucket), "name": name}}
 
     def tracked_comments(self, bucket, thread):
         """What the other readers already read on recording `thread` in `bucket`: (the newest comment id read, the ids
@@ -1716,9 +1734,11 @@ class Tools:
             (k for k, r in self.load("threads.json", {}).items() if rid in r.get("comments", [])), None)
         if thread is not None:
             return self.reply_thread(thread, rid, text, again)
+        bucket = None
         if chat is not None:
             store, rec = ("chats.json", chats), chats[chat]
-            target = f"/buckets/{self.project}/chats/{chat}/lines.json"
+            bucket = rec.get("bucket")  # a mention in another project's chat ("mentions": {"scope": "account"})
+            target = f"/buckets/{bucket or self.project}/chats/{chat}/lines.json"
         else:
             cards = self.load("map.json", {})
             rec = next((r for r in cards.values() if rid in r.get("comments", [])), None)
@@ -1738,11 +1758,11 @@ class Tools:
             self.log(f"dry reply {rid}: post in {where}, then remove {EYES}")
             return False
         payload = {"content": body, "content_type": "text/html"} if chat is not None else {"content": body}
-        self.bc("api", "post", target, "-d", json.dumps(payload))
+        self.bc("api", "post", target, "-d", json.dumps(payload), project=bucket)
         rec.setdefault("replied", []).append(rid)
         self.save_json(*store)
         self.log(f"reply {rid}: posted in {where}")
-        self.remove_eyes(rid)
+        self.remove_eyes(rid, bucket)
         return True
 
     def reply_ping(self, chat, rid, text, again):
