@@ -433,6 +433,33 @@ class Doctor:
                          f"them can run (the others are refused as duplicates): {hs}",
                          "Fix: turn the extra home's timer off, or connect it to its own project with its own sign-in;\n"
                          '     to run both on purpose, set "allow_duplicate": true in each one\'s settings.')
+        self.mentions_covered(homes)
+
+    def mentions_covered(self, homes):
+        """Warn when a home taking @mentions anywhere ("mentions": {"scope": "account"}) shares its account and login
+        with a home that reads its own project's notifications: a mention or followed-thread comment in that project
+        would reach both. Two homes taking mentions anywhere, or watching one project, are flagged by `overlaps`."""
+        def anywhere(cfg):
+            return (cfg.get("mentions") or {}).get("scope") == "account"
+        for h, cfg in homes:
+            if not anywhere(cfg):
+                continue
+            profile = cfg.get("profile") or ""
+            covered = [(o, ocfg) for o, ocfg in homes
+                       if o != h and not anywhere(ocfg) and (ocfg.get("profile") or "") == profile
+                       and str(ocfg.get("account")) == str(cfg.get("account"))
+                       and str(ocfg.get("project")) != str(cfg.get("project"))
+                       and ocfg.get("profile") and ocfg.get("notifications") is not False
+                       and not (cfg.get("allow_duplicate") is True and ocfg.get("allow_duplicate") is True)]
+            if not covered:
+                continue
+            login = f"the sign-in {profile!r}" if profile else "the default sign-in"
+            self.out("")
+            self.bad(f"{h} takes @mentions and followed threads anywhere in account {cfg.get('account')} with {login}, "
+                     f"and so do these homes in their own projects, so each such mention or comment there would reach "
+                     f"both: {', '.join(o for o, _ in covered)}",
+                     'Fix: give the other homes their own sign-in, or drop "mentions": {"scope": "account"} from '
+                     f'{h}\'s settings;\n     to run both on purpose, set "allow_duplicate": true in each one\'s settings.')
 
 
 def cli(argv, **kw):
