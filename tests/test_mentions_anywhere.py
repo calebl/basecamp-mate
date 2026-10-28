@@ -189,6 +189,29 @@ class OneHomePerLogin(unittest.TestCase):
         self.assertIn('keep "mentions": {"scope": "account"} only in the main home', text)
         said.clear()
         d.overlaps([("/h1", cfg), ("/h2", dict(self.CFG, project=9))])
+        self.assertNotIn("2 homes take @mentions", "\n".join(said))
+
+    def test_doctor_flags_mentions_anywhere_beside_a_home_reading_its_own_project(self):
+        said = []
+        d = doctor.Doctor(out=said.append)
+        cfg = dict(self.CFG, mentions={"scope": "account"})
+        d.overlaps([("/h1", cfg), ("/h2", dict(self.CFG, project=9))])
+        text = "\n".join(said)
+        self.assertIn("/h1 takes @mentions and followed threads anywhere in account 1 with the sign-in 'agent'", text)
+        self.assertIn("would reach both: /h2", text)
+        self.assertEqual(d.problems, 1)
+
+    def test_doctor_passes_mentions_anywhere_beside_other_logins_accounts_or_opt_outs(self):
+        cfg = dict(self.CFG, mentions={"scope": "account"})
+        for other in (dict(self.CFG, project=9, profile="other"), dict(self.CFG, account=5, project=9),
+                      dict(self.CFG, project=9, notifications=False)):
+            said = []
+            d = doctor.Doctor(out=said.append)
+            d.overlaps([("/h1", cfg), ("/h2", other)])
+            self.assertNotIn("@mentions", "\n".join(said), other)
+        said = []
+        d = doctor.Doctor(out=said.append)
+        d.overlaps([("/h1", dict(cfg, allow_duplicate=True)), ("/h2", dict(self.CFG, project=9, allow_duplicate=True))])
         self.assertNotIn("@mentions", "\n".join(said))
 
 
