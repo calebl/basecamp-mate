@@ -50,7 +50,8 @@ RELAY = "relay.jsonl"  # the relay ledger beside the config: relayed, skipped, a
 # Why an item of each kind reached the agent, when its record does not say ("why": "awaiting" or "yours" does).
 WHY = {"mention": "addressed", "chat-question": "chat", "ping": "ping", "comment": "card", "question": "card",
        "approval": "card", "message-comment": "own-message", "todo-comment": "tracked-todo", "boost": "own-recording",
-       "todo-request": "assigned", "card-request": "assigned", "decision-step-done": "tracked-todo"}
+       "todo-request": "assigned", "card-request": "assigned", "step-request": "assigned",
+       "decision-step-done": "tracked-todo"}
 # When a scheduled request is done ("schedule" in the config, schedule.json per list): ask the owner, on its due date, or
 # before it.
 WHEN = ("ask", "due", "before")
@@ -143,6 +144,11 @@ class Tools:
         self.assigned_cards = cfg.get("assigned_cards") not in (None, False)
         self.card_scope = (cfg.get("assigned_cards") or {}).get("scope", "project") \
             if isinstance(cfg.get("assigned_cards"), dict) else "project"
+        # "assigned_steps": card steps (a card's checklist items) assigned to the acting user are requests too, with
+        # their own scope; the card they are on is someone else's.
+        self.assigned_steps = cfg.get("assigned_steps") not in (None, False)
+        self.step_scope = (cfg.get("assigned_steps") or {}).get("scope", "project") \
+            if isinstance(cfg.get("assigned_steps"), dict) else "project"
         self.message_board = str(cfg["message_board"]) if cfg.get("message_board") is not None else None
         # "timezone": the IANA zone times written for people are shown in; unset, the captain's Basecamp time zone.
         self.timezone = cfg.get("timezone")
@@ -1152,7 +1158,7 @@ class Tools:
         return any((a.get("creator") or {}).get("id") == me and (a.get("group_on") or (a.get("created_at") or "")[:10]) == date
                    for a in answers)
 
-    def read_todo_comments(self, keys=None, requests=None):
+    def read_todo_comments(self, keys=None, requests=None, mentions=()):
         """Record the owner's new comments on each open tracked to-do (or only those in `keys`) as `todo-comment` records.
 
         todos.json keeps, per key, the to-do id and a cursor (the newest comment id
@@ -1162,6 +1168,16 @@ class Tools:
         not read. `requests` True reads only to-do requests (records carry "request":
         true), False only the agent's decision to-dos, None both. A dry run reads and
         logs only.
+
+        A card step request reads the comments on its card, which is someone else's, so
+        only those that concern the agent: one that @mentions it or is in `mentions` (the
+        comments a mention notification named: an @mention, or a Basecamp Reply to the
+        agent's comment, whose text has no @mention), `why` "addressed", and the first one
+        by someone listened to after the agent's own comment there, `why` "awaiting".
+        Every other comment is skipped (a `skipped` line in sync.log and the relay ledger).
+        A comment `mentions` names that was skipped before the notification came is
+        recorded then. Nothing is read there while another reader has the card's comments
+        (card_read_elsewhere).
         """
         for key in sorted(self.load("todos.json", {})):
             if keys is not None and key not in keys:
@@ -1173,26 +1189,48 @@ class Tools:
                     continue
                 if requests is not None and bool(rec.get("request")) != requests:
                     continue
+                step = rec.get("type") == "step"
+                thread = self.step_card(rec)
                 try:
-                    comments = self.bc("comments", "list", str(rec["todo"]), project=rec.get("bucket")) or []
+                    comments = [] if step and self.card_read_elsewhere(rec) else \
+                        self.bc("comments", "list", str(thread), project=rec.get("bucket")) or []
                 except RuntimeError as e:
                     self.log(f"todo {key}: {e}")
                     continue
                 if self.dry:
                     rec = json.loads(json.dumps(rec))
                 cursor = rec.get("cursor", 0)
+                me = self.acting_id() if step else None
+                due = rec.get("answer_due", False)  # a card step request: the agent commented there last
                 for c in sorted(comments, key=lambda c: c.get("id", 0)):
                     cid = c.get("id", 0)
-                    if cid <= cursor:
+                    late = (step and cid in mentions and cid > rec.get("start", cursor)
+                            and cid not in rec.get("comments", []))
+                    if cid <= cursor and not late:
                         continue
-                    cursor = cid
+                    cursor = max(cursor, cid)
+                    if step and me is not None and (c.get("creator") or {}).get("id") == me:
+                        due = True  # the next comment by someone listened to there answers it
+                        continue
                     if not self.hears(c.get("creator"), bucket=rec.get("bucket")):
                         if self.addressed(c.get("content")):
-                            self.block(c.get("creator"), rec.get("bucket") or self.project, rec["todo"], cid,
+                            self.block(c.get("creator"), rec.get("bucket") or self.project, thread, cid,
                                        c.get("created_at"), what="comment")
                         continue
                     text = html.unescape(re.sub(r"<[^>]+>", " ", c.get("content", "")))
                     text = re.sub(r"\s+", " ", text).strip()
+                    why = None
+                    if step:
+                        why = "addressed" if self.addressed(c.get("content")) or cid in mentions else "awaiting" if due else None
+                        if why is None:
+                            who = (c.get("creator") or {}).get("name") or (c.get("creator") or {}).get("id")
+                            if not self.dry:
+                                self.skipped(f"skipped comment {cid} by {who} on card {thread} (step request {key}): "
+                                             "not addressed to the agent, and no comment of its own there awaits an answer",
+                                             "todo-comment", cid, "not addressed to the agent", bucket=rec.get("bucket") or self.project,
+                                             text=text, url=c.get("app_url"), person=c.get("creator"), key=key)
+                            continue
+                        due = False
                     question = "?" in text
                     rec.setdefault("ack", []).append([cid, self.read_ack(question)])
                     if self.dry:
@@ -1201,17 +1239,23 @@ class Tools:
                     self.record({"kind": "todo-comment", "key": key, "todo": rec["todo"], "comment": cid,
                                  "question": question, "url": c.get("app_url") or rec.get("url"),
                                  "text": text, "at": c.get("created_at"), **request_fields(rec),
+                                 **({"why": why} if why else {}),
                                  **({"on": rec.get("title")} if rec.get("on") else {}),
                                  **self.author(c.get("creator"), rec.get("bucket"))})
                     rec.setdefault("comments", []).append(cid)
                     if not rec.get("request") and self.role(c.get("creator"), bucket=rec.get("bucket")) in AUTHORITY:
                         rec.setdefault("deciding", []).append(cid)  # acknowledged as decided once it is carried out
                     self.log(f"new owner comment on todo {key}: {cid}")
+                if step:  # on someone else's card, only the boosts on what concerns the step: its comments and the agent's
+                    comments = [c for c in comments if c.get("id") in rec.get("comments", [])
+                                or me is not None and (c.get("creator") or {}).get("id") == me]
                 self.read_todo_boosts(key, rec, comments)
                 self.read_steps(key, rec)
                 self.acknowledge(f"todo {key}", rec, rec.get("bucket"))
                 if not self.dry:
                     rec["cursor"] = cursor
+                    if step:
+                        rec["answer_due"] = due
                     self.save_json("todos.json", state)
 
     def read_steps(self, key, rec):
@@ -1388,34 +1432,58 @@ class Tools:
 
     # --- to-do requests: to-dos the people listened to assign to the acting user ---
 
-    def todo(self, tid, bucket=None, card=False):
+    def todo(self, tid, bucket=None, what="todo"):
         """To-do `tid` in `bucket` (default the project), refetched: content (its name), description, assignees, creator,
         completed, completion, status, due_on, repetition_schedule, its parent (list) and the bucket (project) it is in.
-        `card`: card `tid` instead, in the same shape (its title as content, its content as description)."""
-        if card:
+        `what` "card": card `tid` instead, in the same shape (its title as content, its content as description); "step":
+        card step `tid` (a Kanban::Step: its title as content, no description, the card it is on as parent)."""
+        if what == "card":
             c = self.bc("api", "get", f"/buckets/{bucket or self.project}/card_tables/cards/{tid}.json", project=bucket) or {}
             return dict(c, content=c.get("title"), description=c.get("content"))
+        if what == "step":
+            c = self.bc("api", "get", f"/buckets/{bucket or self.project}/card_tables/steps/{tid}.json", project=bucket) or {}
+            return dict(c, content=c.get("title"), description=None)
         return self.bc("api", "get", f"/buckets/{bucket or self.project}/todos/{tid}.json", project=bucket) or {}
 
-    def assigned_todo_buckets(self, card=False):
-        """{to-do id: its bucket id} for the open to-dos (or, with `card`, cards) assigned to the acting user, from one
-        read of /my/assignments.json: in this project, or in every project of the account when the scope is "account"."""
+    def assigned_todo_buckets(self, what="todo"):
+        """{to-do id: its bucket id} for the open to-dos (or, with `what` "card", cards) assigned to the acting user, from
+        one read of /my/assignments.json: in this project, or in every project of the account when the scope is "account".
+
+        `what` "step": the open card steps assigned to the acting user. Basecamp lists a step only nested in its card's
+        entry, as one of its "children" of type "step"; the card is listed (as "card") whoever it is assigned to.
+        """
         data = self.bc("api", "get", "/my/assignments.json") or {}
         items = data if isinstance(data, list) else (data.get("priorities") or []) + (data.get("non_priorities") or [])
-        kind, scope = ("card", self.card_scope) if card else ("todo", self.assigned_scope)
+        scope = {"card": self.card_scope, "step": self.step_scope}.get(what, self.assigned_scope)
+        if what == "step":
+            items = [s for a in items if (a.get("type") or "").lower() == "card" and not a.get("completed")
+                     for s in a.get("children") or []]
         found = {}
         for a in items:
             bucket = str((a.get("bucket") or {}).get("id") or self.project)
-            if (a.get("id") and not a.get("completed") and (a.get("type") or "todo").lower() == kind
+            if (a.get("id") and not a.get("completed") and (a.get("type") or "todo").lower() == what
                     and (scope == "account" or bucket == self.project)):
                 found.setdefault(a["id"], bucket)
         return found
 
-    def request_keys(self, cards=None):
-        """The keys of the open to-do requests in todos.json; `cards` True only the card requests, False only the to-dos'."""
+    def request_keys(self, what=None):
+        """The keys of the open to-do requests in todos.json; `what` "todo", "card" or "step" only those requests (a to-do
+        request has no "type")."""
         return sorted(k for k, r in self.load("todos.json", {}).items()
                       if r.get("request") and not r.get("completed") and not r.get("closed")
-                      and (cards is None or (r.get("type") == "card") == cards))
+                      and (what is None or (r.get("type") or "todo") == what))
+
+    def step_card(self, rec):
+        """The card whose comments tracked `rec` reads: the card a step request is on; else rec's own to-do or card."""
+        return rec.get("card") if rec.get("type") == "step" else rec["todo"]
+
+    def card_read_elsewhere(self, rec):
+        """True when the comments on the card step request `rec` is on are another reader's: the card mirror's (a card
+        made from the backlog) or an open tracked record's on that card itself (a card request, a decision card)."""
+        bucket = str(rec.get("bucket") or self.project)
+        return self.mirrored_card(rec.get("card"), bucket) or any(
+            r.get("todo") == rec.get("card") and str(r.get("bucket") or self.project) == bucket
+            and not r.get("completed") and not r.get("closed") for r in self.load("todos.json", {}).values())
 
     def mirrored_card(self, cid, bucket=None):
         """True when card `cid` is one the card mirror made from the backlog (map.json), never a request."""
@@ -1462,7 +1530,7 @@ class Tools:
         _, _, key, rec = max(found, key=lambda f: f[:2])
         return key, rec
 
-    def read_todo_request(self, tid, by=None, bucket=None, card=False):
+    def read_todo_request(self, tid, by=None, bucket=None, what="todo"):
         """Record to-do `tid` as a `todo-request` once, when it is open, assigned to the acting user, and `by` is listened to.
 
         `by` is who assigned it (an event's creator id); None means its creator, as the
@@ -1480,23 +1548,34 @@ class Tools:
         assigned by someone listened to (the sweep remembers those in
         assigned-todos.json, so it fetches each once). A dry run records nothing.
 
-        `card`: `tid` is a card (assigned_cards), recorded as a `card-request` and kept with
-        "type": "card"; a card the card mirror made from the backlog is never a request.
+        `what` "card": `tid` is a card (assigned_cards), recorded as a `card-request` and kept
+        with "type": "card"; a card the card mirror made from the backlog is never a request.
+        "step": `tid` is a card step (assigned_steps), recorded as a `step-request` with the
+        card it is on (`card`: id, title, url) and kept with "type": "step" and that card;
+        the comments already on the card are its own, not the step's, so they are not
+        relayed (the cursor starts at the card's newest comment).
         """
         me = self.agent()
         key = f"request-{tid}"
         rec = self.load("todos.json", {}).get(key)
         if me is None or (rec is not None and not rec.get("completed") and not rec.get("closed")):
             return False
-        if card and self.mirrored_card(tid, bucket):
+        if what == "card" and self.mirrored_card(tid, bucket):
             return False
+        errors = self.errors
         try:
-            todo = self.todo(tid, bucket, card)
+            todo = self.todo(tid, bucket, what)
         except RuntimeError as e:
             self.log(f"todo request {tid}: {e}")
+            if what == "step" and getattr(e, "code", None) == "not_found":
+                self.errors = errors  # about that step only (deleted, or out of reach): nothing to retry
             return False
         if (todo.get("completed") or todo.get("status") not in (None, "active")
                 or me not in [a.get("id") for a in todo.get("assignees") or []]):
+            return False
+        card = (todo.get("parent") or {}) if what == "step" else {}
+        if what == "step" and (card.get("type") not in (None, "Kanban::Card") or not card.get("id")):
+            self.log(f"todo request {tid}: a step on a {card.get('type') or 'missing parent'}, not on a card; not a request")
             return False
         prev_key, prev = self.previous_occurrence(tid, todo, bucket)
         creator = todo.get("creator") or {}
@@ -1517,9 +1596,17 @@ class Tools:
         if self.dry:
             self.log(f"dry todo request {tid}: record and acknowledge with {EYES}")
             return False
+        cursor = 0
+        if what == "step":
+            try:  # the card's comments so far are its own: the step's start after them
+                cursor = max([c.get("id", 0) for c in self.bc("comments", "list", str(card["id"]), project=bucket) or []],
+                             default=0)
+            except RuntimeError as e:
+                self.log(f"todo request {tid}: the comments on card {card['id']}: {e}")
+                return False
         with self.locked("todos.json"):
             state = self.load("todos.json", {})
-            rec = state.get(key) or {"todo": tid, "cursor": 0, "created": todo.get("created_at")}
+            rec = state.get(key) or {"todo": tid, "cursor": cursor, "created": todo.get("created_at")}
             for k in ("completed", "closed", "next"):
                 rec.pop(k, None)
             n = rec.get("requests", 0) + 1
@@ -1527,45 +1614,50 @@ class Tools:
                        request=self.author(who, bucket), bucket=int(bucket or self.project),
                        project_name=(todo.get("bucket") or {}).get("name") or rec.get("project_name"),
                        parent=(todo.get("parent") or {}).get("id"), **todo_schedule(todo))
-            if card:
-                rec["type"] = "card"
+            if what != "todo":
+                rec["type"] = what
+            if what == "step":
+                rec.update(card=card["id"], card_title=card.get("title"), card_url=card.get("app_url"))
+                rec["cursor"] = rec["start"] = max(rec.get("cursor") or 0, cursor)
+                rec["answer_due"] = False
             if prev_key is not None and prev_key != key:
                 state[prev_key]["next"] = tid
             if [tid, self.read_ack()] not in [a[:2] for a in rec.get("acked", [])] + rec.get("ack", []):
                 rec.setdefault("ack", []).append([tid, self.read_ack()])
-            self.record({"kind": "card-request" if card else "todo-request", "key": key, "todo": tid, "n": n, "reopened": n > 1 and prev is None,
+            self.record({"kind": f"{what}-request", "key": key, "todo": tid, "n": n, "reopened": n > 1 and prev is None,
                          "follows": prev["todo"] if prev else None, **todo_schedule(todo), **self.timing(todo),
                          "title": todo.get("content"), "text": plain(todo.get("description")),
                          "assignees": [a.get("name") for a in todo.get("assignees") or []],
                          "url": todo.get("app_url"), "at": todo.get("updated_at") or todo.get("created_at"),
-                         "project": request_project(rec), **self.author(who, bucket)})
+                         "project": request_project(rec), **step_fields(rec), **self.author(who, bucket)})
             self.log(f"todo request {key}: todo {tid} in project {rec['bucket']} assigned by {who.get('id')}")
             self.acknowledge(f"todo {key}", rec, rec["bucket"])
             state[key] = rec
             self.save_json("todos.json", state)
         return True
 
-    def discover_todo_requests(self, limit=10, cards=False):
+    def discover_todo_requests(self, limit=10, what="todo"):
         """The sweep: run read_todo_request for each open to-do assigned to the acting user that is not yet an open request.
 
         Only this project's to-dos, unless the scope is "account": then every project's.
         At most `limit` to-dos are fetched a run; one already found not to be assigned by
         someone listened to is never fetched again. Refused (logged) unless the acting
         user is someone other than the owner: /my/assignments.json is the acting user's.
-        `cards`: the cards assigned to the acting user instead (assigned_cards).
+        `what` "card" or "step": the cards (assigned_cards) or card steps (assigned_steps)
+        assigned to the acting user instead.
         """
         if self.agent() is None:
             self.log("todo requests: the acting user is the owner, unset or unknown; assigned to-dos not read")
             return
         try:
-            found = self.assigned_todo_buckets(cards)
+            found = self.assigned_todo_buckets(what)
         except RuntimeError as e:
             self.log(f"todo requests: {e}")
             return
         tracked = {self.load("todos.json", {})[k]["todo"] for k in self.request_keys()}
         ignored = set(self.load("assigned-todos.json", {}).get("ignored", []))
         for tid in [i for i in found if i not in tracked and i not in ignored][:limit]:
-            self.read_todo_request(tid, bucket=found[tid], card=cards)
+            self.read_todo_request(tid, bucket=found[tid], what=what)
 
     def refresh_todo_request(self, key, by=None):
         """Record what changed on open to-do request `key` since it was last read: an edit, or its closing.
@@ -1577,16 +1669,20 @@ class Tools:
         Its name or description changed, or (for one tracked with its schedule) its due date
         or repetition rule: a `todo-request-update` record with the new text and schedule.
         `by` is who did it, when an event says; otherwise Basecamp does not say who edited it. A dry run records nothing. Returns the record kind, or None.
-        A card request's records are `card-request-closed` and `card-request-update`.
+        A card request's records are `card-request-closed` and `card-request-update`, a card step request's
+        `step-request-closed` and `step-request-update`.
         """
         me = self.agent()
         rec = self.load("todos.json", {}).get(key)
         if me is None or rec is None or not rec.get("request") or rec.get("completed") or rec.get("closed"):
             return None
+        errors = self.errors
         try:
-            todo = self.todo(rec["todo"], rec.get("bucket"), rec.get("type") == "card")
+            todo = self.todo(rec["todo"], rec.get("bucket"), rec.get("type") or "todo")
         except RuntimeError as e:
             self.log(f"todo request {key}: {e}")
+            if rec.get("type") == "step" and getattr(e, "code", None) == "not_found":
+                self.errors = errors  # about that step only: its notification is not retried every run
             return None
         who = {"id": by, "name": None} if by is not None else None
         if todo.get("completed"):
@@ -1608,7 +1704,7 @@ class Tools:
                     state[key].update(todo_schedule(todo), parent=(todo.get("parent") or {}).get("id"))
                     self.save_json("todos.json", state)
             return None
-        kind = ("card" if rec.get("type") == "card" else "todo") + ("-request-closed" if reason else "-request-update")
+        kind = (rec.get("type") or "todo") + ("-request-closed" if reason else "-request-update")
         if self.dry:
             self.log(f"dry todo request {key}: {kind}" + (f" ({reason})" if reason else ""))
             return None
@@ -1619,7 +1715,8 @@ class Tools:
             out = {"kind": kind, "key": key, "todo": rec["todo"], "n": rec.get("requests", 1),
                    "title": todo.get("content") or rec.get("title"), "url": todo.get("app_url") or rec.get("url"),
                    "at": (todo.get("completion") or {}).get("created_at") or todo.get("updated_at"),
-                   "project": request_project(rec), **todo_schedule(todo), **({} if reason else self.timing(todo)), **authored}
+                   "project": request_project(rec), **step_fields(rec), **todo_schedule(todo),
+                   **({} if reason else self.timing(todo)), **authored}
             if reason:
                 out["reason"] = reason
                 rec["closed"] = reason
@@ -1957,7 +2054,8 @@ class Tools:
         of the comments recorded, acknowledged or answered). A decision to-do or to-do request (open, done or closed),
         a mirrored card and the agent's own message each keep their own cursor and lists."""
         recs = [r for r in self.load("todos.json", {}).values()
-                if r.get("todo") == thread and str(r.get("bucket") or self.project) == str(bucket)]
+                if (r.get("todo") == thread or r.get("type") == "step" and r.get("card") == thread)
+                and str(r.get("bucket") or self.project) == str(bucket)]
         if str(bucket) == str(self.project):
             recs += [r for r in self.load("map.json", {}).values() if r.get("card") == thread]
             recs += [p for p in [self.load("messages.json", {}).get("posts", {}).get(str(thread))] if p]
@@ -2125,7 +2223,7 @@ class Tools:
             self.log(f"dry reply {rid}: {self.reply_plan(rid, f'comment on todo {key}', boost)}, then remove {EYES}")
             return False
         answer = self.reply_send(rid, f"on todo {key}", boost, rec.get("bucket"), lambda: self.bc(
-            "comments", "create", str(rec["todo"]), "-", input=text, project=rec.get("bucket")))
+            "comments", "create", str(self.step_card(rec)), "-", input=text, project=rec.get("bucket")))
         with self.locked("todos.json"):
             state = self.load("todos.json", {})
             state[key].setdefault("replied", []).append(rid)
@@ -2360,9 +2458,9 @@ class Tools:
         return True
 
     def need_todos(self, requests=True):
-        """Refuse a to-do command the config does not allow: "todos" for any, or "assigned_todos" (or "assigned_cards")
-        for a tracked request."""
-        if self.todos is None and not (requests and (self.assigned_todos or self.assigned_cards)):
+        """Refuse a to-do command the config does not allow: "todos" for any, or "assigned_todos" (or "assigned_cards"
+        or "assigned_steps") for a tracked request."""
+        if self.todos is None and not (requests and (self.assigned_todos or self.assigned_cards or self.assigned_steps)):
             raise RuntimeError('config has no "todos"' + (' or "assigned_todos"' if requests else ""))
 
     def todo_create(self, key, title, description="", todolist=None, due=None, subtasks=(), project=None, card=None):
@@ -2572,7 +2670,7 @@ class Tools:
         return hit
 
     def todo_comment(self, ref, text):
-        """Post `text` (Markdown) as a comment on a tracked to-do."""
+        """Post `text` (Markdown) as a comment on a tracked to-do (a card step request: on the card the step is on)."""
         self.need_todos()
         key, rec = self.tracked(ref)
         if not text.strip():
@@ -2582,14 +2680,16 @@ class Tools:
         if self.dry:
             self.log(f"dry todo comment {key}: comment on todo {rec['todo']}")
             return False
-        c = self.bc("comments", "create", str(rec["todo"]), "-", input=text, project=rec.get("bucket")) or {}
-        self.log(f"todo comment {key}: comment {c.get('id')} on todo {rec['todo']}")
+        c = self.bc("comments", "create", str(self.step_card(rec)), "-", input=text, project=rec.get("bucket")) or {}
+        self.log(f"todo comment {key}: comment {c.get('id')} on " + (
+            f"card {rec['card']} (step {rec['todo']})" if rec.get("type") == "step" else f"todo {rec['todo']}"))
         self.ledger("answered", key=key, via="todo comment")
         return True
 
     def todo_complete(self, ref):
         """Mark a tracked to-do complete; its comments are no longer read. A card request is completed
-        by moving the card to its table's Done column (a card already done is recorded completed)."""
+        by moving the card to its table's Done column (a card already done is recorded completed), and a card step
+        request by checking the step off (Basecamp's step completion; the card itself is left as it is)."""
         self.need_todos()
         key, rec = self.tracked(ref)
         if rec.get("completed"):
@@ -2614,6 +2714,11 @@ class Tools:
                 self.log(f"todo complete {key}: card {rec['todo']} is already done in Basecamp")
             else:
                 self.bc("cards", "done", str(rec["todo"]), project=bucket)
+        elif rec.get("type") == "step":
+            if self.todo(rec["todo"], rec.get("bucket"), "step").get("completed"):
+                self.log(f"todo complete {key}: step {rec['todo']} is already checked in Basecamp")
+            else:
+                self.bc("subtasks", "complete", str(rec["todo"]), project=rec.get("bucket"))
         else:
             self.bc("todos", "complete", str(rec["todo"]), project=rec.get("bucket"))
         with self.locked("todos.json"):
@@ -2663,12 +2768,12 @@ class Tools:
         due date and repetition rule. Basecamp alone owns a to-do's schedule, so a date read earlier may have moved."""
         self.need_todos()
         key, rec = self.tracked(ref)
-        todo = self.todo(rec["todo"], rec.get("bucket"), rec.get("type") == "card")
+        todo = self.todo(rec["todo"], rec.get("bucket"), rec.get("type") or "todo")
         me = self.agent()
         out(json.dumps({"key": key, "todo": rec["todo"], "title": todo.get("content"), "text": plain(todo.get("description")),
                         "open": not todo.get("completed") and todo.get("status") in (None, "active"),
                         "assigned_to_you": me is not None and me in [p.get("id") for p in todo.get("assignees") or []],
-                        **todo_schedule(todo), **self.timing(todo), "url": todo.get("app_url"),
+                        **todo_schedule(todo), **self.timing(todo), "url": todo.get("app_url"), **step_fields(rec),
                         **({"subtasks": rec["subtasks"]} if rec.get("subtasks") else {})}, indent=1))
         return True
 
@@ -2886,7 +2991,14 @@ class Tools:
 def request_fields(rec):
     """The fields that mark a record as part of a to-do request: its title and project, for a to-do request's record; none otherwise."""
     return {"request": True, "title": rec.get("title"), "project": request_project(rec),
-            **({"type": "card"} if rec.get("type") == "card" else {})} if rec.get("request") else {}
+            **({"type": rec["type"]} if rec.get("type") in ("card", "step") else {}), **step_fields(rec)} \
+        if rec.get("request") else {}
+
+
+def step_fields(rec):
+    """A card step request's card, for its records: {"card": {"id", "title", "url"}}; {} for anything else."""
+    return {"card": {"id": rec.get("card"), "title": rec.get("card_title"), "url": rec.get("card_url")}} \
+        if rec.get("type") == "step" else {}
 
 
 def request_project(rec):
@@ -2980,13 +3092,13 @@ def outcome_applies(ev, item):
 
 def item_recording(rec):
     """The id of the recording a pending record is about, as `reply --recording` and `dismiss --recording` take it: the
-    comment or line (it holds the read boost), the boost, or the to-do or card of a request; None for the rest."""
+    comment or line (it holds the read boost), the boost, or the to-do, card or card step of a request; None for the rest."""
     kind = rec.get("kind") or "comment"
     if kind in ("chat-question", "ping"):
         return rec.get("line")
     if kind in ("boost", "approval"):
         return rec.get("boost")
-    if kind.startswith(("todo-request", "card-request")):
+    if kind.startswith(("todo-request", "card-request", "step-request")):
         return rec.get("todo")
     return rec.get("comment")
 
@@ -2994,7 +3106,7 @@ def item_recording(rec):
 def relay_fields(rec):
     """A pending record's fields in its `relayed` ledger line: enough to tell the item and rebuild what the agent saw."""
     kind = rec.get("kind") or "comment"
-    base = "todo-request" if kind.startswith("card-request") else kind
+    base = "todo-request" if kind.startswith(("card-request", "step-request")) else kind
     project = rec.get("project") or {}
     return {"kind": kind, "why": rec.get("why") or WHY.get(base, base), "recording": item_recording(rec),
             "key": rec.get("key"), "surface": rec.get("surface"),
@@ -3060,12 +3172,14 @@ THREADS = {"todos": "Todo", "messages": "Message", "cards": "Kanban::Card", "doc
 
 
 def parse_reading(r):
-    """Where a notification (an item of /my/readings.json) points: {"bucket", "thread", "anchor", "path"}.
+    """Where a notification (an item of /my/readings.json) points: {"bucket", "thread", "anchor", "path", "card"}.
 
     The bucket and the thread (the commented recording, the chat, the to-do) come from its
     subscription_url, the anchor (the first unread comment, the mentioning line, the
     to-do) from readable_identifier (base64 of gid://bc3/Recording/<id>), and the path
-    (todos, messages, cards, chats, ... or the Ping's circles) from app_url. Any part it
+    (todos, messages, cards, chats, ... or the Ping's circles) from app_url. "card" is the
+    card the app_url names (/card_tables/cards/<id>): the thread itself, except for a card
+    step, whose notifications subscribe to the step and link to its card. Any part it
     lacks is None.
     """
     m = re.search(r"/buckets/(\d+)/recordings/(\d+)/", r.get("subscription_url") or "")
@@ -3076,8 +3190,10 @@ def parse_reading(r):
         gid = ""
     a = re.fullmatch(r"gid://bc3/Recording/(\d+)", gid)
     p = re.search(r"basecamp\.com/\d+/(?:buckets/\d+/(?:card_tables/)?)?([a-z_]+)", r.get("app_url") or "")
+    c = re.search(r"/card_tables/cards/(\d+)", r.get("app_url") or "")
     return {"bucket": m.group(1) if m else None, "thread": int(m.group(2)) if m else None,
-            "anchor": int(a.group(1)) if a else None, "path": p.group(1) if p else None}
+            "anchor": int(a.group(1)) if a else None, "path": p.group(1) if p else None,
+            "card": int(c.group(1)) if c else None}
 
 
 def local_time(at, zone):

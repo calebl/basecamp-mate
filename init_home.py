@@ -39,7 +39,8 @@ login should: the main one, which routes each request to the right domain). --me
 relays the owner's @mentions of the --login, and comments on threads it follows, in every
 project of the account, not just this one (the same one home per login). --assigned-cards
 does the same for a card the owner assigns to the --login in the project (never a card the
-sync mirrors from the backlog). --advisories
+sync mirrors from the backlog), and --assigned-steps for a card step (a card's checklist item)
+assigned to the --login there. --advisories
 <owner/name> (repeatable) records each new GitHub security advisory of that repository once. --backup
 <Docs & Files folder URL> keeps a daily snapshot of the config and state files in that folder. --timesheet
 posts the agent's active time on each to-do or card it names with sync.py timesheet start to that
@@ -252,7 +253,7 @@ class Init:
     def __init__(self, url, login, home, captain=None, listen_to=(), operators=(), participants_project=False,
                  participants_domains=(), participants_company=None, repo_map=(), create_missing=False, dry=False,
                  force=False, cards=True, assign_captain=True, todos=False, reports=False, every_line=False, checkins=None, releases=True, inbox=False,
-                 session_alert=None, pings=False, assigned_todos=False, assigned_anywhere=False, assigned_cards=False, mentions_anywhere=False, advisories=(), backup=None, timesheet=False, chats=True,
+                 session_alert=None, pings=False, assigned_todos=False, assigned_anywhere=False, assigned_cards=False, assigned_steps=False, mentions_anywhere=False, advisories=(), backup=None, timesheet=False, chats=True,
                  no_keyring=None, blocked=None, replace_people=False, runner=subprocess.run, system=None, sync_dir=HERE, out=print):
         self.account, self.project = parse_url(url)
         self.login, self.home = login, os.path.abspath(home)
@@ -281,6 +282,7 @@ class Init:
             raise Refuse("--session-alert needs --inbox (it watches the inbox's notes) and a number of minutes, 0 or more")
         self.assigned_todos, self.assigned_anywhere = assigned_todos or assigned_anywhere, assigned_anywhere
         self.assigned_cards, self.mentions_anywhere = assigned_cards, mentions_anywhere
+        self.assigned_steps = assigned_steps
         self.chats = chats
         self.advisories = sorted(set(advisories))
         bad = [r for r in self.advisories if not re.fullmatch(r"[^/\s]+/[^/\s]+", r)]
@@ -459,6 +461,8 @@ class Init:
             cfg["assigned_todos"] = {"scope": "account"} if self.assigned_anywhere else {}
         if self.assigned_cards:
             cfg["assigned_cards"] = {}
+        if self.assigned_steps:
+            cfg["assigned_steps"] = {}
         if self.mentions_anywhere:
             cfg["mentions"] = {"scope": "account"}
         if self.advisories:
@@ -476,7 +480,7 @@ class Init:
         # With requests on, a new home asks the owner about a dated request's timing and does a repeating one on its due
         # date; an existing home keeps its own (none: its defaults file's wording stands).
         schedule = self.existing().get("schedule") if self.existing() is not None else (
-            {"dated": "ask", "recurring": "due"} if self.assigned_todos or self.assigned_cards else None)
+            {"dated": "ask", "recurring": "due"} if self.assigned_todos or self.assigned_cards or self.assigned_steps else None)
         if schedule:
             cfg["schedule"] = schedule
         # A new home puts 👀 on everything it reads and 👍 on a deciding comment once it is carried out; an existing home
@@ -802,6 +806,9 @@ def cli(argv, **kw):
     ap.add_argument("--assigned-cards", action="store_true",
                     help="treat a card the owner assigns to the --login in the project as a request, like --assigned-todos; "
                          "cards the sync mirrors from the backlog never are")
+    ap.add_argument("--assigned-steps", action="store_true",
+                    help="treat a card step (a card's checklist item) the owner assigns to the --login in the project as "
+                         "a request, like --assigned-todos; comments on its card arrive only when they concern the --login")
     ap.add_argument("--advisories", action="append", default=[], metavar="OWNER/NAME",
                     help="record each new security advisory (triage or draft) of this GitHub repository once, for the "
                          "agent to route (repeatable); the gh login needs admin or security-manager access")
@@ -837,7 +844,7 @@ def cli(argv, **kw):
              create_missing=a.create_missing_columns, dry=a.dry_run, force=a.force,
              cards=not a.no_cards, assign_captain=not a.no_assign_captain, todos=a.todos, reports=a.reports, every_line=a.every_line,
              checkins=a.checkins, releases=not a.no_releases, inbox=a.inbox, session_alert=a.session_alert, pings=a.pings,
-             assigned_todos=a.assigned_todos, assigned_anywhere=a.assigned_todos_anywhere, assigned_cards=a.assigned_cards, mentions_anywhere=a.mentions_anywhere, advisories=a.advisories, backup=a.backup, timesheet=a.timesheet, chats=not a.no_chats, no_keyring=a.no_keyring,
+             assigned_todos=a.assigned_todos, assigned_anywhere=a.assigned_todos_anywhere, assigned_cards=a.assigned_cards, assigned_steps=a.assigned_steps, mentions_anywhere=a.mentions_anywhere, advisories=a.advisories, backup=a.backup, timesheet=a.timesheet, chats=not a.no_chats, no_keyring=a.no_keyring,
              blocked=False if a.no_blocked_reply else a.blocked_reply, replace_people=a.replace_people, **kw).main()
     except Refuse as e:
         print(e, file=sys.stderr)

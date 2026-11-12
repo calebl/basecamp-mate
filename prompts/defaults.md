@@ -95,6 +95,17 @@ commands with its key (`request-<card id>`): `reply`, `todo comment`, `todo show
 `todo complete` when the work is done, which completes the card and moves it to its
 table's Done column. Cards the sync mirrors from your backlog are never requests.
 
+**Card step requests.** With `assigned_steps` on, a card step (one of a card's checklist
+items) someone you listen to assigns to you is a request handled like a to-do request: it
+arrives as a `step-request` naming the `card` it is on, its edits and closing as
+`step-request-update` and `step-request-closed`. Only the step is yours; the card is
+someone else's, so of its comments only those for you arrive, as `todo-comment` with
+`request: true` and `type: "step"`: one that @mentions or Replies to you (`why`
+`addressed`), and the first one after your own comment there (`why` `awaiting`). Use the
+same commands with its key (`request-<step id>`): `todo comment` comments on the card,
+`reply` answers a comment there, and `todo complete` checks the step off when the work is
+done, leaving the card as it is.
+
 **Scheduled to-dos.** A request with a `due_on` is scheduled. When it carries `when` (from
 the config's `schedule`, or the answer remembered for its `list`):
 

@@ -68,6 +68,9 @@ or by hand from
 - `assigned_cards` (optional): `{}` or `{"limit": <n>, "scope": "project" | "account"}`: the
   same for cards assigned to the acting login, never one the card mirror made. See [To-do
   requests](todo-requests.md) (Cards).
+- `assigned_steps` (optional): `{}` or `{"limit": <n>, "scope": "project" | "account"}`: the
+  same for card steps assigned to the acting login. See [To-do requests](todo-requests.md)
+  (Card steps).
 - `chats` (optional): chat (Campfire) ids whose owner questions are relayed.
   An entry may be `{"chat": <id>, "every_line": true}` to relay every owner line in that chat.
 - `ask_chat` (optional): the chat id `sync.py ask` posts in.

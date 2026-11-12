@@ -420,6 +420,11 @@ class Doctor:
                          f"card would reach all of them: {hs}",
                          'Fix: keep "assigned_cards": {"scope": "account"} only in the main home\'s settings, and set the '
                          'others to "assigned_cards": {} (their own project only).')
+            elif kind == "step-requests":
+                self.bad(f"{len(group)} homes take card steps assigned anywhere in account {where} with {login}, so each "
+                         f"such step would reach all of them: {hs}",
+                         'Fix: keep "assigned_steps": {"scope": "account"} only in the main home\'s settings, and set the '
+                         'others to "assigned_steps": {} (their own project only).')
             elif kind == "mentions":
                 self.bad(f"{len(group)} homes take @mentions and followed threads anywhere in account {where} with "
                          f"{login}, so each such mention or comment would reach all of them: {hs}",

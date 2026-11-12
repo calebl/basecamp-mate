@@ -68,6 +68,11 @@ stay in UTC.
 - `card-request`, `card-request-update`, `card-request-closed`: the same fields, for a card
   assigned to the agent's login (`assigned_cards`); `todo` is the card id, `title` the card's
   title and `text` its content. Handled like the to-do request records.
+- `step-request`, `step-request-update`, `step-request-closed`: the same fields, for a card
+  step assigned to the agent's login (`assigned_steps`); `todo` is the step id, `title` its
+  text, `text` empty (a step has no description), and `card` the card it is on (`id`,
+  `title`, `url`). Handled like the to-do request records; `todo comment` comments on the
+  card and `todo complete` checks the step off.
 - `message-comment`: `message` (id), `subject`, `comment` (id), `question`, `url` (the
   comment), `text`, `at`. The owner commented on a post the agent made, usually feedback
   or an instruction on a report; act on it and answer with `sync.py reply --recording <comment>`.

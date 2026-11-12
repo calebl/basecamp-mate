@@ -34,6 +34,7 @@ own:
 | with `"mentions": {"scope": "account"}`, a comment or @mention on a thread in another project of the account, or an @mention of the agent in a chat there | the thread reader, or the chat mention reader, as in the project (see "Mentions anywhere in the account" below) |
 | `Assignment` or `Completion` of a to-do (with `assigned_todos` on; in any project with `"scope": "account"`) | the to-do request reader, or the request's edit and closing check; the notification says who assigned or completed it |
 | any other event on a card (an `Event`: assigned, moved, edited, completed), with `assigned_cards` on, unless the card mirror made it | the card request reader, or the request's edit and closing check; an event that leaves no request stays unmonitored |
+| an `Assignment`, `Event` (a step added already assigned) or `Completion` of a card step, which subscribes to the step and links to its card (`/card_tables/cards/<card>#__recording_<step>`), with `assigned_steps` on (in any project with `"scope": "account"`) | the card step request reader, or the request's edit and closing check; a decision step `sync.py decide` put there runs its record's reader instead; with `assigned_steps` off, an owner's assignment or completion of a step is unmonitored, never read as a to-do or card |
 | a check-in `Reminder` (with `checkins` on) | the check-in reader: a faster signal than the 5-minute schedule check |
 
 The agent's login hears what it is subscribed to: what it created, commented on or was
@@ -184,6 +185,7 @@ enabled behavior handles is recorded so the agent can ask the owner what to do a
 | --- | --- |
 | a line in a project chat not in `chats` | `chat.line.created/Chat::Lines` |
 | a to-do assigned to the agent, or completed, with `assigned_todos` off | `todo.assignment_changed/Todo`, `todo.completed/Todo` |
+| a card step assigned to the agent, or completed, with `assigned_steps` off | `step.assignment_changed/Kanban::Step`, `step.completed/Kanban::Step` |
 | an owner boost on one of the agent's recordings nothing monitors | `boost.created/<type>`, e.g. `boost.created/Comment on Document` |
 | a kind of notification Basecamp adds later | `<kind>/<recording type>` |
 

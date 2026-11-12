@@ -364,6 +364,11 @@ class InitTest(unittest.TestCase):
         self.assertEqual(cfg, EXPECTED | {"assigned_todos": {}, "schedule": {"dated": "ask", "recurring": "due"}})
         self.assertNotIn("assigned_todos", self.init().discover()[0])
 
+    def test_assigned_steps_flag_turns_the_behavior_on(self):
+        cfg, _ = self.init(assigned_steps=True).discover()
+        self.assertEqual(cfg, EXPECTED | {"assigned_steps": {}, "schedule": {"dated": "ask", "recurring": "due"}})
+        self.assertNotIn("assigned_steps", self.init().discover()[0])
+
     def test_assigned_todos_anywhere_takes_them_account_wide(self):
         cfg, _ = self.init(assigned_anywhere=True).discover()
         self.assertEqual(cfg["assigned_todos"], {"scope": "account"})

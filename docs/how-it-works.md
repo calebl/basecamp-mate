@@ -28,7 +28,7 @@ policy. Each does one thing to the configured account and project:
 | mark read | primitive | marks the agent login's notifications read (`basecamp notifications read`, i.e. `PUT /my/unreads.json`) |
 | Ping reader | reader | finds the Pings (direct messages) the agent's login is in with the owner through `/my/readings.json` and records each new line the owner writes there as `ping` |
 | thread reader | reader | records the owner's new comments on any other thread the agent's login follows or is @mentioned in (a card whatever its backlog state, a document, an upload, someone else's to-do or message) as `mention` when they @mention or Reply to the agent, and as `thread-comment` only when the thread awaits the agent's answer or the agent made it (see "Followed threads" in [notifications.md](notifications.md); it skips the rest), and a mention in a chat nothing relays as `chat-question`; in the project, or, with `"mentions": {"scope": "account"}`, any project of the account |
-| to-do request readers | reader | find the open to-dos in the project (or, with `"scope": "account"`, any project of the account) assigned to the agent's login (`/my/assignments.json`, or a to-do event) and record each one a listened-to person assigned as `todo-request`, once; then its edits and closing as `todo-request-update` and `todo-request-closed` |
+| to-do request readers | reader | find the open to-dos in the project (or, with `"scope": "account"`, any project of the account) assigned to the agent's login (`/my/assignments.json`, or a to-do event) and record each one a listened-to person assigned as `todo-request`, once; then its edits and closing as `todo-request-update` and `todo-request-closed`; the same for cards (`card-request`) and card steps (`step-request`, read from the `children` of their card's entry there) |
 | message comment reader | reader | records the owner's new comments on the agent's own recent Message Board posts as `message-comment` |
 | boost readers | reader | record the owner's new boosts, with their text, on every monitored surface as `boost` ("Boosts are answers" in [safety-bounds.md](safety-bounds.md)); a boost on the agent login's own recording only once its received-boosts feed lists it |
 | unmonitored recorder | reader | records owner input that no behavior handles as `unmonitored`, once per kind of thing (see [Unmonitored input](notifications.md#unmonitored-input)) |
@@ -67,8 +67,8 @@ agent's side of each is in [`prompts/base.md`](../prompts/base.md).
 
 The timer runs `run.sh` every 30 seconds, and each behavior's step runs when it is due
 (`timer.json` keeps when each last ran): `notifications` and `inbox-delivery` every run;
-`card-mirror`, `release-announcements`, `checkin-answering` and `assigned-todos` every 5
-minutes; `security-advisories` and `timesheet` hourly; `backup` daily; and `chat-inbox`, `chat-watch`, `decision-todos`, `reports` and
+`card-mirror`, `release-announcements`, `checkin-answering`, `assigned-todos`, `assigned-cards` and
+`assigned-steps` every 5 minutes; `security-advisories` and `timesheet` hourly; `backup` daily; and `chat-inbox`, `chat-watch`, `decision-todos`, `reports` and
 `pings` hourly, as the repair sweep behind `notifications`, which reads their surfaces as soon as something changes.
 Without `notifications` (no `profile`, or `"notifications": false`) those five run every
 5 minutes instead. `sync.py --all` runs every step at once.
@@ -86,6 +86,7 @@ Without `notifications` (no `profile`, or `"notifications": false`) those five r
 | `decision-todos` | `todos` | `--todos` | to-do comment reader (hourly sweep) | `todo create`, `reply`/`todo comment`, `todo complete` |
 | `assigned-todos` | `assigned_todos` | `--assigned-todos` (`--assigned-todos-anywhere`: account-wide) | to-do request readers, then the to-do comment reader for the requests (5 min) | take each request on; `todo comment`/`reply`; `todo complete` when done |
 | `assigned-cards` | `assigned_cards` | `--assigned-cards` | the to-do request readers for cards assigned to the agent, then the to-do comment reader for those requests (5 min) | as `assigned-todos`; `todo complete` moves the card to Done |
+| `assigned-steps` | `assigned_steps` | `--assigned-steps` | the to-do request readers for card steps assigned to the agent, then the comments on their cards that concern the agent (5 min) | as `assigned-todos`; `todo comment` comments on the card; `todo complete` checks the step off |
 | `reports` | `message_board` | `--reports` | comment and boost readers on the agent's messages (hourly sweep) | `post-message`; `reply` to feedback |
 | `pings` | `pings` | `--pings` | Ping reader (hourly sweep) | `reply` to each line, in the Ping |
 | `inbox-delivery` | `inbox` | `--inbox` | deliver each new pending record as a firstmate inbox note | handle the note, then `fm-inbox.sh drain --ack` |

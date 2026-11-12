@@ -107,8 +107,11 @@ agent works with Basecamp is a defaults file in its home that you change by aski
 [How it works](docs/how-it-works.md) has the full list of tools and behaviors.
 
 basecamp-mate connects a firstmate home: a directory on your computer where a firstmate
-agent keeps its backlog, its state and an inbox of notes. The sync puts each note in that
-inbox. The agent learns how to use the sync
+agent keeps its backlog, its state and an inbox of notes. By default the sync appends what it
+reads to `pending-comments.jsonl` in the home, and a wake check wakes the agent when that
+file grows. Inbox notes are opt-in (setup asks, and suggests no; `init --inbox`): with them
+on, the sync also delivers each new record as a note in the firstmate inbox, and the wake
+check then watches only for failed runs. The agent learns how to use the sync
 from [`skills/basecamp-sync/SKILL.md`](skills/basecamp-sync/SKILL.md) and the
 [base prompt](prompts/base.md).
 
@@ -121,7 +124,7 @@ from [`skills/basecamp-sync/SKILL.md`](skills/basecamp-sync/SKILL.md) and the
 - [Notifications](docs/notifications.md): how the agent hears you within half a minute,
   followed threads, boosts, unmonitored input and mentions anywhere in the account.
 - [Pings](docs/pings.md): direct messages to the agent.
-- [To-do requests](docs/todo-requests.md): to-dos and cards assigned to the agent,
+- [To-do requests](docs/todo-requests.md): to-dos, cards and card steps assigned to the agent,
   scheduled and repeating to-dos.
 - [Card mirror](docs/card-mirror.md): the backlog as cards, and how the backlog is read.
 - [Relay ledger and stats](docs/relay-ledger.md): what was relayed, what came of it, and
