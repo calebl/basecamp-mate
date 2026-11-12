@@ -2,7 +2,7 @@
 
 Before creating or modifying any code or tests, read all four files:
 
-- `README.md`: what the sync does, its commands, config and tests.
+- `README.md`: what the sync does, and links to `docs/`, which holds its commands, config and tests.
 - `VISION.md`: what the project is for and what it does not decide.
 - `docs/firstmate-account.md`: how to set up a Basecamp account for the agent.
 - `skills/basecamp-sync/SKILL.md`: the skill an agent follows to use the sync.

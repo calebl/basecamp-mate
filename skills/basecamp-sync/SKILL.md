@@ -25,7 +25,7 @@ repair sweep. `"listen"` and `sync.py listen`, the retired event listener, are i
 re-running `init` removes its service. `python3 $SYNC/sync.py behaviors --home <home>
 --config <config>` lists which are on and how often each runs. Sections below about cards and the side files apply
 only when the card mirror is on. Mechanics (column rules, file formats, record fields,
-safety bounds) are in the repo's README: `basecamp-mate/README.md` (https://github.com/calebl/basecamp-mate). `SYNC` below
+safety bounds) are in the repo's `docs/`, listed in its README: `basecamp-mate/README.md` (https://github.com/calebl/basecamp-mate). `SYNC` below
 means that checkout.
 
 `$SYNC/prompts/base.md` sets a home up and lists the records and the bounds. How the home

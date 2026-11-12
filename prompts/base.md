@@ -2,7 +2,7 @@
 
 Hand this to a fresh firstmate once, with the three values below filled in. It sets the
 home up and re-establishes how the agent is connected to Basecamp. Mechanics (file formats,
-record fields, every refusal rule) are in `SYNC/README.md`; this prompt is setup, the
+record fields, every refusal rule) are in `SYNC/docs/`, listed in `SYNC/README.md`; this prompt is setup, the
 records and the bounds. How the agent works (where decisions go, what it answers and
 when, where reports go) is the home's defaults file, section 3.
 
