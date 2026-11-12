@@ -1278,8 +1278,11 @@ minutes (by the token's own `expires_at`) and guards the login the `basecamp` CL
   it copies the file again, so the copy never holds a refresh token the renewal spent. Every
   home and login shares the copy, so it is merged rather than replaced: an entry the file has
   already lost stays in the copy.
-- It guards only the file store (`BASECAMP_NO_KEYRING` set, or `auth status` reporting
-  `"storage": "file"`). A login kept in the system keyring is only renewed.
+- It guards only the file store: `BASECAMP_NO_KEYRING` is set, `auth status` reports
+  `"storage": "file"`, or the backup holds the login. A login kept in the system keyring is
+  only renewed.
+- Each entry is restored at most once per copy, by its own mark, so an emptied file never
+  brings back another profile's login that was already restored and refused.
 - If the profile is missing after the renewal, it puts the missing entry back from the copy
   (every entry when the whole file was emptied) and logs one `login: restored` line. It
   does this once per copy: if the restored login is refused again, it logs one
@@ -1424,8 +1427,9 @@ and a temporary `credentials.json`: a renewal that empties the file restored fro
 backup, a network-down run leaving the file untouched, only the lost profile put back beside
 another login's newer entry, a restored login lost again not restored twice, the backup
 retaken after a good renewal and keeping another profile's entry the file already lost, the
-restore marks read and written under the CLI's locks, a keyring login renewed without the
-guard or a false FAILED line, no renewal far from expiry, and one FAILED line per cause;
+restore marks read and written under the CLI's locks, an emptied file not bringing back
+another profile already restored once, a lost file-store login restored without
+`BASECAMP_NO_KEYRING`, a keyring login renewed without the guard or a false FAILED line, no renewal far from expiry, and one FAILED line per cause;
 `tests/test_assigned_todos.py` covers to-do requests with a stubbed `/my/assignments.json`:
 the sweep, who assigned it, comments, boosts, edits and closing, reassignment, the agent
 completing it, the `Assignment` and `Completion` notifications, and their notes, scheduled

@@ -168,9 +168,12 @@ class Login:
 
     def file_store(self, st):
         """Whether the CLI keeps this login in credentials.json: BASECAMP_NO_KEYRING is set (the CLI then uses the file
-        without probing the keyring), or `auth status` (`st`) says so. A keyring login is not guarded: the file does
-        not hold it, so a missing entry there is no loss."""
-        return bool(os.environ.get("BASECAMP_NO_KEYRING")) or (st.get("data") or {}).get("storage") == "file"
+        without probing the keyring), `auth status` (`st`) says so, or the backup holds this login (a backup is only
+        taken from the file store, and a lost login's status names no storage). A keyring login is not guarded: the
+        file does not hold it, so a missing entry there is no loss."""
+        if os.environ.get("BASECAMP_NO_KEYRING") or (st.get("data") or {}).get("storage") == "file":
+            return True
+        return bool(self.key) and self.holds(self.read(self.backup))
 
     def due(self, st):
         """Whether the token needs renewing, from `auth status` (`st`): it expires within RENEW_BEFORE, by its own
@@ -259,18 +262,22 @@ class Login:
             backup = self.read(self.backup)
             if not self.holds(backup):
                 return False
-            mark = fingerprint(backup.get(self.key) if self.key else backup)
             done = self.read(self.restored) or {}
-            if done.get(self.key or "") == mark:
-                return False  # restored once already and lost again: renewing it again would only be refused again
+            # Each entry is restored at most once per copy, by its own mark: one restored already and lost again
+            # would only be refused again, whichever home's restore would bring it back.
+            fresh = {k: v for k, v in backup.items() if done.get(k) != fingerprint(v)}
             if now:  # other logins are still there (only a profile's own can be missing from a non-empty file)
-                merged = {**now, self.key: backup[self.key]}
+                fresh = {k: v for k, v in fresh.items() if k == self.key}
+            if (self.key not in fresh) if self.key else not fresh:
+                return False
+            if now:
                 what = f"{self.key} was missing; put it back"
             else:
-                merged = backup
-                what = f"the file was emptied; put back {', '.join(sorted(backup))}"
-            self.write(self.creds, merged)
-            self.write(self.restored, {**done, (self.key or ""): mark})
+                what = f"the file was emptied; put back {', '.join(sorted(fresh))}"
+                skipped = sorted(set(backup) - set(fresh))
+                what += f" (not {', '.join(skipped)}: restored once already)" if skipped else ""
+            self.write(self.creds, {**(now or {}), **fresh})
+            self.write(self.restored, {**done, **{k: fingerprint(v) for k, v in fresh.items()}})
         self.t.log(f"login: restored {self.creds} from the copy kept before the renewal ({what})")
         return True
 

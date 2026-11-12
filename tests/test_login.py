@@ -187,7 +187,7 @@ class GuardTest(unittest.TestCase):
         self.assertEqual(self.stored(), {"profile:caleb": CALEB, "profile:firstmate": FM})
 
     def test_restore_marks_are_read_and_written_under_the_cli_locks_and_kept_per_profile(self):
-        self.store({})
+        self.store({"profile:caleb": CALEB})
         login.Login(self.home, cred_dir=self.cred_dir).write(os.path.join(self.cred_dir, login.BACKUP),
                                                              {"profile:caleb": CALEB, "profile:firstmate": FM})
         held, outside = [], []
@@ -212,7 +212,7 @@ class GuardTest(unittest.TestCase):
             return real_read(me, path)
 
         with mock.patch.object(login.Login, "cli_lock", lock), mock.patch.object(login.Login, "read", read):
-            self.guard(Auth(self.creds, expires_in=3000)).renew()  # the file was emptied: both put back, firstmate's mark
+            self.guard(Auth(self.creds, expires_in=3000)).renew()  # firstmate's login lost: put back, its mark kept
             self.store({"profile:firstmate": FM})
             caleb = login.Login(Home(self.home_dir, profile="caleb"), runner=Auth(self.creds, profile="caleb", expires_in=3000),
                                 reach=lambda: True, now=lambda: NOW, cred_dir=self.cred_dir)
@@ -220,6 +220,25 @@ class GuardTest(unittest.TestCase):
         self.assertEqual(outside, [])
         marks = load(os.path.join(self.cred_dir, login.RESTORED))
         self.assertEqual(set(marks), {"profile:firstmate", "profile:caleb"})
+        self.assertEqual(self.stored(), {"profile:caleb": CALEB, "profile:firstmate": FM})
+
+    def test_an_emptied_file_does_not_bring_back_another_profile_already_restored_once(self):
+        backup = {"profile:caleb": CALEB, "profile:firstmate": FM}
+        g = self.guard(Auth(self.creds, expires_in=3000))
+        g.write(os.path.join(self.cred_dir, login.BACKUP), backup)
+        g.write(os.path.join(self.cred_dir, login.RESTORED), {"profile:caleb": login.fingerprint(CALEB)})
+        self.store({})
+        self.guard(Auth(self.creds, expires_in=3000)).renew()
+        self.assertEqual(self.stored(), {"profile:firstmate": FM})  # caleb's refused login stays out
+        self.assertIn("not profile:caleb: restored once already", self.home.lines[0])
+
+    def test_a_lost_file_login_is_restored_without_the_env_var(self):
+        self.guard(Auth(self.creds, expires_in=3000)).renew()  # backs up from the file store
+        self.store({"profile:caleb": CALEB})  # lost between runs; its status now names no storage
+        with mock.patch.dict(os.environ, {"BASECAMP_NO_KEYRING": ""}):
+            self.guard(Auth(self.creds, expires_in=3000)).renew()
+        self.assertEqual(self.stored(), {"profile:caleb": CALEB, "profile:firstmate": FM})
+        self.assertIn("login: restored", self.home.lines[-1])
 
     def test_a_keyring_login_is_not_guarded_and_logs_no_false_failure(self):
         self.store({"profile:caleb": CALEB})  # the file does not hold firstmate: its login is in the keyring
