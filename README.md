@@ -8,7 +8,7 @@ with the agent the way you work with a colleague there: chat with it, assign it 
 chat replies and Message Board posts. There is no new app to learn, and it all works from
 the Basecamp app on your phone.
 
-It is built for [firstmate](https://github.com/calebl/firstmate): one agent you talk to,
+It is built for [firstmate](https://github.com/kunchenguid/firstmate): one agent you talk to,
 which runs a crew of other agents on your Linux computer.
 
 - **Decisions arrive as to-dos you answer from your phone.** When the agent needs you (a
