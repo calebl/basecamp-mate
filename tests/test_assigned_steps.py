@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_sync import ACTING, CAPTAIN  # noqa: E402
-from test_tools import comment  # noqa: E402
+from test_tools import boost, comment  # noqa: E402
 from test_notifications import APP, PROJECT  # noqa: E402
 from test_assigned_todos import AssignBase, AssignStub, OTHER, PARTNER, STRANGER  # noqa: E402
 import behaviors  # noqa: E402
@@ -314,6 +314,33 @@ class Lifecycle(StepBase):
         self.poll()
         comments = [(r["key"], r["comment"]) for r in self.pending() if r["kind"] == "todo-comment"]
         self.assertEqual(comments, [(f"request-{STEP}", 1000), ("request-902", 1001)])
+
+    def test_a_new_step_on_the_card_does_not_move_an_older_readers_place(self):
+        self.add_step(dict(step(), created_at="2026-11-12T07:00:00Z"))
+        self.stub.events[str(STEP)] = [assigned("2026-11-12T07:00:00Z")]
+        self.poll()
+        self.on_card(said(1000, "2026-11-12T08:00:00Z", content=f"<p>{MENTION} look</p>"))
+        self.add_step(dict(step(id=902, title="Then deploy it"), created_at="2026-11-12T09:00:00Z"))
+        self.stub.events["902"] = [assigned("2026-11-12T09:00:00Z")]
+        self.assertTrue(self.sync().read_todo_request(902, what="step"))  # found before the older step read the card
+        self.assertEqual(self.request(902)["cursor"], 1000)
+        self.sync().read_todo_comments(keys=[f"request-{STEP}"])
+        self.assertEqual([(r["key"], r.get("comment")) for r in self.pending() if r["kind"] == "todo-comment"],
+                         [(f"request-{STEP}", 1000)])
+
+    def test_the_next_step_takes_over_the_boosts_on_comments_relayed_before(self):
+        self.add_step(step())
+        self.add_step(step(id=902, title="Then deploy it"))
+        self.poll()
+        self.on_card(dict(comment(1000, content=f"<p>{MENTION} look</p>"), boosts_count=0))
+        self.poll()
+        self.assertTrue(self.sync().todo_complete(f"request-{STEP}"))
+        self.stub.boosts["1000"] = [boost(7, content="ship it")]
+        self.stub.comments[str(CARD)][0]["boosts_count"] = 1
+        self.poll()
+        self.poll()
+        self.assertEqual([(r["kind"], r.get("boost"), r.get("key")) for r in self.pending() if r["kind"] == "boost"],
+                         [("boost", 7, "request-902")])
 
     def test_completion_checks_the_step_off_once_and_is_counted_answered(self):
         self.add_step(step())

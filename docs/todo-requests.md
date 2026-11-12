@@ -65,8 +65,9 @@ awaiting its answer. Comments made on the card up to the step's assignment (that
 time, else the step's making) are never relayed, while one made after it counts even when
 the sweep finds the step later. Every other comment is skipped (a `skipped comment` line in
 `sync.log` and the relay ledger). With several of the agent's steps open on one card, the one
-with the smallest key reads its comments, so each is relayed once, under that key; the next
-goes on from where it stopped. A worded boost on the step, or any boost on one of those comments or the agent's
+with the smallest key reads its comments, so each is relayed once, under that key; when it
+closes, the next takes over what it relayed (and the boosts on those comments) and goes on
+from where it stopped. A step that never read the card hands nothing over. A worded boost on the step, or any boost on one of those comments or the agent's
 own comment there, is a `boost` record of the request. While another reader that is on reads
 that card (the card mirror, for a card made from the backlog; an open card request with
 `assigned_cards` on; a decision card with `todos`), its comments are left to that reader. `sync.py todo comment --todo request-<id>` comments on the card, `sync.py reply`

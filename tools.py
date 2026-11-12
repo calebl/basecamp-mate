@@ -1192,8 +1192,9 @@ class Tools:
                     continue
                 step = rec.get("type") == "step"
                 thread = self.step_card(rec)
+                deferred = step and self.card_read_elsewhere(key, rec)
                 try:
-                    comments = [] if step and self.card_read_elsewhere(key, rec) else \
+                    comments = [] if deferred else \
                         self.bc("comments", "list", str(thread), project=rec.get("bucket")) or []
                 except RuntimeError as e:
                     self.log(f"todo {key}: {e}")
@@ -1204,12 +1205,20 @@ class Tools:
                 me = self.acting_id() if step else None
                 due = rec.get("answer_due", False)  # a card step request: the agent commented there last
                 seen = set(rec.get("comments", []))
-                if step:  # another step request on this card read it before (it was the reader then): go on from there
-                    others = [r for k, r in self.card_steps(rec, state) if k != key]
-                    seen |= {x for r in others for x in r.get("comments", [])}
-                    ahead = max(others, key=lambda r: r.get("cursor") or 0, default=None)
-                    if ahead is not None and (ahead.get("cursor") or 0) > cursor:
-                        cursor, due = ahead["cursor"], ahead.get("answer_due", False)
+                if step and not deferred:
+                    # Another step request on this card that read it before ("read_card": it was the reader then) hands
+                    # over: what it relayed, with its boost state, and, when it read further, its position and wait. A
+                    # step that never read the card hands over nothing: its cursor is only its own starting boundary.
+                    readers = [r for k, r in self.card_steps(rec, state) if k != key and r.get("read_card")]
+                    if readers:
+                        rec["comments"] = sorted(set(rec.get("comments", [])) | {x for r in readers for x in r.get("comments", [])})
+                        rec["boost_counts"] = {**{i: n for r in readers for i, n in (r.get("boost_counts") or {}).items()},
+                                               **(rec.get("boost_counts") or {})}
+                        rec["boost_seen"] = sorted(set(rec.get("boost_seen") or []) | {b for r in readers for b in r.get("boost_seen") or []})
+                        seen = set(rec["comments"])
+                        ahead = max(readers, key=lambda r: r.get("cursor") or 0)
+                        if (ahead.get("cursor") or 0) > cursor:
+                            cursor, due = ahead["cursor"], ahead.get("answer_due", False)
                 for c in sorted(comments, key=lambda c: c.get("id", 0)):
                     cid = c.get("id", 0)
                     # A comment behind the cursor that a mention notification names (a Reply the sweep skipped): read
@@ -1267,6 +1276,8 @@ class Tools:
                     rec["cursor"] = cursor
                     if step:
                         rec["answer_due"] = due
+                        if not deferred:
+                            rec["read_card"] = True
                     self.save_json("todos.json", state)
 
     def read_steps(self, key, rec):
