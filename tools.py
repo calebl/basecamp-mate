@@ -2243,7 +2243,8 @@ class Tools:
         acting user's read boost off it, as `reply` would, and add a `dismissed` line to the relay ledger.
 
         The item is found by the id stored when it was recorded (relayed_item), never by its text; one never recorded
-        is refused (raised). An item already answered (`reply`) is left as it is, logged. A boost, an approval and
+        is refused (raised). An item already answered since it was relayed (`reply` on it, or a to-do command on its
+        key: outcome_applies, as `sync.py stats` counts it) is left as it is, logged. A boost, an approval and
         the items that are not Basecamp recordings carry no read boost, so only the outcome is recorded. A not_found
         while taking the boost off is about that recording only (deleted, or out of this login's reach): logged, and
         the dismissal is still recorded. Refused like `reply` without a profile that is not the owner's; a dry run
@@ -2252,10 +2253,9 @@ class Tools:
         item = self.relayed_item(rid)
         if item is None:
             raise RuntimeError(f"no relayed item has recording {rid} (relay.jsonl, pending-comments.jsonl)")
-        outcomes = {ev.get("event") for ev in read_ledger(self.path(RELAY))
-                    if ev.get("event") in ("answered", "dismissed") and str(ev.get("recording")) == str(rid)}
+        outcomes = {ev.get("event") for ev in read_ledger(self.path(RELAY)) if outcome_applies(ev, item)}
         if "answered" in outcomes:
-            self.log(f"dismiss {rid}: already answered with reply, not dismissing it")
+            self.log(f"dismiss {rid}: already answered (reply, or a to-do command on its key), not dismissing it")
             return False
         if self.refused(f"dismiss {rid}"):
             return False
@@ -2961,6 +2961,21 @@ def read_ledger(path):
         if isinstance(ev, dict):
             out.append(ev)
     return out
+
+
+def outcome_applies(ev, item):
+    """True when ledger line `ev` is an outcome ("answered" or "dismissed") of relayed item `item`: it names the item's
+    recording, or, an answer by a to-do command, its to-do key; and it was written at or after the item was relayed
+    (an item with no relay time, one from before the ledger, takes any). So an outcome never reaches an item relayed
+    after it, such as a request's later edit, which shares the request's to-do id and key."""
+    kind = ev.get("event")
+    if kind not in ("answered", "dismissed"):
+        return False
+    if ev.get("recording") is not None:
+        named = item.get("recording") is not None and str(ev["recording"]) == str(item["recording"])
+    else:
+        named = kind == "answered" and ev.get("key") is not None and ev["key"] == item.get("key")
+    return named and not history(ev.get("at"), item.get("at"), slack=0)
 
 
 def item_recording(rec):

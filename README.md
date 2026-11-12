@@ -672,7 +672,7 @@ else sends it anywhere.
   (the ledger, else `pending-comments.jsonl` for an item relayed before the ledger began),
   takes the agent's read boost off it as `reply` would, and records the outcome with the
   reason. It is refused (raised) for an id nothing relayed, leaves an item already answered
-  as it is, and records a recording Basecamp no longer finds (`not_found`) as dismissed all
+  (by `reply`, or by a to-do command on its key, since it was relayed) as it is, and records a recording Basecamp no longer finds (`not_found`) as dismissed all
   the same. A boost carries no read boost, so only its outcome is recorded. The inbox note
   of every comment, line or boost names the command ("Not for you: ...").
 
@@ -688,8 +688,10 @@ the items skipped, and the noise rate, the dismissed share of the items decided 
 or dismissed). Open items are counted as open, never guessed; the dismissed share of
 everything relayed is in the JSON too. Then the breakdown by kind and why, most dismissed
 first, so the top noise sources show, and the skipped items by kind and reason. An item's
-outcome is `answered` once any answer names it (an answer wins over a dismissal), else
-`dismissed`, else open. The ledger starts with the version that writes it; nothing before
+outcome is `answered` once an answer written after it was relayed names its recording or
+its to-do key (an answer wins over a dismissal), else `dismissed` once a dismissal written
+after it names its recording, else open: an outcome never reaches an item relayed later,
+such as a request's edit, which shares the request's to-do id and key. The ledger starts with the version that writes it; nothing before
 is counted.
 
 **Tokens.** `stats` also reads the agent's Claude Code transcripts, by default those of
@@ -1526,12 +1528,13 @@ step relayed as its answer, and `init`'s new-home default;
 note's request id, kind, why, recording, text and agent, none on a dry run, a `skipped` line
 beside the filter's log line, `answered` from `reply` and `--boost`, `dismiss` (the read boost
 taken off and the outcome recorded, by the CLI, refused for an id nothing relayed, a no-op on
-an answered item, a dry run, an item from before the ledger, a `not_found` recording), the
+an item answered by `reply` or by a to-do command on its key, a dry run, an item from before the ledger, a `not_found` recording), the
 note's dismiss line, the ledger kept out of the backup, and `sync.py stats`: counts per week
 and in total, the noise rate, the top noise source first, `--since` and `--until`, answered
 winning over dismissed and a to-do key answering only earlier items, and tokens from
 transcripts (session total with each message once, subagents included, per-item spans
-shared evenly, an unanswered span not attributed, a missing directory, `--json`);
+shared evenly, a request named by its `--todo` key, an unanswered span not attributed, a
+missing directory, `--json`), and an outcome never reaching an item relayed after it;
 `tests/test_schedule.py` covers when scheduled requests are done: `when` and `list` on a
 dated request (`ask` until its list has an answer), the list's remembered answer winning
 over the remembered default, the recurring default, nothing on an undated request or

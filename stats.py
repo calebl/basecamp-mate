@@ -9,8 +9,9 @@ It reads the relay ledger (tools.RELAY, relay.jsonl beside the config), which th
     `todo comment`, `todo complete` or `todo subtask`;
   - "dismissed": the agent said a recording was not for it with `sync.py dismiss`.
 
-An item's outcome is "answered" once any answer names its recording (or, for one with a to-do key, its key, after it
-was relayed), else "dismissed" once the agent dismissed it, else "open". The dismissed share of the items decided
+An item's outcome is "answered" once an answer written after it was relayed names its recording or, for one with a
+to-do key, its key (tools.outcome_applies), else "dismissed" once a dismissal written after it names its recording, else
+"open". The dismissed share of the items decided
 (answered or dismissed) is the noise rate; open items are counted, never guessed.
 
 Tokens, when a Claude Code transcript directory is readable (default: the sessions run in the home): the period's
@@ -23,7 +24,7 @@ answered in another session) is counted as not attributed. Only local files are 
 import json, os, re
 from datetime import date, datetime, timedelta, timezone
 
-from tools import RELAY, claude_transcript_dirs, read_ledger
+from tools import RELAY, claude_transcript_dirs, outcome_applies, read_ledger
 
 PERIODS = ("day", "week", "month", "all")
 PARTS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
@@ -65,21 +66,18 @@ def fold(events):
             items.append(dict(ev, outcome="open"))
         elif ev.get("event") == "skipped":
             skipped.append(ev)
-    by_rec = {}
+    by_rec, by_key = {}, {}
     for it in items:
         if it.get("recording") is not None:
             by_rec.setdefault(str(it["recording"]), []).append(it)
+        if it.get("key") is not None:
+            by_key.setdefault(it["key"], []).append(it)
     for ev in events:
         kind = ev.get("event")
         if kind not in ("answered", "dismissed"):
             continue
-        if ev.get("recording") is not None:
-            hits = by_rec.get(str(ev["recording"]), [])
-        elif kind == "answered" and ev.get("key") is not None:
-            hits = [it for it in items if it.get("key") == ev["key"] and str(it.get("at")) <= str(ev.get("at"))]
-        else:
-            hits = []
-        for it in hits:
+        near = by_rec.get(str(ev["recording"]), []) if ev.get("recording") is not None else by_key.get(ev.get("key"), [])
+        for it in (it for it in near if outcome_applies(ev, it)):
             if kind == "answered" and it["outcome"] != "answered":
                 it.update(outcome="answered", answered_at=ev.get("at"), via=ev.get("via"))
             elif kind == "dismissed" and it["outcome"] == "open":
@@ -189,12 +187,15 @@ def read_transcripts(dirs, since=None):
 
 
 def marker(it):
-    """The pattern that names item `it` in a note and in the agent's command: its recording, else its to-do key."""
+    """The pattern that names item `it` in a note and in the agent's command: its recording (`--recording <id>`) or its
+    to-do key (`--todo <key>`), whichever is used: a request's note and its answers name only the key, and a comment on
+    a tracked to-do may be answered either way."""
+    ways = []
     if it.get("recording") is not None:
-        return re.compile(r"--recording[ =]" + re.escape(str(it["recording"])) + r"(?!\d)")
+        ways.append(r"--recording[ =]" + re.escape(str(it["recording"])) + r"(?!\d)")
     if it.get("key") is not None:
-        return re.compile(r"--todo[ =]'?" + re.escape(str(it["key"])) + r"(?![\w.-])")
-    return None
+        ways.append(r"--todo[ =]'?" + re.escape(str(it["key"])) + r"(?![\w.-])")
+    return re.compile("|".join(ways)) if ways else None
 
 
 def span(entries, it):

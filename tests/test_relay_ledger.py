@@ -121,6 +121,31 @@ class Outcomes(Ledger):
         self.assertFalse(self.sync().dismiss(2))
         self.assertEqual((len(self.stub.deletes()), self.ledger("dismissed")), (deletes, []))
 
+    def test_dismiss_leaves_an_item_answered_by_a_todo_command_alone(self):
+        """Regression (review): the answered check matched only `recording`, so a comment answered with `todo comment`
+        on its key could still be dismissed."""
+        tid = self.create()
+        self.stub.comments[str(tid)] = [comment(9, content="<p>why?</p>")]
+        self.poll()
+        self.assertEqual([e["key"] for e in self.ledger("relayed")], ["ta-x"])
+        self.assertTrue(self.sync().todo_comment("ta-x", "Because."))
+        self.assertFalse(self.sync().dismiss(9))
+        self.assertEqual((self.stub.deletes(), self.ledger("dismissed")), ([], []))
+        self.assertIn("dismiss 9: already answered", self.log())
+
+    def test_an_answer_on_a_key_does_not_cover_what_is_relayed_after_it(self):
+        tid = self.create()
+        self.stub.comments[str(tid)] = [comment(9, content="<p>why?</p>")]
+        self.poll()
+        self.sync().todo_comment("ta-x", "Because.")
+        self.stub.comments[str(tid)].append(comment(10, content="<p>and the other one?</p>"))
+        self.poll()  # 10 is relayed after the answer: moved later than it below, as it would be in time
+        later = [dict(e, at="2099-01-01T00:00:00Z") if e.get("recording") == 10 else e for e in self.ledger()]
+        with open(os.path.join(self.cfgdir, "relay.jsonl"), "w") as f:
+            f.write("".join(json.dumps(e) + "\n" for e in later))
+        self.assertTrue(self.sync().dismiss(10))
+        self.assertEqual([e["recording"] for e in self.ledger("dismissed")], [10])
+
     def test_a_dry_dismiss_changes_nothing(self):
         self.ask_in_chat()
         self.assertFalse(self.sync(dry=True).dismiss(2))
@@ -202,6 +227,17 @@ class Report(unittest.TestCase):
         items, _ = stats.fold(evs)
         self.assertEqual([i["outcome"] for i in items], ["answered", "open"])
 
+    def test_an_old_dismissal_does_not_reach_a_later_item_on_the_same_recording(self):
+        """Regression (review): a request and its later edit share the to-do id, and a dismissal of the request also
+        marked the edit dismissed before the agent saw it."""
+        evs = [{"event": "relayed", "at": "2026-11-09T10:00:00Z", "kind": "todo-request", "recording": 50, "key": "k"},
+               {"event": "dismissed", "at": "2026-11-09T10:01:00Z", "recording": 50},
+               {"event": "relayed", "at": "2026-11-09T11:00:00Z", "kind": "todo-request-update", "recording": 50, "key": "k"},
+               {"event": "relayed", "at": "2026-11-09T12:00:00Z", "kind": "ping", "recording": 7},
+               {"event": "answered", "at": "2026-11-09T12:00:00Z", "recording": 7, "via": "reply"}]  # the same second
+        items, _ = stats.fold(evs)
+        self.assertEqual([i["outcome"] for i in items], ["dismissed", "open", "answered"])
+
     def test_the_text_report_and_the_cli(self):
         text = stats.render(stats.report(self.t, tokens=False))
         self.assertIn("thread-comment/yours: 2 relayed, 0 answered, 2 dismissed, 0 open (noise 100%)", text)
@@ -265,6 +301,23 @@ class Tokens(unittest.TestCase):
                          [("ping", 0), ("thread-comment", 150), ("mention", 450)])
         text = stats.render(r)
         self.assertIn("dismissed: 2 item(s), 1 attributed, ~150 tokens (~150 per item)", text)
+
+    def test_a_request_named_by_its_key_is_attributed(self):
+        """Regression (review): marker() used only `--recording` when an item had one, but a request's note and its
+        answers name it by `--todo <key>`, so answered requests were never attributed."""
+        write(os.path.join(self.dir, "relay.jsonl"), [
+            {"event": "relayed", "at": "2026-11-10T10:00:00Z", "kind": "todo-request", "why": "assigned", "recording": 50,
+             "key": "request-50"},
+            {"event": "answered", "at": "2026-11-10T10:10:00Z", "key": "request-50", "via": "todo complete"}])
+        with open(os.path.join(self.tx, "s2.jsonl"), "w") as f:
+            f.write("\n".join([
+                shown("2026-11-10T10:01:00Z", "Commands: sync.py todo comment --todo request-50; sync.py todo complete "
+                                              "--todo request-50."),
+                assistant("r1", "2026-11-10T10:02:00Z", 70),
+                assistant("r2", "2026-11-10T10:03:00Z", 30, "python3 sync.py todo complete --home h --config c --todo request-50"),
+                assistant("r3", "2026-11-10T10:04:00Z", 999, "python3 sync.py todo complete --todo request-500")]) + "\n")
+        tk = stats.report(self.t, since=date(2026, 11, 10), transcripts=[self.tx])["tokens"]
+        self.assertEqual(tk["answered"], {"items": 1, "attributed": 1, "tokens": 100, "per_item": 100})
 
     def test_a_missing_transcript_directory_reports_none(self):
         r = stats.report(self.t, transcripts=[os.path.join(self.dir, "nowhere")])
