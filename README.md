@@ -83,6 +83,9 @@ policy. Each does one thing to the configured account and project:
 | boost readers | reader | record the owner's new boosts, with their text, on every monitored surface as `boost` (below); a boost on the agent login's own recording only once its received-boosts feed lists it |
 | unmonitored recorder | reader | records owner input that no behavior handles as `unmonitored`, once per kind of thing (below) |
 | `sync.py reply` | command | answers a recorded comment, chat line, Ping line, to-do comment, thread comment or mention where it was made (with `--boost`, as a boost of 16 characters or fewer on it), then removes the 👀; with `--awaiting`, on a followed thread, the next comment there is relayed |
+| `sync.py dismiss` | command | says a relayed item was not for the agent: takes the 👀 (the read boost) off it, as `reply` would, and records it dismissed in the relay ledger (see "Relay ledger and stats") |
+| `sync.py stats` | command | reports the relay ledger: per day, week or month, the items relayed, answered, dismissed, still open and skipped, the noise rate, its sources by kind and why, and the tokens spent; local files only, read-only (see "Relay ledger and stats") |
+| relay ledger | primitive | appends one line per item recorded for the agent, per item the relay filter skips, and per outcome (answered, dismissed) to `relay.jsonl`; local only |
 | `sync.py ask` | command | posts a new chat line @mentioning the owner |
 | `sync.py watch`, `sync.py unwatch` | command | starts or stops watching one chat in any project of the account (kept in `chats.json`, not the config): its listened-to lines after a given line are recorded as `chat-question` (see "Chat watches") |
 | `sync.py answer` | command | answers a check-in question, once per question per day |
@@ -641,6 +644,71 @@ once and remembered in `assigned-todos.json`. Each sweep then reads every open r
 comments, boosts and the to-do itself, for edits and closing. Without a `profile`, or with
 one that signs in as the owner, nothing is read: the assignments would be the owner's own.
 
+## Relay ledger and stats
+
+Everything the sync relays costs the agent a turn, so the sync keeps a record of what it
+relayed and what came of it, in `relay.jsonl` beside the config. It is append-only, one
+JSON line per event, and stays on this computer: the backup never uploads it and nothing
+else sends it anywhere.
+
+- `relayed`: written with each pending record (so each inbox note): `item` (the note's
+  request id, `basecamp-<kind>-<id>`), `kind`, `why` (the record's own `why`, `awaiting` or
+  `yours`, else what the kind means: `addressed` for a mention, `chat`, `ping`, `card`,
+  `own-message`, `tracked-todo`, `own-recording` for a boost, `assigned` for a request),
+  `recording` (the id `reply --recording` and `dismiss --recording` take: the comment, line or
+  boost, or the to-do of a request), `key`, `surface`, `bucket`, `url`, `title`, `text` (what
+  the agent saw), `author`, `role` and `created_at` (Basecamp's time).
+- `skipped`: an item the relay filter dropped: a comment on a followed thread with no
+  @mention or answer awaited, a group Ping line not addressed to the agent, an emoji-only
+  boost there and a boost on someone else's recording. Each keeps its one "skipped" line in
+  `sync.log`; the ledger adds its `kind`, `recording`, `reason`, `bucket`, `text`, `url` and
+  `author`. People the sync does not listen to are blocked before the filter and are not
+  counted here.
+- `answered`: `sync.py reply` posted the answer (`via` `reply` or `reply --boost`, with the
+  `recording`), or `todo comment`, `todo complete` or `todo subtask` acted on a tracked to-do
+  (with its `key`: every item relayed under that key before it counts as answered).
+- `dismissed`: the agent ran `sync.py dismiss --recording <id> [--reason <text>]`: the
+  item was not for it. The command finds the item by the id stored when it was recorded
+  (the ledger, else `pending-comments.jsonl` for an item relayed before the ledger began),
+  takes the agent's read boost off it as `reply` would, and records the outcome with the
+  reason. It is refused (raised) for an id nothing relayed, leaves an item already answered
+  (by `reply`, or by a to-do command on its key, since it was relayed) as it is, and records a recording Basecamp no longer finds (`not_found`) as dismissed all
+  the same. A boost carries no read boost, so only its outcome is recorded. The inbox note
+  of every comment, line or boost names the command ("Not for you: ...").
+
+Every line carries `at` (when it was written, UTC) and `agent` (the `home`, the `profile`
+and, once known, the login's person `id`). Together they make each relayed item a labeled
+example: what the agent saw and why, where to refetch it (`bucket`, `recording`, `url`),
+which agent it was for, and the label (`answered`, `dismissed`, or none yet).
+
+`sync.py stats --home <home> --config <config.json> [--since YYYY-MM-DD] [--until
+YYYY-MM-DD] [--by day|week|month|all] [--json]` reports it. Per period (by week, from
+Monday, unless `--by`), and in total: the items relayed, answered, dismissed and still open,
+the items skipped, and the noise rate, the dismissed share of the items decided (answered
+or dismissed). Open items are counted as open, never guessed; the dismissed share of
+everything relayed is in the JSON too. Then the breakdown by kind and why, most dismissed
+first, so the top noise sources show, and the skipped items by kind and reason. An item's
+outcome is `answered` once an answer written after it was relayed names its recording or
+its to-do key (an answer wins over a dismissal), else `dismissed` once a dismissal written
+after it names its recording, else open: an outcome never reaches an item relayed later,
+such as a request's edit, which shares the request's to-do id and key. The ledger starts with the version that writes it; nothing before
+is counted.
+
+**Tokens.** `stats` also reads the agent's Claude Code transcripts, by default those of
+sessions run in `--home` (under `CLAUDE_CONFIG_DIR`, default `~/.claude`, in `projects/`,
+subagent transcripts included), or the directories given with `--transcripts <dir>`
+(repeatable); `--no-tokens` skips them. It reports the period's session total from each
+assistant message's `usage` (input, cache write, cache read and output, each message counted
+once however many lines it spans), and an estimate per item: the assistant messages from
+the first transcript line that shows the item's note (the line holding its `--recording
+<id>` or `--todo <key>` command) to the agent's own `reply`, `dismiss` or to-do command
+naming it, each message shared evenly among the items whose spans hold it. Totals and the
+per-item average are given for answered and dismissed items, with how many were
+attributed; an item handled in another session, or with no transcript, is not attributed.
+It is an estimate: the span holds whatever else the agent did meanwhile, and each message's
+usage is mostly the cached context of the whole session, so read it as the cost of the turns
+an item took, not of the item alone.
+
 ## Timesheets
 
 With `"timesheet": {}` (`init --timesheet`), the sync posts the agent's active time on each
@@ -717,7 +785,8 @@ basecamp-mate checkout, `HOME` its firstmate home):
   in the project (with `"mentions": {"scope": "account"}`, any project of the account), any
   thread the acting login follows or is @mentioned in is read for the owner's comments, and
   `reply` answers there. Their only writes are the readers' 👀/👍
-  acknowledgements and marking handled notifications read; never another home's.
+  acknowledgements and marking handled notifications read; never another home's. The
+  agent's `reply` and `dismiss` take its own read boost off again.
 - Cards are never deleted, trashed or archived. Cards whose task left the backlog are
   left as they are (the run logs how many).
 - The sync never posts as a comment, and never to chat, except the opt-in session alert
@@ -906,7 +975,8 @@ basecamp-mate checkout, `HOME` its firstmate home):
   basecamp-<kind>-<id> --json -` (FM_HOME set to that home). The note body is short and
   plain: what it is and who wrote it, the text, the Basecamp link, the facts that matter
   (whether their word authorizes, a due date Basecamp owns, a repeat Basecamp makes, a
-  closed request) and the commands that act on it. It never says how to handle it: that is
+  closed request) and the commands that act on it, with, for a comment, line or boost, how
+  to dismiss it when it is not for the agent (`sync.py dismiss`). It never says how to handle it: that is
   the home's `defaults.md` (see "The base prompt and the agent skill"), which the note
   points to.
   The request id (the comment, line or boost id; question and date for a check-in) makes a
@@ -1305,6 +1375,7 @@ claim, in `~/.local/state/basecamp-mate/runs/`; see "One home per project and lo
 | `assigned-todos.json` | the script | `ignored`: to-dos assigned to the acting login whose creator is not listened to, so the sweep fetches each once |
 | `sync.log` | the script | one line per action, plus a counts line per run |
 | `pending-comments.jsonl` | the script | captain comments and approvals waiting to be relayed, one JSON record per line (see below) |
+| `relay.jsonl` | the script, `reply`, `dismiss` and the to-do commands | the relay ledger: one line per item relayed, per item the relay filter skipped, and per outcome (answered, dismissed); never backed up (see "Relay ledger and stats") |
 | `extra-repos.json` | hand | `{"task": ["board", ...]}`: extra boards for a task |
 | `figuring.json` | hand | `{"task": "why"}`: queued tasks that need a plan approved |
 | `not-now.json` | hand | `{"task": "why"}`: tasks deferred |
@@ -1453,6 +1524,17 @@ standing in, a participant's Ping, `init`'s flags and `doctor`'s domain check;
 boost on the captain's deciding comment (never a participant's) once `todo complete` or
 `todo subtask` carries it out with the read boost taken off, once, a boost on a decision
 step relayed as its answer, and `init`'s new-home default;
+`tests/test_relay_ledger.py` covers the relay ledger: a `relayed` line per record with its
+note's request id, kind, why, recording, text and agent, none on a dry run, a `skipped` line
+beside the filter's log line, `answered` from `reply` and `--boost`, `dismiss` (the read boost
+taken off and the outcome recorded, by the CLI, refused for an id nothing relayed, a no-op on
+an item answered by `reply` or by a to-do command on its key, a dry run, an item from before the ledger, a `not_found` recording), the
+note's dismiss line, the ledger kept out of the backup, and `sync.py stats`: counts per week
+and in total, the noise rate, the top noise source first, `--since` and `--until`, answered
+winning over dismissed and a to-do key answering only earlier items, and tokens from
+transcripts (session total with each message once, subagents included, per-item spans
+shared evenly, a request named by its `--todo` key, an unanswered span not attributed, a
+missing directory, `--json`), and an outcome never reaching an item relayed after it;
 `tests/test_schedule.py` covers when scheduled requests are done: `when` and `list` on a
 dated request (`ask` until its list has an answer), the list's remembered answer winning
 over the remembered default, the recurring default, nothing on an undated request or

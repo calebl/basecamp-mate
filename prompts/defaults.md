@@ -61,6 +61,11 @@ where you put everything that needs them:
   approval as approving every recommendation on the card, and record that decision in the
   backlog.
 - A **comment on your report** (`message-comment`): see "Reports" below.
+- **Not for you**: when a comment, line, mention or boost reached you but is meant for
+  someone else, or needs nothing from you, do not answer it and do not take the 👀 off by
+  hand: run `python3 SYNC/sync.py dismiss C --recording <id> --reason "<a few words>"` (the
+  note names the command). It takes the read boost off and records the item as not for you,
+  so `sync.py stats` can show what the sync relays that it should not.
 
 ## Requests
 
@@ -327,7 +332,8 @@ The sync puts them on for you; never add or remove one by hand. What they are is
 config's `acknowledge`, changed there when the captain asks:
 
 - **Read**: everything you read gets the `read` boost (👀 for a new home); `reply` takes it
-  off once you answer. Without it, 👀 on a question and 👍 on anything else.
+  off once you answer, and `dismiss` once you find it was not for you. Without it, 👀 on a
+  question and 👍 on anything else.
 - **Decided**: once you have carried out a decision (`todo complete`, or `todo subtask` for
   one step), each deciding comment gets the `decided` boost (👍 for a new home) and loses
   its read boost.

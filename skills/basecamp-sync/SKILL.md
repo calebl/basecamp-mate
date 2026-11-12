@@ -7,7 +7,7 @@ description: Operating contract for a firstmate or second mate whose home mirror
 
 The sync has two layers. Tools are single-purpose: readers that the timer (every 30
 seconds) runs to append pending records, and commands you run to post (`reply`, `ask`, `answer`,
-`todo create|track|comment|complete|subtask`, `post-message`). Behaviors are the workflows the
+`todo create|track|comment|complete|subtask`, `post-message`) or to dismiss what was not for you (`dismiss`). Behaviors are the workflows the
 config turns on, each composed from tools: the card mirror (`tables`, `repos`; off with
 `"cards": false` or without `tables`), the chat inbox (`chats`), chat asks (`ask_chat`),
 check-in answering (`checkins`), release announcements (`releases`), decision to-dos
@@ -396,7 +396,11 @@ The main firstmate's own home answers its questions itself rather than relaying.
 Acknowledgements are the sync's. With the config's `acknowledge` `read` (a new home: 👀) it
 goes on everything read; without it, 👀 on a captain question means "looking into it" and
 👍 on a comment or card means "got it". `sync.py reply` removes the read boost once
-answered, with a comment or line or with `--boost`. With `acknowledge` `decided` (a new home: 👍), `todo complete` and `todo subtask`
+answered, with a comment or line or with `--boost`. When a relayed comment, line, mention
+or boost is not for you (meant for someone else, or needing nothing from you), run
+`python3 $SYNC/sync.py dismiss --home <home> --config <home>/data/basecamp-sync/config.json --recording <id> --reason "<a few words>"`
+instead of answering: it removes the read boost and records the item as not for you in the
+relay ledger (`relay.jsonl`), which `sync.py stats` reports as the noise rate. With `acknowledge` `decided` (a new home: 👍), `todo complete` and `todo subtask`
 put it on each deciding comment once the decision is carried out. A boost on a decision
 step (a subtask) arrives as a `boost` with `surface` `subtask` and `step`: that decision's
 answer. Don't add or remove acknowledgements by hand.
