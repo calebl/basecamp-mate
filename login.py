@@ -168,11 +168,15 @@ class Login:
 
     def file_store(self, st):
         """Whether the CLI keeps this login in credentials.json: BASECAMP_NO_KEYRING is set (the CLI then uses the file
-        without probing the keyring), `auth status` (`st`) says so, or the backup holds this login (a backup is only
-        taken from the file store, and a lost login's status names no storage). A keyring login is not guarded: the
+        without probing the keyring), `auth status` (`st`) says so, or status names no store and the backup holds this
+        login (a backup is only taken from the file store, and a lost login's status names no storage; a status that
+        names the keyring wins over an old backup). A keyring login is not guarded: the
         file does not hold it, so a missing entry there is no loss."""
-        if os.environ.get("BASECAMP_NO_KEYRING") or (st.get("data") or {}).get("storage") == "file":
+        storage = (st.get("data") or {}).get("storage")
+        if os.environ.get("BASECAMP_NO_KEYRING") or storage == "file":
             return True
+        if storage:
+            return False  # status names another store (the keyring, the environment): an old file backup is moot
         return bool(self.key) and self.holds(self.read(self.backup))
 
     def due(self, st):

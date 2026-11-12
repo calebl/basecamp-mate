@@ -1279,8 +1279,8 @@ minutes (by the token's own `expires_at`) and guards the login the `basecamp` CL
   home and login shares the copy, so it is merged rather than replaced: an entry the file has
   already lost stays in the copy.
 - It guards only the file store: `BASECAMP_NO_KEYRING` is set, `auth status` reports
-  `"storage": "file"`, or the backup holds the login. A login kept in the system keyring is
-  only renewed.
+  `"storage": "file"`, or status names no store and the backup holds the login. A login kept
+  in the system keyring is only renewed, even when an old file backup holds it.
 - Each entry is restored at most once per copy, by its own mark, so an emptied file never
   brings back another profile's login that was already restored and refused.
 - If the profile is missing after the renewal, it puts the missing entry back from the copy

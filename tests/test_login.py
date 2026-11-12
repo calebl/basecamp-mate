@@ -252,6 +252,14 @@ class GuardTest(unittest.TestCase):
             self.guard(Auth(self.creds, keyring=True, ok=False)).renew()  # a real refusal is still reported
             self.assertEqual([ln[:20] for ln in self.home.lines], ["FAILED token refresh"])
 
+    def test_a_login_moved_to_the_keyring_is_not_restored_from_its_old_file_backup(self):
+        self.guard(Auth(self.creds, expires_in=3000)).renew()  # backed up while in the file store
+        self.store({"profile:caleb": CALEB})  # moved to the keyring: the file no longer holds it
+        with mock.patch.dict(os.environ, {"BASECAMP_NO_KEYRING": ""}):
+            self.guard(Auth(self.creds, expires_in=3000, keyring=True)).renew()
+        self.assertEqual(self.stored(), {"profile:caleb": CALEB})
+        self.assertEqual(self.home.lines, [])
+
     def test_sync_renew_exits_offline_so_run_sh_skips_the_run(self):
         cfg = os.path.join(self.home_dir, "config.json")
         with open(cfg, "w") as f:
