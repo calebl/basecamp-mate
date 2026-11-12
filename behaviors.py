@@ -24,7 +24,7 @@ SLOW, SWEEP, DAY = 300, 3600, 86400  # seconds: the card mirror's, releases' and
 
 
 class Behavior:
-    name = ""  # as the README and `sync.py behaviors` name it
+    name = ""  # as docs/how-it-works.md and `sync.py behaviors` name it
     keys = ()  # the config keys that turn it on or configure it
     timer = True  # False: the agent carries it out with the tools; nothing runs on the timer
     every = 0  # seconds between its timer steps; 0: every timer run (every 30 seconds)
