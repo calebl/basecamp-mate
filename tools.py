@@ -1450,7 +1450,9 @@ class Tools:
         one read of /my/assignments.json: in this project, or in every project of the account when the scope is "account".
 
         `what` "step": the open card steps assigned to the acting user. Basecamp lists a step only nested in its card's
-        entry, as one of its "children" of type "step"; the card is listed (as "card") whoever it is assigned to.
+        entry, as one of its "children" of type "step"; the card is listed (as "card") whoever it is assigned to. So for
+        `what` "card", an entry whose own "assignees" leave out the acting user is only there for its steps and is
+        skipped before anything is fetched; an entry without "assignees" is kept, to be read as before.
         """
         data = self.bc("api", "get", "/my/assignments.json") or {}
         items = data if isinstance(data, list) else (data.get("priorities") or []) + (data.get("non_priorities") or [])
@@ -1458,9 +1460,12 @@ class Tools:
         if what == "step":
             items = [s for a in items if (a.get("type") or "").lower() == "card" and not a.get("completed")
                      for s in a.get("children") or []]
+        me = self.agent() if what == "card" else None
         found = {}
         for a in items:
             bucket = str((a.get("bucket") or {}).get("id") or self.project)
+            if me is not None and "assignees" in a and me not in [p.get("id") for p in a.get("assignees") or []]:
+                continue  # a card that only holds the acting user's steps: not assigned to it
             if (a.get("id") and not a.get("completed") and (a.get("type") or "todo").lower() == what
                     and (scope == "account" or bucket == self.project)):
                 found.setdefault(a["id"], bucket)

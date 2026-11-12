@@ -28,7 +28,10 @@ tracked in `todos.json` with `"type": "card"`), then `card-request-update` and
 `card-request-closed`, and its comments and boosts as `todo-comment` and `boost` records
 with `"request": true` and `"type": "card"`. Basecamp raises an `Event` notification on the
 card when it is assigned, which the notification reader takes as the signal to read it; the
-5-minute sweep of `/my/assignments.json` is the repair sweep. `sync.py reply`, `todo comment`,
+5-minute sweep of `/my/assignments.json` is the repair sweep. That listing also has a card
+assigned to someone else when one of its steps is assigned to the agent; the sweep skips any
+card entry whose own `assignees` leave out the agent's login, so such a card is never fetched
+nor counted against `limit`. `sync.py reply`, `todo comment`,
 `todo show` and `todo complete` work on it; `todo complete` completes the card, which
 Basecamp shows by moving it to its table's Done column. A card the card mirror made from the
 backlog (in `map.json`) is never a request, and `assigned_todos` is unchanged by it.

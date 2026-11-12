@@ -100,7 +100,8 @@ as an update, Basecamp's next occurrence recorded once as a request that `follow
 completed one, a reused to-do, `todo show`), plus the account-wide
 scope (a request in another project carrying its project, its comments, boosts, replies,
 edits and closing in that project) and the unchanged project default;
-`tests/test_assigned_steps.py` covers card step requests with fixtures shaped like Basecamp's
+`tests/test_assigned_cards.py` also covers a card listed only for the agent's step never being
+fetched nor counted against `limit`; `tests/test_assigned_steps.py` covers card step requests with fixtures shaped like Basecamp's
 (a step nested in its card's `/my/assignments.json` entry, the step record, its notifications
 subscribed to the step): discovery once and acknowledged, the card itself not a request,
 someone else's or a stranger's step, the account scope and its claim, the card's comments
