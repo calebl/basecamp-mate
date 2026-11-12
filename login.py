@@ -1,0 +1,270 @@
+"""Renew the Basecamp login before a timer run, and keep the stored login from being lost.
+
+`run.sh` runs `sync.py renew` before each timer run. It renews the profile's OAuth token
+(`basecamp auth refresh -P <profile>`) when the token is near expiry, and guards the file
+store the `basecamp` CLI keeps every login in (`credentials.json` in its config directory,
+used with BASECAMP_NO_KEYRING=1):
+
+  - Before a renewal, a copy of the file is kept beside it (`credentials.json.basecamp-mate-backup`,
+    mode 0600), but only while the file still holds the profile. After a renewal that worked,
+    the copy is taken again, so it never holds a refresh token the renewal just spent.
+  - If after the renewal the profile is missing (the CLI deletes a login whose refresh is
+    refused, and a store it could not read is saved back as `{}`), the missing entries are
+    restored from the copy, and one line says so. Only the profile's own entry is put back
+    while the file still holds other logins; when the whole file was emptied, every entry
+    the copy holds is.
+  - A copy is restored at most once (its fingerprint is kept in
+    `credentials.json.basecamp-mate-restored`). If the restored login is refused again, it is
+    not put back again: Basecamp bans a client and address after a handful of refused
+    renewals, so the run logs one FAILED line saying to sign in and stops renewing.
+  - After a renewal the file and its directory are flushed to disk (fsync): the CLI renames
+    a fresh file into place without one, and a power cut soon after can lose the rotated
+    refresh token, leaving the spent one on disk.
+  - A run that cannot reach Basecamp (the boot window, before the network is up) leaves the
+    stored login alone, does not count as a login failure, and skips the sync; one line
+    notes the outage when it starts and one when it ends.
+
+The CLI's own lock files (`locks/` in its config directory) are taken around each read and
+write of the file, so neither side writes while the other is part-way through.
+Nothing here prints or logs a token: only key names, whether a key is present, and hashes.
+"""
+import contextlib, fcntl, hashlib, json, os, socket, subprocess, tempfile, time
+from datetime import datetime
+
+RENEW_BEFORE = 15 * 60  # seconds: renew when the access token expires within this; it lasts about an hour
+REACH = (("3.basecampapi.com", 443), ("launchpad.37signals.com", 443))  # the API and the token endpoints
+REACH_TIMEOUT = 5  # seconds per host
+AUTH_TIMEOUT = 30  # seconds per `basecamp auth` call
+BACKUP = "credentials.json.basecamp-mate-backup"
+RESTORED = "credentials.json.basecamp-mate-restored"
+OFFLINE = 75  # `sync.py renew` exit code: Basecamp unreachable, skip this run (EX_TEMPFAIL)
+
+
+def config_dir():
+    """The `basecamp` CLI's config directory, as it finds it: $XDG_CONFIG_HOME/basecamp, else ~/.config/basecamp."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "basecamp")
+
+
+def reachable(hosts=REACH, timeout=REACH_TIMEOUT):
+    """True when a TCP connection to any of `hosts` opens (name lookup included)."""
+    for host, port in hosts:
+        try:
+            socket.create_connection((host, port), timeout=timeout).close()
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def fingerprint(blob):
+    """A stable hash of one stored login, to tell copies apart without keeping or showing its tokens."""
+    return hashlib.sha256(json.dumps(blob, sort_keys=True).encode()).hexdigest()
+
+
+class Login:
+    """The renewal step for one config: `renew()` returns 0 to go on with the run, OFFLINE to skip it."""
+
+    def __init__(self, tools, runner=subprocess.run, reach=None, now=time.time, cred_dir=None):
+        self.t, self.run, self.reach, self.now = tools, runner, reach or reachable, now
+        self.profile = tools.cfg.get("profile")
+        self.dir = cred_dir or config_dir()
+        self.creds = os.path.join(self.dir, "credentials.json")
+        self.backup = os.path.join(self.dir, BACKUP)
+        self.restored = os.path.join(self.dir, RESTORED)
+
+    # --- the CLI's file store ---
+
+    @property
+    def key(self):
+        """The credential's key in credentials.json: "profile:<name>", or None for the CLI's default login."""
+        return f"profile:{self.profile}" if self.profile else None
+
+    def holds(self, store):
+        """True when `store` (a parsed credentials.json) still holds this config's login."""
+        if not isinstance(store, dict) or not store:
+            return False
+        return self.key in store if self.key else True
+
+    def read(self, path):
+        """The JSON object at `path`, or None when it is missing, empty or not an object."""
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def write(self, path, data):
+        """Write `data` to `path` atomically, mode 0600, flushed to disk with its directory."""
+        fd, tmp = tempfile.mkstemp(dir=self.dir, prefix=".basecamp-mate-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+        self.flush_dir()
+
+    def flush(self, path):
+        """fsync `path` and its directory, so a rename the CLI made reaches the disk now, not at the next commit."""
+        with contextlib.suppress(OSError):
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        self.flush_dir()
+
+    def flush_dir(self):
+        with contextlib.suppress(OSError):
+            fd = os.open(self.dir, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+    @contextlib.contextmanager
+    def cli_lock(self, name, shared=False):
+        """Hold one of the CLI's own lock files (locks/<name>), as the CLI does: flock, shared for a read."""
+        locks = os.path.join(self.dir, "locks")
+        os.makedirs(locks, mode=0o700, exist_ok=True)
+        with open(os.path.join(locks, name), "a") as f:
+            fcntl.flock(f, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+            yield
+
+    def key_lock_name(self):
+        """The CLI's per-credential lock file: key-<sha256 of the key>.lock."""
+        return "key-" + hashlib.sha256((self.key or "").encode()).hexdigest() + ".lock"
+
+    def read_store(self):
+        with self.cli_lock("store.lock", shared=True):
+            return self.read(self.creds)
+
+    # --- the CLI ---
+
+    def auth(self, *args):
+        """`basecamp auth <args> [-P profile] --json`: its parsed output, or {"ok": False, ...} on any failure."""
+        prof = ["-P", self.profile] if self.profile else []
+        try:
+            r = self.run(["basecamp", "auth", *args, *prof, "--json"], capture_output=True, text=True,
+                         timeout=AUTH_TIMEOUT, stdin=subprocess.DEVNULL)
+            out = json.loads(r.stdout)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "code": "timeout", "error": f"no answer in {AUTH_TIMEOUT}s"}
+        except (OSError, ValueError) as e:
+            return {"ok": False, "error": type(e).__name__}
+        return out if isinstance(out, dict) else {"ok": False, "error": "not a JSON object"}
+
+    def due(self):
+        """Whether the token needs renewing: it expires within RENEW_BEFORE, by its own expires_at (renew when unknown)."""
+        st = self.auth("status")
+        data = st.get("data") or {}
+        if st.get("ok") and data.get("authenticated") is False:
+            return False  # nothing stored to renew; the check after says what is missing
+        try:
+            at = datetime.fromisoformat(str(data["expires_at"]).replace("Z", "+00:00")).timestamp()
+        except (KeyError, ValueError):
+            return True
+        return at - self.now() < RENEW_BEFORE
+
+    # --- the step ---
+
+    def state(self):
+        return self.t.load("login.json", {})
+
+    def note(self, **kw):
+        """Change this home's login state (login.json beside the config); a None value removes the key."""
+        st = self.state()
+        for k, v in kw.items():
+            if v is None:
+                st.pop(k, None)
+            else:
+                st[k] = v
+        self.t.save_json("login.json", st)
+
+    def renew(self):
+        if not self.reach():
+            if not self.state().get("offline"):
+                self.t.log("network: Basecamp cannot be reached; this run leaves the stored login alone and skips the "
+                           "sync until it can (not a login failure)")
+                self.note(offline=int(self.now()))
+            return OFFLINE
+        if self.state().get("offline"):
+            self.t.log("network: Basecamp can be reached again; the sync runs")
+            self.note(offline=None)
+        before = self.read_store()
+        if self.holds(before):
+            self.keep(before)
+        renewed = None
+        if self.due():
+            out = self.auth("refresh")
+            renewed = bool(out.get("ok"))
+            self.flush(self.creds)
+        after = self.read_store()
+        if not self.holds(after):
+            if self.restore():
+                return 0
+            return self.failed("the stored login is missing and no backup copy can be restored")
+        if renewed is False:
+            return self.failed("basecamp auth refresh did not succeed")
+        if renewed:
+            self.keep(after)
+            self.forget_restored()
+        if self.state().get("failed"):
+            self.t.log("login: renewal works again")
+            self.note(failed=None)
+        return 0
+
+    def keep(self, store):
+        """Back up `store` (credentials.json, read when it still held the profile) beside it, mode 0600."""
+        try:
+            self.write(self.backup, store)
+        except OSError as e:
+            self.t.log(f"login: could not back up {self.creds}: {type(e).__name__}")
+
+    def restore(self):
+        """Put the missing login back from the backup, once per backup copy; True when it was put back."""
+        backup = self.read(self.backup)
+        if not self.holds(backup):
+            return False
+        mark = fingerprint(backup.get(self.key) if self.key else backup)
+        done = self.read(self.restored) or {}
+        if done.get(self.key or "") == mark:
+            return False  # restored once already and lost again: renewing it again would only be refused again
+        with self.cli_lock(self.key_lock_name()), self.cli_lock("store.lock"):
+            now = self.read(self.creds)
+            if self.holds(now):
+                return True  # something else put it back meanwhile
+            if now:  # other logins are still there (only a profile's own can be missing from a non-empty file)
+                merged = {**now, self.key: backup[self.key]}
+                what = f"{self.key} was missing; put it back"
+            else:
+                merged = backup
+                what = f"the file was emptied; put back {', '.join(sorted(backup))}"
+            self.write(self.creds, merged)
+        self.write(self.restored, {**done, (self.key or ""): mark})
+        self.t.log(f"login: restored {self.creds} from the copy kept before the renewal ({what})")
+        return True
+
+    def forget_restored(self):
+        """A renewal worked, so the login is live again: a later loss may be restored once more."""
+        done = self.read(self.restored)
+        if done and (self.key or "") in done:
+            done.pop(self.key or "")
+            self.write(self.restored, done)
+
+    def failed(self, why):
+        """Log the FAILED line once per cause (and hourly while it lasts), not on every run; the sync still runs."""
+        login = f"basecamp auth login{' -P ' + self.profile if self.profile else ''}"
+        line = f"FAILED token refresh: {why}; run {login}"
+        st = self.state().get("failed") or {}
+        if st.get("line") != line or self.now() - st.get("at", 0) >= 3600:
+            self.t.log(line)
+            self.note(failed={"line": line, "at": int(self.now())})
+        return 0
