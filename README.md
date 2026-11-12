@@ -1275,7 +1275,11 @@ minutes (by the token's own `expires_at`) and guards the login the `basecamp` CL
 
 - Before a renewal it copies that file to `credentials.json.basecamp-mate-backup` beside it
   (mode 0600), but only while the file still holds the profile. After a renewal that worked
-  it copies the file again, so the copy never holds a refresh token the renewal spent.
+  it copies the file again, so the copy never holds a refresh token the renewal spent. Every
+  home and login shares the copy, so it is merged rather than replaced: an entry the file has
+  already lost stays in the copy.
+- It guards only the file store (`BASECAMP_NO_KEYRING` set, or `auth status` reporting
+  `"storage": "file"`). A login kept in the system keyring is only renewed.
 - If the profile is missing after the renewal, it puts the missing entry back from the copy
   (every entry when the whole file was emptied) and logs one `login: restored` line. It
   does this once per copy: if the restored login is refused again, it logs one
@@ -1419,7 +1423,9 @@ then hourly, stale, removed and recycled-pid claims, the override, dry runs, com
 and a temporary `credentials.json`: a renewal that empties the file restored from the
 backup, a network-down run leaving the file untouched, only the lost profile put back beside
 another login's newer entry, a restored login lost again not restored twice, the backup
-retaken after a good renewal, no renewal far from expiry, and one FAILED line per cause;
+retaken after a good renewal and keeping another profile's entry the file already lost, the
+restore marks read and written under the CLI's locks, a keyring login renewed without the
+guard or a false FAILED line, no renewal far from expiry, and one FAILED line per cause;
 `tests/test_assigned_todos.py` covers to-do requests with a stubbed `/my/assignments.json`:
 the sweep, who assigned it, comments, boosts, edits and closing, reassignment, the agent
 completing it, the `Assignment` and `Completion` notifications, and their notes, scheduled

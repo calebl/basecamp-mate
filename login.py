@@ -7,7 +7,12 @@ used with BASECAMP_NO_KEYRING=1):
 
   - Before a renewal, a copy of the file is kept beside it (`credentials.json.basecamp-mate-backup`,
     mode 0600), but only while the file still holds the profile. After a renewal that worked,
-    the copy is taken again, so it never holds a refresh token the renewal just spent.
+    the copy is taken again, so it never holds a refresh token the renewal just spent. The copy
+    is shared by every home and login, so it is merged: an entry the file no longer holds stays
+    in the copy, and each entry the file does hold replaces the copy's.
+  - Only the file store is guarded (BASECAMP_NO_KEYRING set, or `auth status` reporting
+    "storage": "file"). A login kept in the system keyring is only renewed: the file does not
+    hold it, so its absence there is no loss and no failure.
   - If after the renewal the profile is missing (the CLI deletes a login whose refresh is
     refused, and a store it could not read is saved back as `{}`), the missing entries are
     restored from the copy, and one line says so. Only the profile's own entry is put back
@@ -161,9 +166,15 @@ class Login:
             return {"ok": False, "error": type(e).__name__}
         return out if isinstance(out, dict) else {"ok": False, "error": "not a JSON object"}
 
-    def due(self):
-        """Whether the token needs renewing: it expires within RENEW_BEFORE, by its own expires_at (renew when unknown)."""
-        st = self.auth("status")
+    def file_store(self, st):
+        """Whether the CLI keeps this login in credentials.json: BASECAMP_NO_KEYRING is set (the CLI then uses the file
+        without probing the keyring), or `auth status` (`st`) says so. A keyring login is not guarded: the file does
+        not hold it, so a missing entry there is no loss."""
+        return bool(os.environ.get("BASECAMP_NO_KEYRING")) or (st.get("data") or {}).get("storage") == "file"
+
+    def due(self, st):
+        """Whether the token needs renewing, from `auth status` (`st`): it expires within RENEW_BEFORE, by its own
+        expires_at (renew when unknown)."""
         data = st.get("data") or {}
         if st.get("ok") and data.get("authenticated") is False:
             return False  # nothing stored to renew; the check after says what is missing
@@ -198,49 +209,60 @@ class Login:
         if self.state().get("offline"):
             self.t.log("network: Basecamp can be reached again; the sync runs")
             self.note(offline=None)
-        before = self.read_store()
-        if self.holds(before):
-            self.keep(before)
+        st = self.auth("status")
+        guard = self.file_store(st)
+        if guard:
+            self.keep()
         renewed = None
-        if self.due():
+        if self.due(st):
             out = self.auth("refresh")
             renewed = bool(out.get("ok"))
-            self.flush(self.creds)
-        after = self.read_store()
-        if not self.holds(after):
+            if guard:
+                self.flush(self.creds)
+        if guard and not self.holds(self.read_store()):
             if self.restore():
                 return 0
             return self.failed("the stored login is missing and no backup copy can be restored")
         if renewed is False:
             return self.failed("basecamp auth refresh did not succeed")
-        if renewed:
-            self.keep(after)
+        if renewed and guard:
+            self.keep()
             self.forget_restored()
         if self.state().get("failed"):
             self.t.log("login: renewal works again")
             self.note(failed=None)
         return 0
 
-    def keep(self, store):
-        """Back up `store` (credentials.json, read when it still held the profile) beside it, mode 0600."""
+    def keep(self):
+        """Back up credentials.json beside it (mode 0600) while it holds this profile. The backup is shared by every
+        home and login, so it is merged, not replaced: an entry the file no longer holds (another profile already
+        lost) stays in the backup, and every entry the file holds replaces the backup's. Read and written under the
+        CLI's store lock, so neither a CLI write nor another home's backup lands part-way through."""
         try:
-            self.write(self.backup, store)
+            with self.cli_lock("store.lock"):
+                now = self.read(self.creds)
+                if not self.holds(now):
+                    return
+                self.write(self.backup, {**(self.read(self.backup) or {}), **now})
         except OSError as e:
             self.t.log(f"login: could not back up {self.creds}: {type(e).__name__}")
 
     def restore(self):
-        """Put the missing login back from the backup, once per backup copy; True when it was put back."""
-        backup = self.read(self.backup)
-        if not self.holds(backup):
-            return False
-        mark = fingerprint(backup.get(self.key) if self.key else backup)
-        done = self.read(self.restored) or {}
-        if done.get(self.key or "") == mark:
-            return False  # restored once already and lost again: renewing it again would only be refused again
+        """Put the missing login back from the backup, once per backup copy; True when it was put back.
+
+        The whole read-check-write (the file, the backup, and the marks of what was restored) runs under the CLI's
+        key and store locks, so two homes restoring at once neither both restore nor drop each other's mark."""
         with self.cli_lock(self.key_lock_name()), self.cli_lock("store.lock"):
             now = self.read(self.creds)
             if self.holds(now):
                 return True  # something else put it back meanwhile
+            backup = self.read(self.backup)
+            if not self.holds(backup):
+                return False
+            mark = fingerprint(backup.get(self.key) if self.key else backup)
+            done = self.read(self.restored) or {}
+            if done.get(self.key or "") == mark:
+                return False  # restored once already and lost again: renewing it again would only be refused again
             if now:  # other logins are still there (only a profile's own can be missing from a non-empty file)
                 merged = {**now, self.key: backup[self.key]}
                 what = f"{self.key} was missing; put it back"
@@ -248,16 +270,17 @@ class Login:
                 merged = backup
                 what = f"the file was emptied; put back {', '.join(sorted(backup))}"
             self.write(self.creds, merged)
-        self.write(self.restored, {**done, (self.key or ""): mark})
+            self.write(self.restored, {**done, (self.key or ""): mark})
         self.t.log(f"login: restored {self.creds} from the copy kept before the renewal ({what})")
         return True
 
     def forget_restored(self):
         """A renewal worked, so the login is live again: a later loss may be restored once more."""
-        done = self.read(self.restored)
-        if done and (self.key or "") in done:
-            done.pop(self.key or "")
-            self.write(self.restored, done)
+        with self.cli_lock("store.lock"):
+            done = self.read(self.restored)
+            if done and (self.key or "") in done:
+                done.pop(self.key or "")
+                self.write(self.restored, done)
 
     def failed(self, why):
         """Log the FAILED line once per cause (and hourly while it lasts), not on every run; the sync still runs."""

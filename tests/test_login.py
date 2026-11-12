@@ -46,21 +46,26 @@ class Home:
 class Auth:
     """`basecamp auth status|refresh`; `on_refresh(store)` returns the file the refresh leaves (None: deleted)."""
 
-    def __init__(self, creds, expires_in=600, on_refresh=None, ok=True):
+    def __init__(self, creds, expires_in=600, on_refresh=None, ok=True, profile="firstmate", keyring=False):
         self.creds, self.expires_in, self.on_refresh, self.ok, self.calls = creds, expires_in, on_refresh, ok, []
+        self.key, self.keyring = f"profile:{profile}", keyring  # keyring: the login is in the keyring, not the file
 
     def __call__(self, cmd, **kw):
         assert cmd[:2] == ["basecamp", "auth"], cmd
         self.calls.append(cmd[2])
         store = load(self.creds, {})
+        held = self.keyring or self.key in store
         if cmd[2] == "status":
-            if "profile:firstmate" not in store:
+            if not held:
                 out = {"ok": True, "data": {"authenticated": False}}
             else:
                 at = datetime.fromtimestamp(NOW + self.expires_in, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                out = {"ok": True, "data": {"authenticated": True, "expires_at": at}}
+                out = {"ok": True, "data": {"authenticated": True, "expires_at": at,
+                                            "storage": "keyring" if self.keyring else "file"}}
+        elif cmd[2] == "refresh" and self.keyring:
+            out = {"ok": self.ok}
         elif cmd[2] == "refresh":
-            if "profile:firstmate" not in store:
+            if not held:
                 out = {"ok": False, "error": "no stored credential"}
             else:
                 new = self.on_refresh(store) if self.on_refresh else store
@@ -86,6 +91,9 @@ class GuardTest(unittest.TestCase):
         self.creds = os.path.join(self.cred_dir, "credentials.json")
         self.store({"profile:caleb": CALEB, "profile:firstmate": FM})
         self.home = Home(self.home_dir)
+        env = mock.patch.dict(os.environ, {"BASECAMP_NO_KEYRING": "1"})  # the homes' file store
+        env.start()
+        self.addCleanup(env.stop)
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
@@ -166,6 +174,64 @@ class GuardTest(unittest.TestCase):
         self.assertEqual([ln[:20] for ln in self.home.lines], ["FAILED token refresh"])
         self.guard(Auth(self.creds, on_refresh=rotated)).renew()
         self.assertEqual(self.home.lines[-1], "login: renewal works again")
+
+    def test_the_backup_keeps_another_profiles_entry_the_file_already_lost(self):
+        self.guard(Auth(self.creds, expires_in=3000)).renew()  # backs up both logins
+        self.store({"profile:firstmate": FM})  # caleb's login lost elsewhere; this home backs up again
+        self.guard(Auth(self.creds, expires_in=3000)).renew()
+        backup = load(os.path.join(self.cred_dir, login.BACKUP))
+        self.assertEqual(backup, {"profile:caleb": CALEB, "profile:firstmate": FM})
+        caleb = login.Login(Home(self.home_dir, profile="caleb"), runner=Auth(self.creds, profile="caleb", expires_in=3000),
+                            reach=lambda: True, now=lambda: NOW, cred_dir=self.cred_dir)
+        caleb.renew()  # caleb's home finds its login gone and gets it back from the backup firstmate's home kept
+        self.assertEqual(self.stored(), {"profile:caleb": CALEB, "profile:firstmate": FM})
+
+    def test_restore_marks_are_read_and_written_under_the_cli_locks_and_kept_per_profile(self):
+        self.store({})
+        login.Login(self.home, cred_dir=self.cred_dir).write(os.path.join(self.cred_dir, login.BACKUP),
+                                                             {"profile:caleb": CALEB, "profile:firstmate": FM})
+        held, outside = [], []
+        real_lock, real_read = login.Login.cli_lock, login.Login.read
+
+        def lock(me, name, shared=False):
+            cm = real_lock(me, name, shared)
+
+            class Held:
+                def __enter__(self):
+                    cm.__enter__()
+                    held.append(name)
+
+                def __exit__(self, *a):
+                    held.remove(name)
+                    return cm.__exit__(*a)
+            return Held()
+
+        def read(me, path):
+            if path.endswith(login.RESTORED) and "store.lock" not in held:
+                outside.append(path)
+            return real_read(me, path)
+
+        with mock.patch.object(login.Login, "cli_lock", lock), mock.patch.object(login.Login, "read", read):
+            self.guard(Auth(self.creds, expires_in=3000)).renew()  # the file was emptied: both put back, firstmate's mark
+            self.store({"profile:firstmate": FM})
+            caleb = login.Login(Home(self.home_dir, profile="caleb"), runner=Auth(self.creds, profile="caleb", expires_in=3000),
+                                reach=lambda: True, now=lambda: NOW, cred_dir=self.cred_dir)
+            caleb.renew()
+        self.assertEqual(outside, [])
+        marks = load(os.path.join(self.cred_dir, login.RESTORED))
+        self.assertEqual(set(marks), {"profile:firstmate", "profile:caleb"})
+
+    def test_a_keyring_login_is_not_guarded_and_logs_no_false_failure(self):
+        self.store({"profile:caleb": CALEB})  # the file does not hold firstmate: its login is in the keyring
+        with mock.patch.dict(os.environ, {"BASECAMP_NO_KEYRING": ""}):
+            auth = Auth(self.creds, keyring=True)
+            self.assertEqual(self.guard(auth).renew(), 0)
+            self.assertEqual(auth.calls, ["status", "refresh"])
+            self.assertEqual(self.home.lines, [])
+            self.assertFalse(os.path.exists(os.path.join(self.cred_dir, login.BACKUP)))
+            self.assertEqual(self.stored(), {"profile:caleb": CALEB})
+            self.guard(Auth(self.creds, keyring=True, ok=False)).renew()  # a real refusal is still reported
+            self.assertEqual([ln[:20] for ln in self.home.lines], ["FAILED token refresh"])
 
     def test_sync_renew_exits_offline_so_run_sh_skips_the_run(self):
         cfg = os.path.join(self.home_dir, "config.json")
