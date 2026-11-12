@@ -37,7 +37,7 @@ Deterministic, no model calls. Safety bounds, enforced here:
     with "timesheet" on, timesheet entries go only on the to-dos and cards the agent
     names with `sync.py timesheet start` (or tracks under the same key);
   - nothing is ever deleted, trashed or archived, except the acting user's own 👀
-    boost once a question is answered; the timer run posts no comment, and its only
+    boost once a question is answered (`reply`) or found not to be for the agent (`dismiss`); the timer run posts no comment, and its only
     writes besides the card mirror are 👀/👍 acknowledgement boosts, marking the agent
     login's handled notifications read, a Message Board announcement per new GitHub
     release, and, with "session_alert", one chat line to the owner while the firstmate
@@ -55,6 +55,8 @@ the same project (or Pings, account-wide to-do requests or account-wide mentions
 Usage: sync.py --home <home> --config <config.json> [--all] [--dry-run] [--include-prereleases] [--allow-duplicate]
        sync.py status      (the runs recorded on this computer; also bin/basecamp-mate status)
        sync.py reply --home <home> --config <config.json> --recording <comment, chat line or Ping line id> (--body-file <file> | --boost <text>) [--again] [--awaiting] [--dry-run]
+       sync.py dismiss --home <home> --config <config.json> --recording <id> [--reason <text>] [--dry-run]
+       sync.py stats --home <home> --config <config.json> [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--by day|week|month|all] [--transcripts <dir>]... [--no-tokens] [--json]
        sync.py watch --home <home> --config <config.json> --chat <chat URL> [--after-line <line id>] [--until YYYY-MM-DD] [--dry-run]
        sync.py unwatch --home <home> --config <config.json> --chat <chat URL> [--dry-run]
        sync.py ask --home <home> --config <config.json> --body-file <file> [--dry-run]
@@ -400,6 +402,32 @@ def cli(argv=None, runner=subprocess.run):
         return command(a, f"reply {a.recording}", lambda s: s.reply(
             a.recording, None if a.boost is not None else read(a.body_file), again=a.again, boost=a.boost,
             awaiting=a.awaiting), runner)
+    if argv[:1] == ["dismiss"]:
+        ap = common("sync.py dismiss", "Say a relayed item was not for the agent: take the read boost (👀) off it and "
+                                       "record it dismissed in the relay ledger (relay.jsonl).")
+        ap.add_argument("--recording", required=True, type=int,
+                        help="the id its note names (the comment's, line's or boost's: the one `reply --recording` takes)")
+        ap.add_argument("--reason", help="why it was not for the agent, a few words (kept in the ledger)")
+        ap.add_argument("--dry-run", action="store_true")
+        a = ap.parse_args(argv[1:])
+        return command(a, f"dismiss {a.recording}", lambda s: s.dismiss(a.recording, a.reason), runner)
+    if argv[:1] == ["stats"]:
+        import stats
+        ap = common("sync.py stats", "Report the relay ledger: per period, the items relayed to the agent, answered, "
+                                     "dismissed (not for it), still open, and skipped by the relay filter, with the "
+                                     "noise rate, its sources by kind and why, and the tokens spent (local files only).")
+        ap.add_argument("--since", type=stats.parse_day, help="the first day, YYYY-MM-DD (UTC)")
+        ap.add_argument("--until", type=stats.parse_day, help="the last day, YYYY-MM-DD (UTC)")
+        ap.add_argument("--by", choices=stats.PERIODS, default="week", help="the period (default: week, from Monday)")
+        ap.add_argument("--transcripts", action="append", default=[],
+                        help="a directory of the agent's Claude Code transcripts (repeatable; default: the sessions run "
+                             "in --home, under CLAUDE_CONFIG_DIR or ~/.claude)")
+        ap.add_argument("--no-tokens", action="store_true", help="skip reading the transcripts")
+        ap.add_argument("--json", action="store_true")
+        a = ap.parse_args(argv[1:])
+        r = stats.report(Sync(a.home, a.config, runner=runner), a.since, a.until, a.by, a.transcripts, not a.no_tokens)
+        print(json.dumps(r, indent=1, sort_keys=True) if a.json else stats.render(r))
+        return 0
     if argv[:1] in (["watch"], ["unwatch"]):
         what = argv[0]
         ap = common(f"sync.py {what}", "Watch one chat in any project of the account: relay the listened-to people's lines "

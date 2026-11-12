@@ -20,8 +20,12 @@ A tool does one explicit thing to the configured account and project, through th
     anyone else who addresses the acting login is dropped, with one automatic reply
     when "blocked" is on (`block`);
   - commands post exactly what the agent hands them: `reply`, `ask`, `answer`,
-    `todo create|track|comment|complete`, `post-message`; `unmonitored handle|forget`
+    `todo create|track|comment|complete`, `post-message`; `dismiss` takes the read
+    boost off an item that was not for the agent; `unmonitored handle|forget`
     only edit local state;
+  - the relay ledger (relay.jsonl, local only): one line per item recorded for the agent,
+    per item the relay filter skipped, and per outcome (answered, dismissed), which
+    `sync.py stats` (stats.py) reads;
   - primitives the behaviors compose: card create/update/move/assign/unassign, a
     Message Board post, acknowledgement boosts.
 
@@ -42,6 +46,11 @@ THUMBS, EYES = "\U0001F44D", "\U0001F440"
 BOOST_MAX = 16  # the most characters a Basecamp boost holds
 AWAIT_DAYS = 7  # how long `reply --awaiting` waits for an answer on a followed thread
 AUTHORITY = ("captain", "operator")  # the roles whose word authorizes the agent: a decision or an approval
+RELAY = "relay.jsonl"  # the relay ledger beside the config: relayed, skipped, answered and dismissed items (never backed up)
+# Why an item of each kind reached the agent, when its record does not say ("why": "awaiting" or "yours" does).
+WHY = {"mention": "addressed", "chat-question": "chat", "ping": "ping", "comment": "card", "question": "card",
+       "approval": "card", "message-comment": "own-message", "todo-comment": "tracked-todo", "boost": "own-recording",
+       "todo-request": "assigned", "card-request": "assigned", "decision-step-done": "tracked-todo"}
 # When a scheduled request is done ("schedule" in the config, schedule.json per list): ask the owner, on its due date, or
 # before it.
 WHEN = ("ask", "due", "before")
@@ -232,12 +241,38 @@ class Tools:
         return when if when is not None else at
 
     def record(self, rec):
-        """Append one pending record for the agent, with its times also in the people's zone ("at_local", ...)."""
+        """Append one pending record for the agent, with its times also in the people's zone ("at_local", ...), and its
+        `relayed` line in the relay ledger."""
         for k in ("at", "created_at"):
             if rec.get(k) and local_time(rec[k], timezone.utc) is not None:
                 rec = {**rec, k + "_local": self.local_time(rec[k])}
         with open(self.path("pending-comments.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
+        from behaviors import inbox_note  # the note's request id names the item; behaviors imports this module
+        self.ledger("relayed", **relay_fields(rec), item=inbox_note(rec, self.account, self.project)[0])
+
+    def ledger(self, event, **fields):
+        """Append one `event` line ("relayed", "skipped", "answered" or "dismissed") to the relay ledger (RELAY), stamped
+        with now and the agent it is for (this home and login). Local only: never sent anywhere. A dry run writes nothing,
+        and a failed write is logged, never raised: the ledger only measures the relay."""
+        if self.dry:
+            return
+        agent = {"home": self.home, "profile": self.profile}
+        if isinstance(self._acting, int):
+            agent["id"] = self._acting
+        line = {"event": event, "at": now_iso(), **{k: v for k, v in fields.items() if v is not None}, "agent": agent}
+        try:
+            with open(self.path(RELAY), "a") as f:
+                f.write(json.dumps(line, sort_keys=True) + "\n")
+        except OSError as e:
+            self.log(f"relay ledger: {event} not written: {type(e).__name__}: {e}")
+
+    def skipped(self, msg, kind, recording, reason, bucket=None, text=None, url=None, person=None, **more):
+        """Log `msg` (the relay filter's one "skipped" line) and add the item's `skipped` line to the relay ledger."""
+        self.log(msg)
+        person = person or {}
+        self.ledger("skipped", kind=kind, recording=recording, reason=reason, bucket=None if bucket is None else int(bucket),
+                    text=text, url=url, author={"id": person.get("id"), "name": person.get("name")}, **more)
 
     def bc(self, *args, input=None, project=None, tries=3):
         """Run the basecamp CLI on the configured project, or on `project` (another bucket of the account) when given;
@@ -557,7 +592,8 @@ class Tools:
                     self.log(f"{surface} {rid}: boost {bid} is the answer awaited there; the mark is cleared")
                 elif not emoji and emoji_only(b.get("content")):
                     who = (b.get("booster") or {}).get("name") or (b.get("booster") or {}).get("id")
-                    self.log(f"skipped boost {bid} by {who} on {surface} {rid}: emoji only")
+                    self.skipped(f"skipped boost {bid} by {who} on {surface} {rid}: emoji only", "boost", bid, "emoji only",
+                                 bucket=bucket, text=plain(b.get("content")), url=url, person=b.get("booster"), surface=surface, on=rid)
                     continue
                 self.record({"kind": "boost", "surface": surface, **context, "recording": rid, "boost": bid,
                              **({"why": "awaiting"} if answer else {}),
@@ -626,7 +662,9 @@ class Tools:
             if others is True or others == "worded" and not emoji_only(b.get("content")):
                 return b
             who = (b.get("booster") or {}).get("name") or (b.get("booster") or {}).get("id")
-            self.log(f"skipped boost {b.get('id')} by {who} on {rid}: not on the agent's own recording")
+            self.skipped(f"skipped boost {b.get('id')} by {who} on {rid}: not on the agent's own recording", "boost",
+                         b.get("id"), "not on the agent's own recording", bucket=bucket, text=plain(b.get("content")),
+                         person=b.get("booster"), on=rid)
             return None
         if feed is None or recent(b.get("created_at")):
             return "retry"
@@ -1319,8 +1357,10 @@ class Tools:
                 if rec.get("group") and not (self.addressed(ln.get("content"))
                                              or (prev and (prev.get("creator") or {}).get("id") == me)):
                     if self.hears(who, bucket=bucket):
-                        self.log(f"{'dry ' if self.dry else ''}skipped line {lid} by {who.get('name') or who.get('id')} "
-                                 f"in group Ping {chat}: no @mention of the agent, not after its line")
+                        self.skipped(f"{'dry ' if self.dry else ''}skipped line {lid} by {who.get('name') or who.get('id')} "
+                                     f"in group Ping {chat}: no @mention of the agent, not after its line", "ping", lid,
+                                     "group Ping: no @mention of the agent, not after its line", bucket=bucket,
+                                     text=plain(ln.get("content")), url=ln.get("app_url"), person=who)
                     continue
                 if not self.hears(who, bucket=bucket):
                     self.block(who, bucket, chat, lid, ln.get("created_at"), chat=True, what="Ping line")
@@ -1863,9 +1903,11 @@ class Tools:
                 why_not = ("no answer awaited" if mark is None else
                            "posted after the answer awaited there was due" if history(mark.get("until"), c.get("created_at"), slack=0)
                            else "posted before the agent's reply that awaits an answer")
-                self.log(f"{'dry ' if self.dry else ''}skipped comment {cid} by {who} on "
-                         f"{rec.get('parent_type') or 'thread'} {thread}: no @mention or reply to the agent, {why_not}, "
-                         "not the agent's own thread")
+                self.skipped(f"{'dry ' if self.dry else ''}skipped comment {cid} by {who} on "
+                             f"{rec.get('parent_type') or 'thread'} {thread}: no @mention or reply to the agent, {why_not}, "
+                             "not the agent's own thread", "thread-comment", cid, why_not, bucket=bucket,
+                             text=plain(c.get("content")), url=c.get("app_url"), person=c.get("creator"),
+                             title=rec.get("title"))
                 continue
             text = plain(c.get("content"))
             on = c.get("parent") or {}
@@ -2161,20 +2203,78 @@ class Tools:
         if boost is None:
             post()
             self.log(f"reply {rid}: posted {where}")
+            self.ledger("answered", recording=rid, via="reply")
         else:
             answer = self.boost(self.acting_id(), rid, boost, bucket)
             self.log(f"reply {rid}: boosted {boost!r} ({where})")
+            self.ledger("answered", recording=rid, via="reply --boost")
             return answer
 
-    def remove_eyes(self, rid, bucket=None, answer=None):
+    def remove_eyes(self, rid, bucket=None, answer=None, what="reply"):
         """Take the acting user's read acknowledgement (👀, or the config's "acknowledge" "read") off `rid`, except the
-        boost with id `answer`, the one that answered `rid`."""
+        boost with id `answer`, the one that answered `rid`; `what` (the command) starts each log line."""
         emoji = self.read_ack()
         for b in self.boosts_by(self.acting_id(), rid, emoji, bucket):
             if answer is not None and b.get("id") == answer:
                 continue
             self.bc("api", "delete", f"/buckets/{bucket or self.project}/boosts/{b.get('id')}.json")
-            self.log(f"reply {rid}: removed {emoji} boost {b.get('id')}")
+            self.log(f"{what} {rid}: removed {emoji} boost {b.get('id')}")
+
+    def relayed_item(self, rid):
+        """The relay ledger's last `relayed` line for recording `rid` (see item_recording); else one made from the last
+        pending record about it (an item relayed before the ledger began, "from": "pending"); else None."""
+        hit = None
+        for ev in read_ledger(self.path(RELAY)):
+            if ev.get("event") == "relayed" and str(ev.get("recording")) == str(rid):
+                hit = ev
+        if hit is not None:
+            return hit
+        for ln in self.pending_lines():
+            try:
+                rec = json.loads(ln)
+            except ValueError:
+                continue
+            if str(item_recording(rec)) == str(rid):
+                hit = {**relay_fields(rec), "from": "pending"}
+        return hit
+
+    def dismiss(self, rid, reason=None):
+        """Mark relayed item `rid` (the comment, line, boost or to-do id its note names) as not for the agent: take the
+        acting user's read boost off it, as `reply` would, and add a `dismissed` line to the relay ledger.
+
+        The item is found by the id stored when it was recorded (relayed_item), never by its text; one never recorded
+        is refused (raised). An item already answered (`reply`) is left as it is, logged. A boost, an approval and
+        the items that are not Basecamp recordings carry no read boost, so only the outcome is recorded. A not_found
+        while taking the boost off is about that recording only (deleted, or out of this login's reach): logged, and
+        the dismissal is still recorded. Refused like `reply` without a profile that is not the owner's; a dry run
+        logs only.
+        """
+        item = self.relayed_item(rid)
+        if item is None:
+            raise RuntimeError(f"no relayed item has recording {rid} (relay.jsonl, pending-comments.jsonl)")
+        outcomes = {ev.get("event") for ev in read_ledger(self.path(RELAY))
+                    if ev.get("event") in ("answered", "dismissed") and str(ev.get("recording")) == str(rid)}
+        if "answered" in outcomes:
+            self.log(f"dismiss {rid}: already answered with reply, not dismissing it")
+            return False
+        if self.refused(f"dismiss {rid}"):
+            return False
+        acked = item.get("kind") not in ("boost", "approval") and item.get("recording") is not None
+        bucket = item.get("bucket")
+        if self.dry:
+            self.log(f"dry dismiss {rid}: " + (f"remove {self.read_ack()}, then " if acked else "") + "record it dismissed")
+            return False
+        if acked:
+            try:
+                self.remove_eyes(rid, bucket, what="dismiss")
+            except BasecampError as e:
+                if e.code != "not_found":
+                    raise
+                self.log(f"dismiss {rid}: the recording was not found, so no boost was removed: {e}")
+        if "dismissed" not in outcomes:
+            self.ledger("dismissed", recording=rid, kind=item.get("kind"), reason=reason)
+        self.log(f"dismiss {rid}: {item.get('kind')} recorded as not for the agent" + (f" ({reason})" if reason else ""))
+        return True
 
     def acknowledge_decided(self, key):
         """With "acknowledge" "decided" set, boost each deciding comment on tracked `key` (the captain's or an operator's
@@ -2484,6 +2584,7 @@ class Tools:
             return False
         c = self.bc("comments", "create", str(rec["todo"]), "-", input=text, project=rec.get("bucket")) or {}
         self.log(f"todo comment {key}: comment {c.get('id')} on todo {rec['todo']}")
+        self.ledger("answered", key=key, via="todo comment")
         return True
 
     def todo_complete(self, ref):
@@ -2520,6 +2621,7 @@ class Tools:
             state[key]["completed"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             self.save_json("todos.json", state)
         self.log(f"todo complete {key}: completed todo {rec['todo']}")
+        self.ledger("answered", key=key, via="todo complete")
         self.acknowledge_decided(key)
         return True
 
@@ -2549,6 +2651,7 @@ class Tools:
             self.save_json("todos.json", state)
         left = sum(not q["done"] for q in subtasks)
         self.log(f"todo subtask {key} {number}: done, {left} left on todo {rec['todo']}")
+        self.ledger("answered", key=key, via="todo subtask")
         if not left and not rec.get("request"):
             self.todo_complete(key)
         else:
@@ -2839,6 +2942,49 @@ def claude_transcript_dirs(workdir):
     root = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "projects")
     paths = dict.fromkeys((os.path.abspath(workdir), os.path.realpath(workdir)))
     return [os.path.join(root, re.sub(r"[^A-Za-z0-9]", "-", p)) for p in paths]
+
+
+def read_ledger(path):
+    """The relay ledger's lines at `path` as dicts, oldest first; none when it does not exist, a line that is not JSON
+    skipped."""
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return []
+    out = []
+    for ln in lines:
+        try:
+            ev = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(ev, dict):
+            out.append(ev)
+    return out
+
+
+def item_recording(rec):
+    """The id of the recording a pending record is about, as `reply --recording` and `dismiss --recording` take it: the
+    comment or line (it holds the read boost), the boost, or the to-do or card of a request; None for the rest."""
+    kind = rec.get("kind") or "comment"
+    if kind in ("chat-question", "ping"):
+        return rec.get("line")
+    if kind in ("boost", "approval"):
+        return rec.get("boost")
+    if kind.startswith(("todo-request", "card-request")):
+        return rec.get("todo")
+    return rec.get("comment")
+
+
+def relay_fields(rec):
+    """A pending record's fields in its `relayed` ledger line: enough to tell the item and rebuild what the agent saw."""
+    kind = rec.get("kind") or "comment"
+    base = "todo-request" if kind.startswith("card-request") else kind
+    project = rec.get("project") or {}
+    return {"kind": kind, "why": rec.get("why") or WHY.get(base, base), "recording": item_recording(rec),
+            "key": rec.get("key"), "surface": rec.get("surface"),
+            "bucket": rec.get("bucket") or project.get("id"), "url": rec.get("url"), "title": rec.get("title"),
+            "text": rec.get("text"), "author": rec.get("author"), "role": rec.get("role"), "created_at": rec.get("at")}
 
 
 def watch_until(until):
