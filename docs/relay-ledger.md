@@ -13,7 +13,8 @@ else sends it anywhere.
   boost, or the to-do of a request), `key`, `surface`, `bucket`, `url`, `title`, `text` (what
   the agent saw), `author`, `role` and `created_at` (Basecamp's time).
 - `skipped`: an item the relay filter dropped: a comment on a followed thread with no
-  @mention or answer awaited, a group Ping line not addressed to the agent, an emoji-only
+  @mention or answer awaited, a comment on the card of a card step request that does not
+  concern the agent, a group Ping line not addressed to the agent, an emoji-only
   boost there and a boost on someone else's recording. Each keeps its one "skipped" line in
   `sync.log`; the ledger adds its `kind`, `recording`, `reason`, `bucket`, `text`, `url` and
   `author`. People the sync does not listen to are blocked before the filter and are not

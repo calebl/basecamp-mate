@@ -24,7 +24,11 @@ def card(id, by=CAPTAIN, to=(ACTING,), title="Address security issues", content=
 
 
 class CardStub(AssignStub):
-    """Adds cards: listed in /my/assignments.json as "card", refetched by id, and completed with `basecamp cards done`."""
+    """Adds cards: listed in /my/assignments.json as "card", refetched by id, and completed with `basecamp cards done`.
+
+    Like Basecamp, the listing has each entry's own "assignees", and also lists a card that is not assigned to the
+    acting user but holds a step that is ("steps": its step ids for the acting user), with those steps as "children".
+    """
 
     def __init__(self):
         super().__init__()
@@ -39,9 +43,14 @@ class CardStub(AssignStub):
                 out = super().__call__(cmd, **kw)
                 data = json.loads(out.stdout)["data"]
                 data["non_priorities"] += [{"id": c["id"], "type": "card", "content": c["title"], "completed": False,
-                                            "bucket": {"id": c["bucket"]["id"]}}
+                                            "bucket": {"id": c["bucket"]["id"]}, "assignees": c["assignees"],
+                                            "children": [{"id": s, "type": "step", "completed": False,
+                                                          "assignees": [{"id": self.me}],
+                                                          "bucket": {"id": c["bucket"]["id"]}, "parent": {"id": c["id"]}}
+                                                         for s in c.get("steps", [])]}
                                            for c in self.cards.values()
-                                           if not c["completed"] and self.me in [a["id"] for a in c["assignees"]]]
+                                           if not c["completed"] and (self.me in [a["id"] for a in c["assignees"]]
+                                                                      or c.get("steps"))]
                 return ok(data)
             if core[:2] == ["api", "get"] and "/card_tables/cards/" in core[2]:
                 self.calls.append(core)
@@ -112,6 +121,17 @@ class Sweep(CardBase):
             json.dump({"engine/t1": {"card": 42}}, f)
         self.poll()
         self.assertEqual(self.pending(), [])
+
+    def test_a_card_listed_only_for_the_agents_step_is_never_fetched_nor_counted_against_the_limit(self):
+        self.cfg(assigned_cards={"limit": 1})
+        self.add_card(dict(card(41, to=(STRANGER,)), steps=[4101]))  # someone else's card, holding the agent's step
+        self.add_card(card(42))
+        self.poll()
+        self.poll()
+        self.assertEqual([(r["kind"], r["todo"]) for r in self.pending()], [("card-request", 42)])
+        fetched = [c[2] for c in self.stub.calls if c[:2] == ["api", "get"] and "/card_tables/cards/" in c[2]]
+        self.assertNotIn(f"/buckets/{PROJECT}/card_tables/cards/41.json", fetched)
+        self.assertNotIn("request-41", self.todos())
 
     def test_assigned_todos_alone_leaves_cards_alone(self):
         self.cfg(assigned_todos={}, assigned_cards=False)

@@ -28,10 +28,53 @@ tracked in `todos.json` with `"type": "card"`), then `card-request-update` and
 `card-request-closed`, and its comments and boosts as `todo-comment` and `boost` records
 with `"request": true` and `"type": "card"`. Basecamp raises an `Event` notification on the
 card when it is assigned, which the notification reader takes as the signal to read it; the
-5-minute sweep of `/my/assignments.json` is the repair sweep. `sync.py reply`, `todo comment`,
+5-minute sweep of `/my/assignments.json` is the repair sweep. That listing also has a card
+assigned to someone else when one of its steps is assigned to the agent; the sweep skips any
+card entry whose own `assignees` leave out the agent's login, so such a card is never fetched
+nor counted against `limit`. `sync.py reply`, `todo comment`,
 `todo show` and `todo complete` work on it; `todo complete` completes the card, which
 Basecamp shows by moving it to its table's Done column. A card the card mirror made from the
 backlog (in `map.json`) is never a request, and `assigned_todos` is unchanged by it.
+
+**Card steps.** With `"assigned_steps": {}` (`init --assigned-steps`; off by default, the
+same `limit` and `scope` as `assigned_todos`), a card step (one of a card's checklist items,
+a `Kanban::Step`) a listened-to person assigns to the agent's login is a request: a
+`step-request` record (key `request-<step id>`, tracked in `todos.json` with `"type":
+"step"` and the `card` it is on), acknowledged with a 👀 on the step, then
+`step-request-update` (its text or due date changed) and `step-request-closed` (`reason`
+`completed`, `unassigned` or `trashed`). Every record of it carries `card`: the `id`,
+`title` and `url` of the card the step is on. Basecamp lists a step in `/my/assignments.json`
+only inside its card's entry, as one of its `children` of type `"step"` (the card itself is
+listed there whoever it is assigned to); the 5-minute sweep reads it from there, and the
+step's own notifications (`Assignment`, the `Event` of a step added already assigned, and
+`Completion`), which subscribe to the step and link to its card, run the reader within
+about 30 seconds. The step is read at `/buckets/<project>/card_tables/steps/<id>.json`, and
+its events (`/buckets/<project>/recordings/<id>/events.json`) say when it was assigned to the
+agent and by whom: the latest `assignment_changed` event that adds the agent's login. When
+the sweep finds the step, without a notification naming who assigned it, that event's creator
+did. Someone not listened to who assigns one gets the automatic reply on its card.
+
+A step has no comments of its own, and its card is someone else's, so of the card's
+comments only those that concern the agent are part of the request, as `todo-comment`
+records with `"request": true`, `"type": "step"` and a `why`: one that @mentions the agent
+or is a Basecamp Reply to its comment (`addressed`; a Reply has no @mention in its text, so
+the mention notification that names it decides, even after the sweep skipped it), and the
+first comment from someone listened to after the agent's own comment on the card
+(`awaiting`); a Reply read late, behind a newer comment of the agent's, leaves that comment
+awaiting its answer. Comments made on the card up to the step's assignment (that event's
+time, else the step's making) are never relayed, while one made after it counts even when
+the sweep finds the step later. Every other comment is skipped (a `skipped comment` line in
+`sync.log` and the relay ledger). With several of the agent's steps open on one card, the one
+with the smallest key reads its comments, so each is relayed once, under that key; when it
+closes, the next takes over what it relayed (and the boosts on those comments) and goes on
+from where it stopped. A step that never read the card hands nothing over. A worded boost on the step, or any boost on one of those comments or the agent's
+own comment there, is a `boost` record of the request. While another reader that is on reads
+that card (the card mirror, for a card made from the backlog; an open card request with
+`assigned_cards` on; a decision card with `todos`), its comments are left to that reader. `sync.py todo comment --todo request-<id>` comments on the card, `sync.py reply`
+answers one of its comments there, `todo show` reads the step, and `sync.py todo complete`
+checks the step off (`basecamp subtasks complete`), leaving the card as it is. Every record
+and outcome goes through the relay ledger, so `sync.py stats` counts step requests like any
+other.
 
 **Scheduled to-dos.** A request with a due date is scheduled: every request record carries
 `due_on` (null when undated), and the agent does the work on that date, not before when

@@ -13,7 +13,7 @@ config turns on, each composed from tools: the card mirror (`tables`, `repos`; o
 check-in answering (`checkins`), release announcements (`releases`), decision to-dos
 (`todos`), reports (`message_board`), Pings (`pings`: the owner's direct messages to the
 agent's login, outside the project), to-do requests (`assigned_todos`: to-dos the owner
-assigns to the agent's login, in the project or, with `"scope": "account"`, anywhere in the account), card requests (`assigned_cards`: cards the owner assigns to the agent's login, handled the same way), inbox delivery (`inbox`), the session alert (`session_alert`: one chat line
+assigns to the agent's login, in the project or, with `"scope": "account"`, anywhere in the account), card requests (`assigned_cards`: cards the owner assigns to the agent's login, handled the same way), card step requests (`assigned_steps`: a card's checklist items assigned to the agent's login), inbox delivery (`inbox`), the session alert (`session_alert`: one chat line
 to the owner while no firstmate session holds the home's lock and inbox notes wait, as after a reboot) and notifications (on
 with a `profile`: every run reads the agent login's Basecamp notifications and boosts and
 runs the reader for each thread that changed, so the captain's input arrives within about
@@ -205,6 +205,19 @@ arrives once as a `card-request` (key `request-<card id>`), its edits and closin
 to the table's Done column. Cards the card mirror makes from the backlog are never
 requests.
 
+**Card steps assigned to you** (`"assigned_steps": {}`, `init --assigned-steps`; off by
+default; the same `limit` and `scope` as `assigned_todos`): a card step (one of a card's
+checklist items) a listened-to person assigns to this home's login is a request handled
+like a to-do request. It arrives once as a `step-request` (key `request-<step id>`) with
+the `card` it is on (`id`, `title`, `url`), its edits and closing as
+`step-request-update` and `step-request-closed` (`reason` completed, unassigned, trashed).
+Only the step is yours: the card is someone else's, so of its comments only those for you
+arrive, as `todo-comment` records with `request: true` and `type: "step"`: one that
+@mentions or Replies to you (`why` `addressed`) and the first after your own comment there
+(`why` `awaiting`); the rest are skipped. `sync.py todo comment --todo <key>` comments on
+the card, `sync.py reply` answers a comment there, and `sync.py todo complete --todo <key>`
+checks the step off, leaving the card as it is.
+
 ## One home per project and login
 
 Two homes on this computer that watch the same project, the same login's Pings, or its
@@ -290,6 +303,8 @@ that read.
   `follows`), an edit to it (its text or its schedule), or its closing; see "To-do requests".
 - `card-request`, `card-request-update`, `card-request-closed`: the same for a card assigned
   to this home's login (`assigned_cards`); see "Cards assigned to you".
+- `step-request`, `step-request-update`, `step-request-closed`: the same for a card step
+  assigned to this home's login (`assigned_steps`); see "Card steps assigned to you".
 - `message-comment`: the captain commented on a Message Board post this home made (a
   report); it is feedback or an instruction on it. Act on it (relaying first outside the
   main firstmate's home), then answer with `sync.py reply --recording <comment id>`.

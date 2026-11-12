@@ -73,6 +73,8 @@ replaced the event listener); a config that differs from the discovered one only
 `"assigned_todos": {"scope": "account"}` instead: one in any project of the account is (only
 in the main home; see [To-do requests](todo-requests.md)). `--assigned-cards` adds `"assigned_cards": {}`: a
 card the owner assigns to the `--login` in the project is a request (see [To-do requests](todo-requests.md)).
+`--assigned-steps` adds `"assigned_steps": {}`: a card step the owner assigns to the
+`--login` in the project is a request (see [To-do requests](todo-requests.md)).
 `--mentions-anywhere` adds `"mentions": {"scope": "account"}`: the owner's @mentions of the
 `--login`, and comments on threads it follows, in any project of the account are relayed
 (only in the main home; see [Notifications](notifications.md)).

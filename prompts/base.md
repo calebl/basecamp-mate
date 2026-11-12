@@ -129,6 +129,10 @@ sync relays is measured (`sync.py stats`). By `kind`:
   date or repetition) or closed (`reason`).
 - `card-request`, `card-request-update`, `card-request-closed`: the same for a card assigned
   to you.
+- `step-request`, `step-request-update`, `step-request-closed`: the same for a card step (a
+  card's checklist item) assigned to you, with the `card` it is on (`id`, `title`, `url`).
+  Only the step is yours; `todo comment` comments on the card, and `todo complete` checks
+  the step off.
 - `chat-question`: a line the captain posted in chat. With `every_line` on, that is every line, not
   only questions; with `mention: true` it @mentions you (or replies to your line) in a chat
   you otherwise do not relay. A chat you watch (`sync.py watch`) relays every line, and a

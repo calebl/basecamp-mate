@@ -54,6 +54,9 @@ def watches(cfg):
     opts = cfg.get("assigned_cards")
     if isinstance(opts, dict) and opts.get("scope") == "account":
         out.append(f"card-requests {account}")
+    opts = cfg.get("assigned_steps")
+    if isinstance(opts, dict) and opts.get("scope") == "account":
+        out.append(f"step-requests {account}")
     opts = cfg.get("mentions")
     if isinstance(opts, dict) and opts.get("scope") == "account":
         out.append(f"mentions {account}")
