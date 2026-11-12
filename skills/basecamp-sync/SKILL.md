@@ -17,7 +17,8 @@ assigns to the agent's login, in the project or, with `"scope": "account"`, anyw
 to the owner while no firstmate session holds the home's lock and inbox notes wait, as after a reboot) and notifications (on
 with a `profile`: every run reads the agent login's Basecamp notifications and boosts and
 runs the reader for each thread that changed, so the captain's input arrives within about
-half a minute; it relays their comments and @mentions on anything the login follows, marks
+half a minute; it relays their @mentions and Replies to the login on anything it follows, and
+other comments there only after its `reply --awaiting`, marks
 handled notifications read, and records an `unmonitored` record when the captain does
 something nothing monitors). The other readers run as an hourly (to-do requests: 5-minute)
 repair sweep. `"listen"` and `sync.py listen`, the retired event listener, are ignored;
@@ -262,11 +263,22 @@ that read.
 - `ping`: a line the captain wrote to this home's login in a Ping (a direct message, in a
   bucket of its own). Treat it like a `chat-question` from an `every_line` chat, and answer
   in the Ping with `sync.py reply --recording <line id>`; never with the `basecamp` CLI.
+  In a group Ping (three or more people) only a line that @mentions you or directly
+  follows your own line arrives; the rest is skipped. A line of
+  uploads right after the person's relayed line comes as that record's `attachments`.
 - `mention`, `thread-comment`: the captain @mentioned this home's login in, or commented
   on, something it follows that nothing else tracks (a card whose task left the backlog, a
-  document, someone else's to-do). A mention is addressed to you; a thread comment is said
-  to you. Handle it like a card `comment` (relay outside the main firstmate's home), and
-  answer there with `sync.py reply --recording <comment id>`. With `"mentions": {"scope":
+  document, someone else's to-do). A mention (an @mention, or a Basecamp Reply to your
+  comment) is addressed to you; attachment-only comments right after it come as its
+  `attachments`. A comment that only names you, with no @mention or Reply, does not arrive.
+  A thread comment arrives only on a thread you made (`why` `yours`) or as the first
+  comment after your `reply --awaiting` there (`why` `awaiting`: the answer to your
+  question); every other comment on a followed thread is skipped, with a `skipped comment`
+  line in `sync.log`. Handle it like a card `comment` (relay outside the main firstmate's
+  home), and answer there with `sync.py reply --recording <comment id>`.
+  When your reply on a followed thread asks something and the answer may come without an
+  @mention, add `--awaiting`: the next comment there from anyone listened to within 7 days
+  reaches you once. Without it, a plain answer on someone else's thread is skipped. With `"mentions": {"scope":
   "account"}` (`init --mentions-anywhere`, the main home only, like account-wide to-do
   requests), one from any project of the account arrives too, and it and a `chat-question`
   from another project's chat carry `project` (`id`, `name`); route it like an account-wide
@@ -283,7 +295,12 @@ that read.
   main firstmate's home), then answer with `sync.py reply --recording <comment id>`.
 - `boost`: the captain boosted something being watched (`surface`: chat, ping, card,
   card-comment, todo, todo-comment, checkin-answer, message, message-comment, thread-comment); a boost
-  can carry short text. It is an answer to what was boosted, like a comment there: on a
+  can carry short text. Only a boost on your own comment, line, card, message or answer
+  arrives, except on a decision to-do, its comments and its decision steps, where any boost
+  does, and on a to-do request and its comments, where a worded (not emoji-only) boost
+  does. On `thread-comment` any boost on your reply that awaits an answer is that answer
+  (`why` `awaiting`, a 👍 is a yes) and clears the mark; an emoji-only boost (👍, ❤️) on
+  your other comments there is skipped. It is an answer to what was boosted, like a comment there: on a
   decision to-do or a comment under it, a decision or feedback as above; on a to-do request
   (`request: true`), more about that request; elsewhere a reply
   to that line, answer or post. Relay it like a comment outside the main firstmate's home.

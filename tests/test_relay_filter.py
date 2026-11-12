@@ -1,0 +1,541 @@
+"""Tests for what reaches the agent from a thread it only follows: an @mention or a Basecamp Reply to it, and the next
+comment after its `reply --awaiting`; everything else there is skipped, and so is an emoji-only boost there.
+
+The example comments are made up; every Basecamp call is stubbed.
+"""
+import json, os, sys, unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_sync import ACTING, CAPTAIN, line  # noqa: E402
+from test_tools import boost, comment  # noqa: E402
+from test_notifications import EYES, PROJECT, NotifBase, my_boost, note  # noqa: E402
+import behaviors  # noqa: E402
+import sync  # noqa: E402
+import tools  # noqa: E402
+
+THUMBS = "\U0001F44D"
+
+
+def doc(id, who=CAPTAIN, content="<p>status: the import ran</p>", boosts=0, at=None):
+    """A comment on document 4."""
+    return {"id": id, "creator": {"id": who, "name": {CAPTAIN: "Cap", ACTING: "Agent"}.get(who, "Pat")}, "content": content,
+            "created_at": at or f"2099-01-01T00:{id % 60:02d}:00Z", "app_url": f"https://x/docs/4#c{id}",
+            "boosts_count": boosts, "parent": {"id": 4, "type": "Document", "title": "Roadmap", "app_url": "https://x/docs/4"}}
+
+
+class Base(NotifBase):
+    def threads(self):
+        return self.state("threads.json")
+
+    def mention_thread(self):
+        """Document 4 known to the thread reader: the captain's Reply to the agent (a Mention notification) relayed."""
+        self.stub.comments["4"] = [doc(9, content="<p>which import do you mean</p>")]
+        self.notify(note(10, "Mention", thread=4, anchor=9, path="documents", title="Re: Roadmap"))
+        self.poll()
+        self.assertEqual([(r["kind"], r["comment"]) for r in self.pending()], [("mention", 9)])
+
+    def comment_later(self, id, n, **kw):
+        """Comment `id` on document 4, announced by a plain comment notification `n` seconds into the hour."""
+        self.stub.comments["4"].append(doc(id, **kw))
+        self.notify(note(10, thread=4, anchor=id, path="documents", at=f"2099-01-01T01:00:{n:02d}Z", title="Re: Roadmap"))
+        self.poll()
+
+
+class Comments(Base):
+    def test_a_plain_comment_on_someone_elses_thread_is_skipped_with_one_log_line(self):
+        self.stub.comments["4"] = [doc(9)]
+        self.notify(note(10, thread=4, anchor=9, path="documents"))
+        self.poll()
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(self.stub.posted(), [])  # no 👀 or 👍 on it
+        self.assertEqual(self.stub.marked, [["10"]])
+        self.assertEqual(self.threads()[f"{PROJECT}:4"]["cursor"], 9)
+        self.assertEqual(self.log().count("skipped comment 9 by Cap on Document 4"), 1)
+
+    def test_a_comment_that_at_mentions_someone_else_is_skipped(self):
+        self.stub.comments["4"] = [doc(9, content='<p><bc-attachment sgid="sgid-pat"></bc-attachment> is it okay to merge?</p>')]
+        self.notify(note(10, thread=4, anchor=9, path="documents"))
+        self.poll()
+        self.assertEqual(self.pending(), [])
+
+    def test_an_at_mention_of_the_agent_is_relayed(self):
+        self.stub.comments["4"] = [doc(9, content=f'<p><bc-attachment sgid="sgid-{ACTING}"></bc-attachment> look</p>')]
+        self.notify(note(10, thread=4, anchor=9, path="documents"))
+        self.poll()
+        self.assertEqual([(r["kind"], r["comment"]) for r in self.pending()], [("mention", 9)])
+        self.assertEqual(self.stub.posted(), [("9", EYES)])
+
+    def test_a_reply_to_the_agent_without_an_at_mention_is_relayed_as_its_mention_notification_says(self):
+        self.mention_thread()
+        self.assertEqual(self.stub.posted(), [("9", EYES)])
+
+    def test_a_reply_read_before_its_mention_notification_is_recorded_when_that_arrives(self):
+        """Regression: a Reply landing between the notifications read and the comments read was skipped as a plain
+        comment and passed by the cursor, so its Mention notification on the next run found nothing new."""
+        self.mention_thread()
+        self.stub.comments["4"] += [doc(2001), doc(2002, content="<p>the nightly one</p>")]
+        self.notify(note(11, thread=4, anchor=2001, path="documents", at="2099-01-01T01:00:01Z", title="Re: Roadmap"))
+        self.poll()
+        self.assertIn("skipped comment 2002", self.log())
+        self.assertEqual(self.threads()[f"{PROJECT}:4"]["cursor"], 2002)
+        self.notify(note(12, "Mention", thread=4, anchor=2002, path="documents", at="2099-01-01T01:00:02Z",
+                         title="Re: Roadmap"))
+        self.poll()
+        self.poll()
+        self.assertEqual([(r["kind"], r["comment"]) for r in self.pending()], [("mention", 9), ("mention", 2002)])
+        self.assertEqual(self.stub.posted(), [("9", EYES), ("2002", EYES)])
+
+    def test_a_late_mention_already_recorded_is_not_recorded_again(self):
+        self.mention_thread()
+        self.notify(note(10, "Mention", thread=4, anchor=9, path="documents", at="2099-01-01T01:00:01Z", title="Re: Roadmap"))
+        self.poll()
+        self.assertEqual([r["comment"] for r in self.pending()], [9])
+
+    def test_the_dry_run_logs_the_skip_and_records_nothing(self):
+        self.stub.comments["4"] = [doc(9)]
+        self.notify(note(10, thread=4, anchor=9, path="documents"))
+        self.poll(dry=True)
+        self.assertEqual((self.pending(), self.threads()), ([], {}))
+        self.assertIn("dry skipped comment 9 by Cap on Document 4", self.log())
+
+
+class Awaiting(Base):
+    def comment_later(self, id, n, **kw):
+        """As Base's, the comment dated now (within the mark) unless `at` says otherwise."""
+        super().comment_later(id, n, **{"at": tools.now_iso(), **kw})
+
+    def ask(self, **kw):
+        """The agent answers the captain's Reply 9 with a question, awaiting the answer; returns its comment's id."""
+        self.mention_thread()
+        self.assertTrue(self.sync().reply(9, "The nightly one or the manual one?", awaiting=True, **kw))
+        mine = self.stub.comments["4"][-1]["id"] if "boost" not in kw else None
+        if mine is not None:
+            self.stub.comments["4"][-1].update(doc(mine, who=ACTING, content="<p>The nightly one or the manual one?</p>"))
+        return mine
+
+    def test_the_next_comment_from_someone_else_is_relayed_once_then_the_mark_clears(self):
+        mine = self.ask()
+        mark = self.threads()[f"{PROJECT}:4"]["awaiting"]
+        self.assertEqual(mark["comment"], mine)
+        self.assertEqual(tools.history(mark["at"], mark["until"], slack=7 * 86400 - 5), True)  # 7 days later
+        self.assertIn("reply 9: Document 4 awaits an answer until", self.log())
+        self.comment_later(2001, 1, content="<p>the nightly one</p>")
+        self.comment_later(2002, 2, content="<p>thanks all</p>")
+        self.assertEqual([(r["kind"], r["comment"], r.get("why")) for r in self.pending()],
+                         [("mention", 9, None), ("thread-comment", 2001, "awaiting")])
+        self.assertNotIn("awaiting", self.threads()[f"{PROJECT}:4"])
+        self.assertIn("thread 4: comment 2001 is the answer awaited there; the mark is cleared", self.log())
+        self.assertIn("skipped comment 2002", self.log())
+        _, body = behaviors.inbox_note(self.pending()[1], "1", str(PROJECT))
+        self.assertIn("the first comment there after your reply that awaited an answer (reply --awaiting)", body)
+
+    def test_a_mention_while_awaiting_is_the_answer_too(self):
+        self.ask()
+        self.comment_later(2001, 1, content=f'<p><bc-attachment sgid="sgid-{ACTING}"></bc-attachment> nightly</p>')
+        self.comment_later(2002, 2)
+        self.assertEqual([(r["kind"], r["comment"]) for r in self.pending()], [("mention", 9), ("mention", 2001)])
+        self.assertNotIn("awaiting", self.threads()[f"{PROJECT}:4"])
+
+    def test_the_agents_own_comment_and_someone_not_listened_to_leave_the_mark(self):
+        self.ask()
+        self.comment_later(2001, 1, who=ACTING, content="<p>to add: I mean the importer</p>")
+        self.comment_later(2002, 2, who=1)
+        self.assertEqual(len(self.pending()), 1)
+        self.assertIn("awaiting", self.threads()[f"{PROJECT}:4"])
+        self.comment_later(2003, 3)
+        self.assertEqual([r["comment"] for r in self.pending()], [9, 2003])
+
+    def test_the_mark_expires_after_its_days(self):
+        self.ask()
+        state = self.threads()
+        state[f"{PROJECT}:4"]["awaiting"]["until"] = "2000-01-01T00:00:00Z"
+        with open(os.path.join(self.cfgdir, "threads.json"), "w") as f:
+            json.dump(state, f)
+        self.comment_later(2001, 1)
+        self.assertEqual(len(self.pending()), 1)
+        self.assertNotIn("awaiting", self.threads()[f"{PROJECT}:4"])
+        self.assertIn("did not come by 2000-01-01T00:00:00Z; the mark is cleared", self.log())
+
+    def test_an_answer_posted_before_the_end_is_relayed_when_read_after_it(self):
+        mine = self.ask()
+        state = self.threads()
+        state[f"{PROJECT}:4"]["awaiting"]["until"] = "2026-01-01T00:00:00Z"  # passed by the time the reader runs
+        with open(os.path.join(self.cfgdir, "threads.json"), "w") as f:
+            json.dump(state, f)
+        self.assertLess(mine, 2001)
+        self.comment_later(2001, 1, at="2025-12-31T23:59:00Z")
+        self.assertEqual([(r["comment"], r.get("why")) for r in self.pending()], [(9, None), (2001, "awaiting")])
+        self.assertNotIn("awaiting", self.threads()[f"{PROJECT}:4"])
+        self.assertNotIn("did not come by", self.log())
+
+    def test_a_second_awaiting_reply_keeps_the_first_marks_answer(self):
+        """Regression (review on PR 54): the second reply moved the mark past the answer to the first."""
+        first = self.ask()
+        mark = self.threads()[f"{PROJECT}:4"]["awaiting"]
+        self.stub.comments["4"].append(doc(2001, content="<p>the nightly one</p>", at=tools.now_iso()))  # not yet read
+        self.assertTrue(self.sync().reply(9, "And which branch?", again=True, awaiting=True))
+        again = self.threads()[f"{PROJECT}:4"]["awaiting"]
+        self.assertEqual((again["comment"], again["at"]), (first, mark["at"]))
+        self.assertGreaterEqual(again["until"], mark["until"])
+        self.comment_later(2002, 2, content="<p>main</p>")
+        self.assertEqual([(r["comment"], r.get("why")) for r in self.pending()], [(9, None), (2001, "awaiting")])
+
+    def test_the_skip_says_why_when_a_mark_exists(self):
+        self.ask(boost="which one?")  # a mark set by a boost: judged by time
+        self.comment_later(2001, 1, at="2000-01-01T00:00:00Z", content="<p>old</p>")
+        self.comment_later(2002, 2, at="2099-12-31T23:00:00Z", content="<p>too late</p>")
+        self.assertIn("skipped comment 2001 by Cap on Document 4: no @mention or reply to the agent, posted before the "
+                      "agent's reply that awaits an answer, not the agent's own thread", self.log())
+        self.assertIn("skipped comment 2002 by Cap on Document 4: no @mention or reply to the agent, posted after the "
+                      "answer awaited there was due, not the agent's own thread", self.log())
+
+    def test_a_dry_run_takes_only_the_first_comment_as_the_answer(self):
+        self.ask()
+        self.stub.comments["4"] += [doc(2001, content="<p>one</p>", at=tools.now_iso()),
+                                    doc(2002, content="<p>two</p>", at=tools.now_iso())]
+        self.notify(note(10, thread=4, anchor=2001, path="documents", at="2099-01-01T01:00:05Z"))
+        self.poll(dry=True)
+        self.assertIn("dry thread 4: comment 2001 is the answer awaited there", self.log())
+        self.assertIn("dry skipped comment 2002", self.log())
+        self.assertIn("awaiting", self.threads()[f"{PROJECT}:4"])  # a dry run saves nothing
+
+    def test_a_boost_answer_awaits_the_next_comment_after_it(self):
+        self.assertIsNone(self.ask(boost="which one?"))
+        self.assertIsNone(self.threads()[f"{PROJECT}:4"]["awaiting"]["comment"])
+        self.comment_later(2001, 1, at="2000-01-01T00:00:00Z")  # dated before the boost: not its answer
+        self.comment_later(2002, 2)
+        self.assertEqual([r["comment"] for r in self.pending()], [9, 2002])
+
+    def test_dry_run_marks_nothing(self):
+        self.mention_thread()
+        self.assertFalse(self.sync(dry=True).reply(9, "Which one?", awaiting=True))
+        self.assertNotIn("awaiting", self.threads()[f"{PROJECT}:4"])
+        self.assertIn("mark it awaiting an answer for 7 days", self.log())
+
+    def test_awaiting_anywhere_but_a_followed_thread_is_ignored(self):
+        self.stub.lines["77"].append(line(2, content="ship it?"))
+        self.notify(note(10, "Chat", thread=77, path="chats", section="chats"))
+        self.poll()
+        self.assertTrue(self.sync().reply(2, "Shipping.", awaiting=True))
+        self.assertIn("reply 2: --awaiting ignored: it marks only a followed thread", self.log())
+        self.assertEqual([c for c, _ in self.stub.chat_posts()], ["77"])
+
+    def test_cli(self):
+        self.mention_thread()
+        cfg, body = os.path.join(self.cfgdir, "config.json"), os.path.join(self.tmp, "body.txt")
+        open(body, "w").write("Which one?")
+        base = ["reply", "--home", self.home, "--config", cfg, "--recording", "9", "--body-file", body]
+        with self.assertRaises(SystemExit):
+            sync.cli(base + ["--awaiting-days", "3"], runner=self.stub)
+        self.assertEqual(sync.cli(base, runner=self.stub), 0)
+        self.assertNotIn("awaiting", self.threads()[f"{PROJECT}:4"])
+        self.assertEqual(sync.cli(base + ["--again", "--awaiting"], runner=self.stub), 0)
+        mark = self.threads()[f"{PROJECT}:4"]["awaiting"]
+        self.assertTrue(tools.history(mark["at"], mark["until"], slack=7 * 86400 - 5))
+        self.assertFalse(tools.history(mark["at"], mark["until"], slack=7 * 86400 + 5))
+
+
+class Boosts(Base):
+    def boosted(self, rid, bid, content, listed=None):
+        """The captain boosts the agent's comment `rid` on document 4 with `content`, which the agent's received boosts
+        list as `listed` (default the same)."""
+        c = next(c for c in self.stub.comments["4"] if c["id"] == rid)
+        c["boosts_count"] = c.get("boosts_count", 0) + 1
+        self.stub.boosts.setdefault(str(rid), []).append(boost(bid, content=content))
+        self.stub.my_boosts.append(my_boost(bid, rid, "Comment", parent={"id": 4, "type": "Document", "title": "Roadmap"},
+                                            content=content if listed is None else listed))
+        self.poll()
+
+    def ask_on_comment(self):
+        """The agent answers the captain's Reply 9 with a question, awaiting the answer; returns its comment's id."""
+        self.mention_thread()
+        self.assertTrue(self.sync().reply(9, "Ship it tonight?", awaiting=True))
+        mine = self.stub.comments["4"][-1]["id"]
+        self.stub.comments["4"][-1].update(doc(mine, who=ACTING, content="<p>Ship it tonight?</p>"))
+        return mine
+
+    def answered(self):
+        """Document 4 with the agent's plain answer 1500 to the captain's Reply 9 (no answer awaited)."""
+        self.mention_thread()
+        self.comment_later(1500, 1, who=ACTING, content="<p>Done.</p>")
+
+    def boosts(self):
+        return [(r["recording"], r["text"]) for r in self.pending() if r["kind"] == "boost"]
+
+    def test_an_emoji_only_boost_on_the_agents_comment_is_skipped_and_a_worded_one_relayed(self):
+        self.answered()
+        self.boosted(1500, 90, THUMBS)
+        self.boosted(1500, 91, "<div>❤️\U0001F389</div>")
+        self.boosted(1500, 92, "yes")
+        self.boosted(1500, 93, "1️⃣")
+        self.boosted(1500, 94, "?")
+        self.boosted(1500, 95, "\u203c\ufe0f")
+        self.boosted(1500, 96, "\u2713")
+        self.assertEqual(self.boosts(), [(1500, "yes"), (1500, "?"), (1500, "\u2713")])
+        self.assertIn("skipped boost 90 by Cap on thread-comment 1500: emoji only", self.log())
+        self.assertIn("skipped boost 91", self.log())
+        self.assertIn("skipped boost 93", self.log())
+        self.assertIn("skipped boost 95", self.log())
+        self.assertEqual(self.state()["boosts"], [90, 91, 92, 93, 94, 95, 96])  # all handled, none replayed
+
+    def test_any_boost_on_the_comment_that_awaits_an_answer_is_that_answer_and_clears_the_mark(self):
+        self.mention_thread()
+        self.assertTrue(self.sync().reply(9, "Ship it tonight?", awaiting=True))
+        mine = self.stub.comments["4"][-1]["id"]
+        self.stub.comments["4"][-1].update(doc(mine, who=ACTING, content="<p>Ship it tonight?</p>"))
+        self.stub.my_boosts.append(dict(my_boost(90, mine, "Comment", parent={"id": 4, "type": "Document"}, content=THUMBS),
+                                        created_at=tools.now_iso()))
+        c = self.stub.comments["4"][-1]
+        c["boosts_count"] = 1
+        self.stub.boosts[str(mine)] = [boost(90, content=THUMBS)]
+        self.poll()
+        [rec] = [r for r in self.pending() if r["kind"] == "boost"]
+        self.assertEqual((rec["recording"], rec["text"], rec["why"]), (mine, THUMBS, "awaiting"))
+        self.assertNotIn("awaiting", self.threads()[f"{PROJECT}:4"])
+        self.assertIn(f"thread-comment {mine}: boost 90 is the answer awaited there; the mark is cleared", self.log())
+        _, body = behaviors.inbox_note(rec, "1", str(PROJECT))
+        self.assertIn("it is on your reply that awaited an answer (reply --awaiting)", body)
+        self.comment_later(2001, 1, content="<p>unrelated</p>")  # the mark is gone: not taken as the answer
+        self.assertIn("skipped comment 2001", self.log())
+        self.boosted(mine, 91, THUMBS)  # a later emoji boost there is skipped again
+        self.assertIn("skipped boost 91", self.log())
+
+    def test_a_boost_answer_before_an_unrelated_comment_read_with_it_wins(self):
+        """Regression: the comment posted after the 👍 took the mark first, and the 👍 was then skipped as emoji only."""
+        mine = self.ask_on_comment()
+        self.stub.comments["4"].append(doc(2001, content="<p>unrelated</p>", at=tools.now_iso()))
+        self.stub.my_boosts.append(dict(my_boost(90, mine, "Comment", parent={"id": 4, "type": "Document"}, content=THUMBS),
+                                        created_at="2000-01-01T00:00:00Z"))
+        self.stub.comments["4"][-2]["boosts_count"] = 1
+        self.stub.boosts[str(mine)] = [boost(90, content=THUMBS)]
+        self.notify(note(10, thread=4, anchor=2001, path="documents", at="2099-01-01T01:00:01Z"))
+        self.poll()
+        self.assertEqual([(r["kind"], r.get("why")) for r in self.pending()[1:]], [("boost", "awaiting")])
+        self.assertIn("skipped comment 2001", self.log())
+        self.assertNotIn("awaiting", self.threads()[f"{PROJECT}:4"])
+
+    def test_a_comment_before_the_boost_is_the_answer_and_the_boost_is_judged_as_any_other(self):
+        mine = self.ask_on_comment()
+        self.stub.comments["4"].append(doc(2001, content="<p>yes</p>", at="2000-01-01T00:00:00Z"))
+        self.stub.my_boosts.append(dict(my_boost(90, mine, "Comment", parent={"id": 4, "type": "Document"}, content=THUMBS),
+                                        created_at=tools.now_iso()))
+        self.stub.comments["4"][-2]["boosts_count"] = 1
+        self.stub.boosts[str(mine)] = [boost(90, content=THUMBS)]
+        self.notify(note(10, thread=4, anchor=2001, path="documents", at="2099-01-01T01:00:01Z"))
+        self.poll()
+        self.assertEqual([(r["kind"], r.get("why")) for r in self.pending()[1:]], [("thread-comment", "awaiting")])
+        self.assertIn("skipped boost 90", self.log())
+
+    def test_an_expired_mark_stays_while_a_boost_read_on_its_comment_fails(self):
+        mine = self.ask_on_comment()
+        state = self.threads()
+        state[f"{PROJECT}:4"]["awaiting"]["until"] = "2026-01-01T00:00:00Z"
+        with open(os.path.join(self.cfgdir, "threads.json"), "w") as f:
+            json.dump(state, f)
+        self.stub.comments["4"][-1]["boosts_count"] = 1
+        self.stub.boosts[str(mine)] = [boost(90, content=THUMBS)]
+        self.stub.my_boosts.append(dict(my_boost(90, mine, "Comment", parent={"id": 4, "type": "Document"}, content=THUMBS),
+                                        created_at="2025-12-31T23:59:00Z"))
+        self.stub.fail = {f"/recordings/{mine}/boosts.json"}
+        self.comment_later(2001, 1, content="<p>later</p>")
+        self.assertIn("awaiting", self.threads()[f"{PROJECT}:4"])
+        self.stub.fail = set()
+        self.comment_later(2002, 2, content="<p>more</p>")
+        self.assertEqual([(r["kind"], r.get("why")) for r in self.pending()[1:]], [("boost", "awaiting")])
+        self.assertNotIn("awaiting", self.threads()[f"{PROJECT}:4"])
+
+    def test_a_comment_waits_while_the_boosts_on_the_awaiting_comment_cannot_be_read(self):
+        """Regression: with the boosts on the question unread, a later comment took the mark, and the 👍 before it was
+        then skipped as emoji only."""
+        mine = self.ask_on_comment()
+        self.stub.comments["4"][-1]["boosts_count"] = 1
+        self.stub.boosts[str(mine)] = [boost(90, content=THUMBS)]
+        self.stub.my_boosts.append(dict(my_boost(90, mine, "Comment", parent={"id": 4, "type": "Document"}, content=THUMBS),
+                                        created_at="2000-01-01T00:00:00Z"))
+        self.stub.fail = {f"/recordings/{mine}/boosts.json"}
+        self.comment_later(2001, 1, content="<p>unrelated</p>", at=tools.now_iso())
+        self.assertEqual([r["kind"] for r in self.pending()], ["mention"])
+        self.assertIn("awaiting", self.threads()[f"{PROJECT}:4"])
+        self.assertLess(self.threads()[f"{PROJECT}:4"]["cursor"], 2001)
+        self.stub.fail = set()
+        self.comment_later(2002, 2, content="<p>more</p>", at=tools.now_iso())
+        self.assertEqual([(r["kind"], r.get("why")) for r in self.pending()[1:]], [("boost", "awaiting")])
+        self.assertIn("skipped comment 2001", self.log())
+        self.assertEqual(self.threads()[f"{PROJECT}:4"]["cursor"], 2002)
+
+    def test_a_retried_boost_on_the_awaiting_comment_keeps_later_ones_from_taking_the_mark(self):
+        mine = self.ask_on_comment()
+        self.stub.comments["4"][-1]["boosts_count"] = 2
+        self.stub.boosts[str(mine)] = [dict(boost(90, content="later"), created_at=tools.now_iso()),
+                                       boost(91, content="yes")]
+        self.stub.my_boosts.append(dict(my_boost(91, mine, "Comment", parent={"id": 4, "type": "Document"}, content="yes"),
+                                        created_at=tools.now_iso()))
+        self.comment_later(2001, 1, content="<p>fyi</p>", at=tools.now_iso())
+        self.assertEqual([r["kind"] for r in self.pending()], ["mention"])
+        self.assertIn("awaiting", self.threads()[f"{PROJECT}:4"])
+
+    def test_a_comment_deferred_for_an_unconfirmed_boost_is_read_again_and_delivered_once_the_boost_is_gone(self):
+        """Regression: the deferral counted as a successful read, so the notification was handled, and with the boost
+        removed no later read delivered the comment."""
+        mine = self.ask_on_comment()
+        self.stub.comments["4"][-1]["boosts_count"] = 1
+        self.stub.boosts[str(mine)] = [dict(boost(90, content=THUMBS), created_at=tools.now_iso())]
+        self.comment_later(2001, 1, content="<p>tonight works</p>", at=tools.now_iso())
+        self.assertEqual([r["kind"] for r in self.pending()], ["mention"])
+        self.assertIn("notifications: retrying next run", self.log())
+        self.stub.comments["4"][-2]["boosts_count"] = 0
+        self.stub.boosts[str(mine)] = []
+        self.poll()
+        self.assertEqual([(r["kind"], r.get("comment"), r.get("why")) for r in self.pending()[1:]],
+                         [("thread-comment", 2001, "awaiting")])
+        self.assertNotIn("awaiting", self.threads()[f"{PROJECT}:4"])
+        self.assertEqual(self.threads()[f"{PROJECT}:4"]["cursor"], 2001)
+
+    def test_the_skip_is_judged_on_the_text_the_received_boosts_confirm(self):
+        """Regression: the skip was decided on the recording's boost text before the received boosts replaced it."""
+        self.answered()
+        self.boosted(1500, 90, "thanks", listed=THUMBS)
+        self.boosted(1500, 91, THUMBS, listed="yes")
+        self.assertEqual(self.boosts(), [(1500, "yes")])
+        self.assertIn("skipped boost 90", self.log())
+        self.assertEqual(self.state()["boosts"], [90, 91])
+
+    def test_an_emoji_only_boost_elsewhere_is_unchanged(self):
+        self.stub.lines["77"][0]["boosts_count"] = 1
+        self.stub.boosts["1"] = [boost(90, content=THUMBS)]
+        self.stub.my_boosts = [my_boost(90, 1, parent={"id": 77, "type": "Chat::Transcript"}, content=THUMBS)]
+        self.poll()
+        self.assertEqual([(r["kind"], r["surface"], r["text"]) for r in self.pending()], [("boost", "chat", THUMBS)])
+
+
+class Attachments(Base):
+    """A comment of attachments only, right after a relayed comment by the same person, folds into its record."""
+
+    IMG = '<bc-attachment sgid="s1" content-type="image/png" filename="shot.png" href="https://x/shot.png"></bc-attachment>'
+
+    def test_an_attachment_comment_after_a_relayed_one_folds_into_its_note(self):
+        self.stub.comments["4"] = [doc(9, content=f'<p><bc-attachment sgid="sgid-{ACTING}" '
+                                               'content-type="application/vnd.basecamp.mention"></bc-attachment> see this</p>'),
+                                   doc(10, content=self.IMG)]
+        self.notify(note(10, thread=4, anchor=9, path="documents"))
+        self.poll()
+        [rec] = self.pending()
+        self.assertEqual((rec["comment"], rec["attachments"]), (9, [{"filename": "shot.png", "url": "https://x/shot.png"}]))
+        self.assertEqual(self.stub.posted(), [("9", EYES)])  # no acknowledgement on the folded comment
+        self.assertIn("thread 4: 10 (attachments only) folded into the note for 9", self.log())
+        _, body = behaviors.inbox_note(rec, "1", str(PROJECT))
+        self.assertIn("Attachments: shot.png (https://x/shot.png)", body)
+
+    def test_a_late_mention_of_a_folded_attachment_comment_is_not_relayed_again(self):
+        """Regression (Greptile on PR 54): a folded comment was not recorded as delivered, so its Mention notification
+        arriving the next run recorded it again, attachment and all."""
+        self.stub.comments["4"] = [doc(9, content=f'<p><bc-attachment sgid="sgid-{ACTING}" '
+                                               'content-type="application/vnd.basecamp.mention"></bc-attachment> see this</p>'),
+                                   doc(10, content=self.IMG)]
+        self.notify(note(10, thread=4, anchor=9, path="documents"))
+        self.poll()
+        self.assertEqual(self.threads()[f"{PROJECT}:4"]["folded"], [10])
+        self.notify(note(10, thread=4, anchor=9, path="documents"),
+                    note(11, "Mention", thread=4, anchor=10, path="documents", at="2099-01-01T00:00:09Z"))
+        self.poll()
+        self.assertEqual([(r["comment"], len(r.get("attachments", []))) for r in self.pending()], [(9, 1)])
+
+    def test_an_attachment_comment_by_someone_else_or_after_a_skipped_one_is_judged_alone(self):
+        self.stub.comments["4"] = [doc(9, content=f'<p><bc-attachment sgid="sgid-{ACTING}" '
+                                               'content-type="application/vnd.basecamp.mention"></bc-attachment> see</p>'),
+                                   doc(10, who=7, content=self.IMG), doc(11, content="<p>fyi</p>"), doc(12, content=self.IMG)]
+        self.cfg(people=[7])
+        self.notify(note(10, thread=4, anchor=9, path="documents"))
+        self.poll()
+        self.assertEqual([(r["comment"], r.get("attachments")) for r in self.pending()], [(9, None)])
+        self.assertIn("skipped comment 10", self.log())
+        self.assertIn("skipped comment 12", self.log())
+
+
+class OwnThreads(Base):
+    """A comment by someone else on a thread the agent made itself is for the agent (review on PR 54)."""
+
+    def test_a_plain_comment_on_a_document_the_agent_made_is_relayed(self):
+        self.stub.recordings[4] = {"id": 4, "type": "Document", "creator": {"id": ACTING}}
+        self.stub.comments["4"] = [doc(9, content="<p>can you add repro steps?</p>")]
+        self.notify(note(10, thread=4, anchor=9, path="documents"))
+        self.poll()
+        [rec] = self.pending()
+        self.assertEqual((rec["kind"], rec["comment"], rec["why"]), ("thread-comment", 9, "yours"))
+        _, body = behaviors.inbox_note(rec, "1", str(PROJECT))
+        self.assertIn("on something you made", body)
+
+    def test_whose_thread_it_is_is_read_once_per_run_and_a_failed_read_retries(self):
+        self.stub.recordings[4] = {"id": 4, "creator": {"id": ACTING}}
+        self.stub.comments["4"] = [doc(9), doc(10)]
+        self.stub.fail = {"/recordings/4.json"}
+        self.notify(note(10, thread=4, anchor=9, path="documents"))
+        self.poll()
+        self.assertEqual((self.pending(), self.stub.marked), ([], []))
+        self.assertIn("thread 4: who made it could not be read, retrying next run", self.log())
+        self.stub.fail = set()
+        self.stub.calls.clear()
+        self.poll()
+        self.assertEqual([r["comment"] for r in self.pending()], [9, 10])
+        self.assertEqual(self.stub.gets().count(f"/buckets/{PROJECT}/recordings/4.json"), 1)
+
+    def test_a_failed_read_of_whose_thread_it_is_records_nothing_so_a_retry_duplicates_nothing(self):
+        """Regression: two mentions were recorded (the first flushed by the second) before a plain comment's lookup failed
+        and the read returned unsaved, so the retry recorded the first mention again."""
+        self.stub.recordings[4] = {"id": 4, "creator": {"id": CAPTAIN}}
+        at = f'<p><bc-attachment sgid="sgid-{ACTING}"></bc-attachment> look</p>'
+        self.stub.comments["4"] = [doc(9, content=at), doc(10, content=at), doc(11)]
+        self.stub.fail = {"/recordings/4.json"}
+        self.notify(note(10, thread=4, anchor=9, path="documents"))
+        self.poll()
+        self.assertEqual(self.pending(), [])
+        self.stub.fail = set()
+        self.poll()
+        self.assertEqual([r["comment"] for r in self.pending()], [9, 10])
+
+
+class OwnRecordingsOnly(Base):
+    """A boost counts only on the agent's own recording, except on decision to-dos, their comments and decision steps."""
+
+    def test_a_boost_on_someone_elses_comment_is_skipped(self):
+        self.mention_thread()
+        self.stub.comments["4"][0]["boosts_count"] = 1
+        self.stub.boosts["9"] = [boost(91, content="yes")]
+        self.comment_later(2001, 1, content="<p>fyi</p>")  # the thread is read again, and its boost counts with it
+        self.assertEqual([r["kind"] for r in self.pending()], ["mention"])
+        self.assertIn("skipped boost 91 by", self.log())
+        self.assertIn("on 9: not on the agent's own recording", self.log())
+
+    def test_a_boost_on_someone_elses_chat_line_is_skipped(self):
+        self.stub.lines["77"].append(dict(line(2, content="ship it?"), boosts_count=0))
+        self.poll()
+        self.stub.lines["77"][-1]["boosts_count"] = 1
+        self.stub.boosts["2"] = [boost(92, content="🎉")]
+        self.poll()
+        self.assertEqual([r["kind"] for r in self.pending()], ["chat-question"])
+        self.assertIn("skipped boost 92", self.log())
+
+    def test_a_boost_on_a_comment_under_a_decision_todo_is_decision_feedback(self):
+        tid = self.create(key="ta-merge")
+        self.stub.comments[str(tid)] = [dict(comment(9, content="<p>merge</p>"), boosts_count=0)]
+        self.poll()
+        self.stub.comments[str(tid)][0]["boosts_count"] = 1
+        self.stub.boosts["9"] = [boost(93, content=THUMBS)]
+        self.poll()
+        self.assertEqual([(r["kind"], r.get("surface"), r.get("recording")) for r in self.pending()],
+                         [("todo-comment", None, None), ("boost", "todo-comment", 9)])
+
+
+class EmojiOnly(unittest.TestCase):
+    def test_emoji_and_whitespace_only(self):
+        for yes in (THUMBS, "\U0001F44D\U0001F3FD", "❤️", "<div>\U0001F389 \U0001F389</div>", "1️⃣", "#\u20e3",
+                    "\U0001F1FA\U0001F1F8", "\U0001F468\u200d\U0001F4BB", "\u203c\ufe0f", "\u2194\ufe0f", "\u2714\ufe0f", "©",
+                    "\U0001F3F4\U000E0067\U000E0062\U000E0073\U000E0063\U000E0074\U000E007F"):
+            self.assertTrue(tools.emoji_only(yes), yes)
+        for no in ("yes", "+1", "a", "1", "Done ✅", "?", "!!", "\u2713", "\u2192", "\u00b0", "\u20e3", "1\ufe0f",
+                   "\U0001F44D!", "", None, "<div></div>", "<div> </div>"):
+            self.assertFalse(tools.emoji_only(no), no)
+
+
+if __name__ == "__main__":
+    unittest.main()

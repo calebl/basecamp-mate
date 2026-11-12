@@ -17,6 +17,7 @@ import sync  # noqa: E402
 
 PROJECT = 22222222
 OTHER = 44444444  # another project of the account
+MENTION = f'<bc-attachment sgid="sgid-{ACTING}" content-type="application/vnd.basecamp.mention"></bc-attachment>'
 EYES = "\U0001F440"
 APP = "https://app.basecamp.com/1"
 
@@ -234,31 +235,33 @@ class Reader(NotifBase):
 
 
 class Threads(NotifBase):
-    """Comments and @mentions on any other thread the agent follows are relayed by that thread's own reader."""
+    """@mentions on any other thread the agent follows are relayed by that thread's own reader (test_relay_filter covers
+    the plain comments there)."""
 
-    def doc_comment(self, id, who=CAPTAIN, content="<p>tighten the intro</p>", boosts=0):
+    def doc_comment(self, id, who=CAPTAIN, content=f"<p>{MENTION} tighten the intro</p>", boosts=0):
         return {"id": id, "creator": {"id": who, "name": "Cap"}, "content": content, "created_at": f"t{id}",
                 "app_url": f"https://x/docs/4#c{id}", "boosts_count": boosts,
                 "parent": {"id": 4, "type": "Document", "title": "Roadmap", "app_url": "https://x/docs/4"}}
 
     def test_comments_on_a_document_from_the_first_unread_are_relayed_once_and_answered_there(self):
-        self.stub.comments["4"] = [self.doc_comment(7, content="<p>read before</p>"), self.doc_comment(9),
-                                   self.doc_comment(10, who=ACTING), self.doc_comment(11, content="<p>and the end?</p>")]
+        self.stub.comments["4"] = [self.doc_comment(7, content=f"<p>{MENTION} read before</p>"), self.doc_comment(9),
+                                   self.doc_comment(10, who=ACTING, content="<p>on it</p>"),
+                                   self.doc_comment(11, content=f"<p>{MENTION} and the end?</p>")]
         self.notify(note(10, thread=4, anchor=9, path="documents", title="Re: Roadmap"))
         self.poll()
         self.poll()
         self.assertEqual([(r["kind"], r["comment"], r["parent_type"], r["title"], r["question"]) for r in self.pending()],
-                         [("thread-comment", 9, "Document", "Roadmap", False), ("thread-comment", 11, "Document", "Roadmap", True)])
-        self.assertEqual(sorted(self.stub.posted()), [("11", EYES), ("9", "\U0001F44D")])
+                         [("mention", 9, "Document", "Roadmap", False), ("mention", 11, "Document", "Roadmap", True)])
+        self.assertEqual(sorted(self.stub.posted()), [("11", EYES), ("9", EYES)])
         self.assertEqual(self.stub.marked, [["10"]])
         rid, body = behaviors.inbox_note(self.pending()[1], "1", str(PROJECT))
-        self.assertEqual(rid, "basecamp-thread-comment-11")
-        self.assertIn("comment from the captain on Document 'Roadmap'", body)
+        self.assertEqual(rid, "basecamp-mention-11")
+        self.assertIn("@mention of you from the captain on Document 'Roadmap'", body)
         self.assertTrue(self.sync().reply(11, "Done."))
         self.assertEqual(self.stub.made("comments create"), [["comments", "create", "4", "-"]])
         self.assertEqual(self.stub.boosts["11"], [])
         self.assertFalse(self.sync().reply(11, "again"))
-        self.stub.comments["4"].append(self.doc_comment(12, content="<p>thanks</p>"))
+        self.stub.comments["4"].append(self.doc_comment(12, content=f"<p>{MENTION} thanks</p>"))
         self.stub.readings["unreads"][0].update(unread_at="2099-01-01T00:00:09Z", readable_identifier=note(0, anchor=12)["readable_identifier"])
         self.poll()
         self.assertEqual([r["comment"] for r in self.pending()], [9, 11, 12])
@@ -290,12 +293,12 @@ class Threads(NotifBase):
                          [("comment", 501, 9), ("question", 501, 10), ("question", 501, 11)])
         self.assertEqual(self.stub.marked, [["20"]])
 
-    def test_a_comment_on_a_card_nothing_mirrors_is_a_thread_comment(self):
-        self.stub.comments["600"] = [comment(9, content="<p>see this</p>")]
+    def test_a_mention_on_a_card_nothing_mirrors_is_relayed_by_the_thread_reader(self):
+        self.stub.comments["600"] = [comment(9, content=f"<p>{MENTION} see this</p>")]
         self.notify(note(20, thread=600, anchor=9, path="cards", title="Re: Hand-made card"))
         self.poll()
         self.assertEqual([(r["kind"], r["parent"], r["title"]) for r in self.pending()],
-                         [("thread-comment", 600, "Hand-made card")])
+                         [("mention", 600, "Hand-made card")])
 
     def test_an_owner_boost_on_the_agents_reply_in_a_thread_is_relayed(self):
         self.stub.comments["4"] = [self.doc_comment(9)]
@@ -306,7 +309,7 @@ class Threads(NotifBase):
         self.stub.my_boosts = [my_boost(90, 15, "Comment", parent={"id": 4, "type": "Document", "title": "Roadmap"})]
         self.poll()
         self.assertEqual([(r["kind"], r.get("surface"), r.get("recording")) for r in self.pending()],
-                         [("thread-comment", None, None), ("boost", "thread-comment", 15)])
+                         [("mention", None, None), ("boost", "thread-comment", 15)])
 
     def test_a_mention_in_a_chat_nothing_relays_is_a_chat_question_answered_in_that_chat(self):
         self.stub.lines["78"] = [line(1), line(3, content="@Agent look")]
@@ -379,15 +382,15 @@ class Replays(NotifBase):
         self.poll()  # the thread reader takes the completed to-do over: nothing the to-do reader read is new
         self.assertEqual(len(self.pending()), 3)
         self.assertNotIn("comments", self.state("threads.json")[f"{PROJECT}:{tid}"])
-        self.stub.comments[str(tid)].append(comment(900, content="<p>thanks, and one more thing</p>"))
+        self.stub.comments[str(tid)].append(comment(900, content=f"<p>{MENTION} thanks, and one more thing</p>"))
         self.notify(note(22, thread=tid, anchor=900, at="2099-01-01T00:00:04Z"))
         self.poll()  # a comment after the to-do was done is still relayed, once
         self.poll()
-        self.assertEqual([(r["kind"], r["comment"]) for r in self.pending()[3:]], [("thread-comment", 900)])
+        self.assertEqual([(r["kind"], r["comment"]) for r in self.pending()[3:]], [("mention", 900)])
 
     def test_a_thread_adopted_without_a_comment_to_start_from_starts_when_the_notification_did(self):
         def doc(id, at):
-            return {"id": id, "creator": {"id": CAPTAIN, "name": "Cap"}, "content": f"<p>note {id}</p>", "created_at": at,
+            return {"id": id, "creator": {"id": CAPTAIN, "name": "Cap"}, "content": f"<p>{MENTION} note {id}</p>", "created_at": at,
                     "app_url": f"https://x/docs/4#c{id}", "parent": {"id": 4, "type": "Document", "title": "Roadmap"}}
         self.stub.comments["4"] = [doc(7, "2099-01-01T00:00:00Z"), doc(8, "2099-01-01T00:10:00Z")]
         self.notify(note(10, thread=4, path="documents", at="2099-01-01T00:10:00.100Z"))  # names the document, no comment

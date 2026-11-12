@@ -40,6 +40,7 @@ from zoneinfo import ZoneInfo
 
 THUMBS, EYES = "\U0001F44D", "\U0001F440"
 BOOST_MAX = 16  # the most characters a Basecamp boost holds
+AWAIT_DAYS = 7  # how long `reply --awaiting` waits for an answer on a followed thread
 AUTHORITY = ("captain", "operator")  # the roles whose word authorizes the agent: a decision or an approval
 # When a scheduled request is done ("schedule" in the config, schedule.json per list): ask the owner, on its due date, or
 # before it.
@@ -491,7 +492,8 @@ class Tools:
 
     # --- readers: poll Basecamp, append pending records, acknowledge ---
 
-    def read_boosts(self, rec, surface, context, counted=None, always=(), bucket=None):
+    def read_boosts(self, rec, surface, context, counted=None, always=(), bucket=None, emoji=True, others=False,
+                    awaited=None):
         """Record the owner's new boosts on recordings as `boost` records: a boost is an answer.
 
         `counted` is [(recording id, url, boosts_count, creator id)] (see `boost_items`), each
@@ -501,12 +503,21 @@ class Tools:
         always), they are seeded without recording, so turning this on never replays
         history. Each new boost is recorded only as `confirmed` allows: one to retry leaves
         its recording to be read again next run. `bucket` is where the recordings are
-        (default the project). A dry run records nothing.
+        (default the project). With `emoji` False, a boost whose confirmed content is emoji
+        only (see emoji_only) is seen, logged as skipped and never recorded. A boost on
+        someone else's recording is skipped the same way unless `others` allows it (see
+        confirmed). `awaited` is a followed thread's awaiting mark (rec["awaiting"]): any
+        boost made by its `until` on the agent's comment that holds it (its "comment") is
+        that answer, whatever its text, and clears the mark; one to retry there leaves the
+        later boosts on that comment for the next run too. A dry run records nothing.
+        Returns the ids of the recordings to read again next run (a failed read, or a
+        boost `confirmed` retries).
         """
         counts, seen = rec.get("boost_counts"), rec.get("boost_seen")
         seed_counts, seed_seen = counts is None, seen is None
         counts, seen = dict(counts or {}), list(seen or [])
         items = [(rid, url, None, None) for rid, url in always] + list(counted or [])
+        unread = set()
         for rid, url, count, creator in items:
             if count is not None:
                 if seed_counts:
@@ -518,6 +529,7 @@ class Tools:
                 boosts = self.bc("api", "get", f"/buckets/{bucket or self.project}/recordings/{rid}/boosts.json") or []
             except RuntimeError as e:
                 self.log(f"boosts {surface} {rid}: {e}")
+                unread.add(rid)
                 continue
             retry = False
             for b in sorted(boosts, key=lambda b: b.get("id", 0)):
@@ -528,23 +540,39 @@ class Tools:
                     self.log(f"dry {surface} {rid}: owner boost {bid}")
                     continue
                 if not (count is None and seed_seen):
-                    b = self.confirmed(b, rid, creator, bucket)
+                    b = self.confirmed(b, rid, creator, bucket, others)
                     if b == "retry":
                         retry = True
+                        if awaited is not None and rid == awaited.get("comment"):
+                            break
                         continue
                 seen.append(bid)
                 if count is None and seed_seen or b is None:
                     continue
+                answer = (awaited is not None and rid == awaited.get("comment")
+                          and not history(awaited.get("until"), b.get("created_at"), slack=0))
+                if answer:
+                    awaited = None
+                    rec.pop("awaiting", None)
+                    self.log(f"{surface} {rid}: boost {bid} is the answer awaited there; the mark is cleared")
+                elif not emoji and emoji_only(b.get("content")):
+                    who = (b.get("booster") or {}).get("name") or (b.get("booster") or {}).get("id")
+                    self.log(f"skipped boost {bid} by {who} on {surface} {rid}: emoji only")
+                    continue
                 self.record({"kind": "boost", "surface": surface, **context, "recording": rid, "boost": bid,
+                             **({"why": "awaiting"} if answer else {}),
                              "text": html.unescape(re.sub(r"<[^>]+>", "", b.get("content", ""))).strip(),
                              "url": url, "at": b.get("created_at"), **self.author(b.get("booster"), bucket)})
                 self.log(f"new owner boost on {surface} {rid}: {bid}")
-            if count is not None and not retry:
+            if retry:
+                unread.add(rid)
+            elif count is not None:
                 counts[str(rid)] = count
         if counted is not None:
             rec["boost_counts"] = counts
         if always or seen != list(rec.get("boost_seen") or []):
             rec["boost_seen"] = seen
+        return unread
 
     def received(self):
         """The acting person's received boosts by id: one fresh read of /my/boosts.json a run, shared by notifications
@@ -568,7 +596,7 @@ class Tools:
                 return "retry"
         return self._creators[key]
 
-    def confirmed(self, b, rid, creator=None, bucket=None):
+    def confirmed(self, b, rid, creator=None, bucket=None, others=False):
         """Boost `b`, read from recording `rid`'s boosts, as it may be recorded: the boost, None to drop it, or "retry".
 
         A boost on the acting person's own recording counts only when this run's fresh read
@@ -577,8 +605,10 @@ class Tools:
         proves both that the boost exists and that it was aimed at the agent; the booster,
         content and time are then taken from that read. One it does not list is retried
         while it is younger than RECENT seconds (it may have landed after the read), and
-        then dropped, logged. A boost on anyone else's recording is not aimed at the agent
-        and is recorded as read, and so is every boost when no agent acts (no profile, or the
+        then dropped, logged. A boost on anyone else's recording is not aimed at the agent:
+        it is dropped, logged, unless `others` is True (decision feedback), when it is
+        recorded as read, or "worded" (a to-do request) and its content is not emoji only
+        (see emoji_only). Every boost is recorded as read when no agent acts (no profile, or the
         owner's). `creator` is the recording's creator id when the caller knows it; else the
         recording is refetched, only for a boost the read does not list.
         """
@@ -593,7 +623,11 @@ class Tools:
         if creator == "retry":
             return "retry"
         if creator != me:
-            return b
+            if others is True or others == "worded" and not emoji_only(b.get("content")):
+                return b
+            who = (b.get("booster") or {}).get("name") or (b.get("booster") or {}).get("id")
+            self.log(f"skipped boost {b.get('id')} by {who} on {rid}: not on the agent's own recording")
+            return None
         if feed is None or recent(b.get("created_at")):
             return "retry"
         self.log(f"boost {b.get('id')} on {rid} is not among the agent's received boosts; not recorded")
@@ -652,7 +686,7 @@ class Tools:
                 if self.dry:
                     self.log(f"dry {key}: owner boost {bid}")
                     continue
-                b = b if seed else self.confirmed(b, rec["card"])
+                b = b if seed else self.confirmed(b, rec["card"], others=True)  # the card is the agent's task
                 if b == "retry":
                     continue
                 rec.setdefault("card_boost_seen", []).append(bid)
@@ -667,7 +701,7 @@ class Tools:
                 self.log(f"dry {key}: captain approval boost {bid}")
                 self.acknowledge(key, dict(rec, ack=[*rec.get("ack", []), [rec["card"], THUMBS]]))
                 continue
-            b = self.confirmed(b, rec["card"])
+            b = self.confirmed(b, rec["card"], others=True)  # an approval is a decision on the agent's card
             if b == "retry":
                 continue
             if b is None:
@@ -1175,13 +1209,17 @@ class Tools:
         """The owner's boosts on the to-do (read every run), on each open subtask or decision step (read every run: a
         boost there answers that decision), and on its comments (when their count changes)."""
         ctx, bucket = {"key": key, "todo": rec["todo"], **request_fields(rec)}, rec.get("bucket")
-        self.read_boosts(rec, "todo", ctx, always=[(rec["todo"], rec.get("url"))], bucket=bucket)
+        # On a decision to-do, or a to-do or card a decision step is on, any boost is decision feedback, whoever made
+        # what was boosted; on a request otherwise, a worded boost on anyone's recording counts, an emoji-only one only
+        # on the agent's own.
+        decision = True if not rec.get("request") or any(q.get("decider") for q in rec.get("subtasks") or []) else "worded"
+        self.read_boosts(rec, "todo", ctx, always=[(rec["todo"], rec.get("url"))], bucket=bucket, others=decision)
         for n, q in enumerate(rec.get("subtasks") or [], 1):
             if not q.get("done") and q.get("id"):
                 self.read_boosts(rec, "subtask", dict(ctx, step=n, question=q.get("text")),
-                                 always=[(q["id"], rec.get("url"))], bucket=bucket)
+                                 always=[(q["id"], rec.get("url"))], bucket=bucket, others=True)
         self.read_boosts(rec, "todo-comment", ctx, bucket=bucket,
-                         counted=boost_items(comments))
+                         counted=boost_items(comments), others=decision)
 
     def readings(self):
         """The acting user's notifications, one read of /my/readings.json: {"unreads": [...], "reads": [first page], ...}."""
@@ -1204,9 +1242,12 @@ class Tools:
         read and unread, lists each recently active Ping with a listened-to person among
         its participants or as its creator (with "blocked" on, every Ping, so anyone else's
         line there gets the automatic reply); the bucket and chat ids come from its
-        subscription_url. Newest activity first.
+        subscription_url. A Ping with two or more people besides the acting user (Basecamp
+        lists the others as its participants) is a group Ping ("group": true). Newest
+        activity first.
         """
         data = self.readings() if data is None else data
+        me = self.acting_id()
         found = {}
         for r in (data.get("unreads") or []) + (data.get("reads") or []):
             m = re.search(r"/buckets/(\d+)/recordings/(\d+)/", r.get("subscription_url") or "")
@@ -1216,8 +1257,10 @@ class Tools:
             # "blocked": every Ping, to answer. A Ping is a bucket of its own, so "project_people" never admits there.
             if self.blocked_reply is None and not any(self.hears(p, bucket=m.group(1)) for p in people):
                 continue
+            others = {p.get("id") for p in people if p.get("id") is not None and p.get("id") != me}
             found.setdefault(m.group(2), {"bucket": m.group(1), "chat": m.group(2), "title": r.get("bucket_name"),
-                                          "url": r.get("app_url"), "updated_at": r.get("updated_at") or ""})
+                                          "url": r.get("app_url"), "updated_at": r.get("updated_at") or "",
+                                          "group": len(others) >= 2})
         return sorted(found.values(), key=lambda p: p["updated_at"], reverse=True)
 
     def read_pings(self, limit=10, convs=None):
@@ -1229,10 +1272,16 @@ class Tools:
         "since" (when the behavior first ran) and, per Ping chat, a
         cursor (the newest line id seen): every owner line newer than both is recorded and
         queued for a 👀, so a Ping that starts after "since" is relayed from its first line
-        and history from before it never is. The owner's boosts on lines in a Ping are
-        `boost` records, as in a chat. Refused (logged) unless the acting user is someone
-        other than the owner: /my/readings.json is the acting user's. A dry run reads and
-        logs only.
+        and history from before it never is. In a group Ping (three or more people; pings.json
+        keeps "group") a line is relayed only when it @mentions the acting user or directly
+        follows one of its lines, as in a chat; any other
+        line there is skipped (one "skipped line" log line, and no automatic reply to someone
+        not listened to). In any Ping, a line that is only attachments (an image, a file),
+        directly after a line by the same person relayed in the same read, is folded into
+        that line's record ("attachments") instead of a record of its own. The owner's boosts
+        on the acting user's lines in a Ping are `boost` records, as in a chat. Refused
+        (logged) unless the acting user is someone other than the owner: /my/readings.json is
+        the acting user's. A dry run reads and logs only.
         """
         if self.agent() is None:
             self.log("pings: the acting user is the owner, unset or unknown; Pings not read")
@@ -1254,27 +1303,39 @@ class Tools:
             lines = sorted(lines, key=lambda l: l.get("id", 0))
             rec = json.loads(json.dumps(state.get("pings", {}).get(chat, {})))
             rec.update(bucket=int(bucket), title=p["title"], url=p["url"])
-            cursor = rec.get("cursor", 0)
+            if "group" in p:  # a conversation from the readings says; one built from a boost keeps what was known
+                rec["group"] = bool(p["group"])
+            cursor, me, before, held = rec.get("cursor", 0), self.acting_id(), None, Held(self)
             for ln in lines:
-                lid = ln.get("id", 0)
+                lid, prev, before = ln.get("id", 0), before, ln
                 if lid <= cursor:
                     continue
                 cursor = lid
                 if not later(ln.get("created_at"), since):
                     continue
-                if not self.hears(ln.get("creator"), bucket=bucket):
-                    self.block(ln.get("creator"), bucket, chat, lid, ln.get("created_at"), chat=True, what="Ping line")
+                if held.fold(ln, prev, f"ping {chat}"):
+                    continue
+                who = ln.get("creator") or {}
+                if rec.get("group") and not (self.addressed(ln.get("content"))
+                                             or (prev and (prev.get("creator") or {}).get("id") == me)):
+                    if self.hears(who, bucket=bucket):
+                        self.log(f"{'dry ' if self.dry else ''}skipped line {lid} by {who.get('name') or who.get('id')} "
+                                 f"in group Ping {chat}: no @mention of the agent, not after its line")
+                    continue
+                if not self.hears(who, bucket=bucket):
+                    self.block(who, bucket, chat, lid, ln.get("created_at"), chat=True, what="Ping line")
                     continue
                 if self.dry:
                     self.log(f"dry ping {chat}: owner line {lid}")
                     continue
-                self.record({"kind": "ping", "bucket": int(bucket), "chat": int(chat), "line": lid, "title": p["title"],
-                             "url": ln.get("app_url") or f"https://app.basecamp.com/{self.account}/circles/{bucket}@{lid}",
-                             "text": html.unescape(re.sub(r"<[^>]+>", "", ln.get("content", ""))).strip(),
-                             "at": ln.get("created_at"), **self.author(ln.get("creator"), bucket)})
+                held.hold(ln, {"kind": "ping", "bucket": int(bucket), "chat": int(chat), "line": lid, "title": p["title"],
+                               "url": ln.get("app_url") or f"https://app.basecamp.com/{self.account}/circles/{bucket}@{lid}",
+                               "text": html.unescape(re.sub(r"<[^>]+>", "", ln.get("content", ""))).strip(),
+                               "at": ln.get("created_at"), **self.author(who, bucket)})
                 rec.setdefault("lines", []).append(lid)
                 rec.setdefault("ack", []).append([lid, self.read_ack()])
                 self.log(f"new owner ping line in {chat}: {lid}")
+            held.flush()
             self.read_boosts(rec, "ping", {"bucket": int(bucket), "chat": int(chat)}, bucket=bucket,
                              counted=boost_items(lines))
             self.acknowledge(f"ping {chat}", rec, bucket)
@@ -1711,12 +1772,25 @@ class Tools:
         or not, a mirrored card, the agent's own message), so what was already read is not
         replayed; a comment such a reader recorded or answered is never recorded here
         again. Each new comment by someone listened to is a
-        `mention` record when it is in `mentions` (a notification said so) or @mentions the
-        acting user, else a `thread-comment`, and is queued for a 👀 when it is a mention or
+        `mention` record when it is in `mentions` (a notification said so: an @mention, or a
+        Basecamp Reply to the agent's comment) or @mentions the acting user; a comment in
+        `mentions` is recorded even when the cursor has passed it, unless it already was or
+        another reader read past it. Any other comment is a `thread-comment` only when the
+        thread awaits an answer (the agent's `reply --awaiting` there, unexpired; the first
+        such comment after that reply is relayed and clears the mark, "why": "awaiting", unless
+        a boost on the agent's comment holding the mark, made by that comment's time, answered
+        it first: the boosts are read before the comments for that, and while they cannot all
+        be read, the first comment that would answer and every later one wait for the next
+        run), or the thread is the
+        agent's own ("why": "yours"); else it is skipped, with one "skipped" line in sync.log
+        and no record and no boost. Who made the thread is read before any record, and a
+        failed read leaves the whole thread to the next run.
+        A relayed comment is queued for a 👀 when it is a mention or
         contains "?", a 👍 otherwise. `reply` answers either with a comment on the thread.
         `ptype` and `title` name the thread when the comments do not. The owner's boosts on
         its comments (the agent's replies included) are `boost` records with surface
-        `thread-comment`. A thread in another project ("mentions": {"scope": "account"}) is
+        `thread-comment`, except a boost of emoji only (see emoji_only), which is
+        skipped. A thread in another project ("mentions": {"scope": "account"}) is
         read the same way, the people heard as in "project_people" for that project, and its
         records carry that `project`. A dry run reads and logs only.
         """
@@ -1736,23 +1810,70 @@ class Tools:
                                                        "cursor": max((since or 1) - 1, floor),
                                                        "parent_type": ptype, "title": title}))
         self.acting_id()
-        cursor = rec["cursor"]
+        cursor, fresh = rec["cursor"], []
         for c in sorted(comments, key=lambda c: c.get("id", 0)):
             cid = c.get("id", 0)
-            if cid <= cursor:
+            if cid <= rec["cursor"]:
+                if not new and cid > floor and cid in mentions and cid not in known | set(rec.get("comments", []) + rec.get("folded", [])):
+                    fresh.append((c, True))
                 continue
             cursor = cid
             if new and since is None and after and history(c.get("created_at"), after):
                 continue  # there before the notification: the thread's history, not new input
-            if cid in known:
+            if cid not in known:
+                fresh.append((c, cid in mentions or self.addressed(c.get("content"))))
+        heard = [(c, mention) for c, mention in fresh if self.hears(c.get("creator"), bucket=bucket)]
+        mine = False  # whether the agent made the thread itself: read (cached per run), before any record, when needed
+        if any(not mention for _, mention in heard):
+            creator = self.creator_of(thread, bucket)
+            if creator == "retry":
+                self.log(f"thread {thread}: who made it could not be read, retrying next run")
+                return
+            mine = creator is not None and creator == self.acting_id()
+        mark = rec.get("awaiting") or None
+        first = min((c for c, _ in heard if mark is not None and answered(c, mark)), key=lambda c: c.get("id", 0), default=None)
+        # The boosts first, so the earliest answer (a boost by the first answering comment's time, or that comment) wins.
+        awaited = None
+        if mark is not None and mark.get("comment"):
+            awaited = dict(mark, until=first.get("created_at") if first else mark.get("until"))
+        unread = self.read_boosts(rec, "thread-comment", {"bucket": int(bucket), "parent": thread, "title": rec.get("title")},
+                                  bucket=bucket, counted=boost_items(comments), emoji=False, awaited=awaited)
+        mark, held, after_of = rec.get("awaiting") or None, Held(self), {}
+        if mark is not None and first is not None and mark.get("comment") in unread:
+            self.log(f"thread {thread}: the boosts on {mark['comment']}, which awaits an answer, could not all be read; "
+                     f"comment {first.get('id')} and later wait for the next run")
+            fresh = [(c, m) for c, m in fresh if c.get("id", 0) < first.get("id", 0)]
+            cursor = min(cursor, max(rec["cursor"], first.get("id", 0) - 1))
+            self.errors += 1
+        ordered = sorted(comments, key=lambda c: c.get("id", 0))
+        for a, b in zip(ordered, ordered[1:]):
+            after_of[b.get("id")] = a
+        for c, mention in fresh:
+            cid = c.get("id", 0)
+            if held.fold(c, after_of.get(cid), f"thread {thread}"):
+                rec.setdefault("folded", []).append(cid)  # delivered inside the held note: a late mention of it is no news
                 continue
-            mention = cid in mentions or self.addressed(c.get("content"))
             if not self.hears(c.get("creator"), bucket=bucket):
                 if mention:
                     self.block(c.get("creator"), bucket, thread, cid, c.get("created_at"), what="comment")
                 continue
+            answers = mark is not None and answered(c, mark)
+            if not mention and not answers and not mine:
+                who = (c.get("creator") or {}).get("name") or (c.get("creator") or {}).get("id")
+                why_not = ("no answer awaited" if mark is None else
+                           "posted after the answer awaited there was due" if history(mark.get("until"), c.get("created_at"), slack=0)
+                           else "posted before the agent's reply that awaits an answer")
+                self.log(f"{'dry ' if self.dry else ''}skipped comment {cid} by {who} on "
+                         f"{rec.get('parent_type') or 'thread'} {thread}: no @mention or reply to the agent, {why_not}, "
+                         "not the agent's own thread")
+                continue
             text = plain(c.get("content"))
             on = c.get("parent") or {}
+            if answers:  # before the dry run's stop too, so a dry run shows only the one answer
+                mark = None
+                rec.pop("awaiting", None)
+                self.log(f"{'dry ' if self.dry else ''}thread {thread}: comment {cid} is the answer awaited there; "
+                         "the mark is cleared")
             if self.dry:
                 self.log(f"dry thread {thread}: owner {'mention' if mention else 'comment'} {cid}")
                 continue
@@ -1760,15 +1881,21 @@ class Tools:
             elsewhere = self.elsewhere(bucket, c, rec)
             if elsewhere:
                 rec["project_name"] = elsewhere["project"]["name"]
-            self.record({"kind": "mention" if mention else "thread-comment", "bucket": int(bucket), "parent": thread,
-                         "parent_type": rec.get("parent_type"), "title": rec.get("title"), "comment": cid,
-                         "question": "?" in text, "url": c.get("app_url") or on.get("app_url"), "text": text,
-                         "at": c.get("created_at"), **elsewhere, **self.author(c.get("creator"), bucket)})
+            held.hold(c, {"kind": "mention" if mention else "thread-comment", "bucket": int(bucket), "parent": thread,
+                          "parent_type": rec.get("parent_type"), "title": rec.get("title"), "comment": cid,
+                          "question": "?" in text, "url": c.get("app_url") or on.get("app_url"), "text": text,
+                          "at": c.get("created_at"), **({} if mention else {"why": "awaiting" if answers else "yours"}), **elsewhere,
+                          **self.author(c.get("creator"), bucket)})
             rec.setdefault("comments", []).append(cid)
             rec.setdefault("ack", []).append([cid, self.read_ack(mention or "?" in text)])
             self.log(f"new owner {'mention' if mention else 'comment'} on {rec.get('parent_type') or 'thread'} {thread}: {cid}")
-        self.read_boosts(rec, "thread-comment", {"bucket": int(bucket), "parent": thread, "title": rec.get("title")},
-                         bucket=bucket, counted=boost_items(comments))
+        held.flush()
+        mark = rec.get("awaiting") or None
+        # `until` passed with no answer by then, and no boost on its comment is left to read
+        if mark is not None and not history(now_iso(), mark.get("until"), slack=0) and mark.get("comment") not in unread:
+            rec.pop("awaiting", None)
+            self.log(f"thread {thread}: the answer awaited since {mark.get('at')} did not come by {mark.get('until')}; "
+                     "the mark is cleared")
         self.acknowledge(f"thread {thread}", rec, bucket)
         if not self.dry:
             rec["cursor"] = cursor
@@ -1847,7 +1974,7 @@ class Tools:
 
     # --- commands: explicit posts, run by the agent ---
 
-    def reply(self, rid, text=None, again=False, boost=None):
+    def reply(self, rid, text=None, again=False, boost=None, awaiting=False):
         """Answer the captain's comment or line `rid` where it was made, then take the acting user's 👀 off it.
 
         A card comment is answered with a comment on that card, a chat or Ping line with
@@ -1858,11 +1985,21 @@ class Tools:
         👀 stays. With `boost` (text of at most BOOST_MAX characters) the answer is that
         boost on `rid` itself instead of a comment or line, recorded and followed the same
         way; longer or empty text is refused (raised) before anything is read or posted.
+        With `awaiting` on a followed thread's comment (threads.json), the thread is marked
+        as awaiting an answer for AWAIT_DAYS days: the next comment there from anyone
+        listened to but the agent is relayed even without an @mention, which clears the
+        mark (see read_thread). Anywhere else every comment or line
+        that is input already reaches the agent, so `awaiting` is logged and ignored there.
         """
         if boost is not None:
             boost = boost.strip()
             if not boost or len(boost) > BOOST_MAX:
                 raise ValueError(f"a boost holds 1 to {BOOST_MAX} characters, not {len(boost)}: {boost!r}")
+        threads = self.load("threads.json", {})
+        if awaiting and not any(rid in r.get("comments", []) for r in threads.values()):
+            self.log(f"reply {rid}: --awaiting ignored: it marks only a followed thread (threads.json), and every "
+                     "comment or line that is input elsewhere already reaches the agent")
+            awaiting = False
         ping = next((c for c, r in self.load("pings.json", {}).get("pings", {}).items() if rid in r.get("lines", [])), None)
         if ping is not None:
             return self.reply_ping(ping, rid, text, again, boost)
@@ -1878,10 +2015,9 @@ class Tools:
             post = next((k for k, r in self.load("messages.json", {}).get("posts", {}).items() if rid in r.get("comments", [])), None)
         if post is not None:
             return self.reply_message(post, rid, text, again, boost)
-        thread = None if chat is not None else next(
-            (k for k, r in self.load("threads.json", {}).items() if rid in r.get("comments", [])), None)
+        thread = None if chat is not None else next((k for k, r in threads.items() if rid in r.get("comments", [])), None)
         if thread is not None:
-            return self.reply_thread(thread, rid, text, again, boost)
+            return self.reply_thread(thread, rid, text, again, boost, awaiting)
         bucket = None
         if chat is not None:
             store, rec = ("chats.json", chats), chats[chat]
@@ -1975,8 +2111,10 @@ class Tools:
         self.remove_eyes(rid, None, answer)
         return True
 
-    def reply_thread(self, key, rid, text, again, boost=None):
-        """Answer the owner's comment `rid` on thread `key` (threads.json) with a comment (Markdown) there, in its bucket."""
+    def reply_thread(self, key, rid, text, again, boost=None, awaiting=False):
+        """Answer the owner's comment `rid` on thread `key` (threads.json) with a comment (Markdown) there, in its bucket;
+        with `awaiting`, mark the thread as awaiting an answer for AWAIT_DAYS days (threads.json "awaiting": the agent's
+        comment, when posted as one, and when the mark was set and ends)."""
         rec = self.load("threads.json", {})[key]
         if rid in rec.get("replied", []) and not again:
             self.log(f"reply {rid}: already replied, pass --again to post another")
@@ -1985,12 +2123,29 @@ class Tools:
             return False
         where = f"{rec.get('parent_type') or 'thread'} {rec['thread']}"
         if self.dry:
-            self.log(f"dry reply {rid}: {self.reply_plan(rid, f'comment on {where}', boost)}, then remove {EYES}")
+            mark = f", mark it awaiting an answer for {AWAIT_DAYS} days" if awaiting else ""
+            self.log(f"dry reply {rid}: {self.reply_plan(rid, f'comment on {where}', boost)}{mark}, then remove {EYES}")
             return False
-        answer = self.reply_send(rid, f"on {where}", boost, rec.get("bucket"), lambda: self.bc(
-            "comments", "create", str(rec["thread"]), "-", input=text, project=rec.get("bucket")))
+        posted = {}
+
+        def post():
+            out = self.bc("comments", "create", str(rec["thread"]), "-", input=text, project=rec.get("bucket"))
+            posted.update(out if isinstance(out, dict) else {})
+        answer = self.reply_send(rid, f"on {where}", boost, rec.get("bucket"), post)
         state = self.load("threads.json", {})
         state[key].setdefault("replied", []).append(rid)
+        if awaiting:
+            now = datetime.now(timezone.utc)
+            until = (now + timedelta(days=AWAIT_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            held = state[key].get("awaiting")
+            if held and history(now_iso(), held.get("until"), slack=0):
+                # A mark not yet answered nor expired keeps its comment and start, so the answer to the first question,
+                # posted before this reply, still counts; only its end moves.
+                state[key]["awaiting"] = dict(held, until=until)
+            else:
+                state[key]["awaiting"] = {"comment": posted.get("id"), "at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "until": until}
+            self.log(f"reply {rid}: {where} awaits an answer until {state[key]['awaiting']['until']}: the next comment "
+                     "there is relayed")
         self.save_json("threads.json", state)
         self.remove_eyes(rid, rec.get("bucket"), answer)
         return True
@@ -2894,6 +3049,87 @@ def md_inline(text):
     s = re.sub(r"(?<![\w_])_(?=\S)(.+?)(?<=\S)_(?![\w_])", r"<em>\1</em>", s)
     s = re.sub(r"~~(?=\S)(.+?)(?<=\S)~~", r"<strike>\1</strike>", s)
     return re.sub(r"\0(\d+)\0", lambda m: codes[int(m.group(1))], s)
+
+
+class Held:
+    """The last record a reader made in this read, held back so a line or comment of attachments only that directly
+    follows it, by the same person, is folded into it ("attachments") rather than recorded on its own."""
+
+    def __init__(self, t):
+        self.t, self.item, self.rec = t, None, None
+
+    def hold(self, item, rec):
+        """Record `rec` (for line or comment `item`) once nothing more can fold into it; the one held before is recorded now."""
+        self.flush()
+        files = attachments(item)
+        self.item, self.rec = item, dict(rec, **({"attachments": files} if files else {}))
+
+    def fold(self, item, prev, where):
+        """True (logged) when `item` is attachments only, `prev` (the line or comment just before it) is the one held, and
+        both are by the same person: its attachments are added to the held record."""
+        if (self.item is None or prev is None or prev.get("id") != self.item.get("id") or not attachments_only(item)
+                or (item.get("creator") or {}).get("id") != (prev.get("creator") or {}).get("id")):
+            return False
+        self.rec.setdefault("attachments", []).extend(attachments(item))
+        self.item = item  # a run of attachment lines folds into the same record
+        self.t.log(f"{where}: {item.get('id')} (attachments only) folded into the note for {self.rec.get('line') or self.rec.get('comment')}")
+        return True
+
+    def flush(self):
+        if self.rec is not None:
+            self.t.record(self.rec)
+        self.item = self.rec = None
+
+
+def attachments(item):
+    """[{"filename", "url"}] of a chat line's uploads ("attachments") or a comment's attached files (its rich text's
+    bc-attachment tags, an @mention aside)."""
+    out = [{"filename": a.get("filename") or a.get("title"), "url": a.get("url") or a.get("download_url")}
+           for a in item.get("attachments") or []]
+    for tag in re.findall(r"<bc-attachment\b[^>]*>", item.get("content") or ""):
+        attrs = dict(re.findall(r'([\w-]+)="([^"]*)"', tag))
+        if attrs.get("content-type") != "application/vnd.basecamp.mention":
+            out.append({"filename": html.unescape(attrs.get("filename") or attrs.get("caption") or ""),
+                        "url": html.unescape(attrs.get("href") or attrs.get("url") or "")})
+    return out
+
+
+def attachments_only(item):
+    """True when line or comment `item` holds attachments and no text of its own."""
+    text = re.sub(r"<bc-attachment\b.*?(?:</bc-attachment>|/>)", " ", item.get("content") or "", flags=re.S)
+    return bool(attachments(item)) and not plain(text)
+
+
+def answered(comment, mark):
+    """True when comment `comment` answers awaiting mark `mark`: posted by its `until` (whenever it is read), and after
+    the agent's reply that set it: after its comment, or (a reply posted as a boost) not before the time it was set."""
+    if history(mark.get("until"), comment.get("created_at"), slack=0):
+        return False  # posted after the mark ended
+    if mark.get("comment"):
+        return comment.get("id", 0) > mark["comment"]
+    return not history(comment.get("created_at"), mark.get("at"), slack=0)
+
+
+# Unicode's Extended_Pictographic code points (emoji-data.txt), as ranges "first[..last]" in hex.
+PICTOGRAPHIC = [tuple(int(x, 16) for x in (r.split("..") * 2)[:2]) for r in """
+    00A9 00AE 203C 2049 2122 2139 2194..2199 21A9..21AA 231A..231B 2328 2388 23CF 23E9..23F3 23F8..23FA 24C2
+    25AA..25AB 25B6 25C0 25FB..25FE 2600..2605 2607..2612 2614..2685 2690..2705 2708..2712 2714 2716 271D 2721 2728
+    2733..2734 2744 2747 274C 274E 2753..2755 2757 2763..2767 2795..2797 27A1 27B0 27BF 2934..2935 2B05..2B07
+    2B1B..2B1C 2B50 2B55 3030 303D 3297 3299 1F000..1F0FF 1F10D..1F10F 1F12F 1F16C..1F171 1F17E..1F17F 1F18E
+    1F191..1F19A 1F1AD..1F1E5 1F201..1F20F 1F21A 1F22F 1F232..1F23A 1F23C..1F23F 1F249..1F3FA 1F400..1F53D
+    1F546..1F64F 1F680..1F6FF 1F774..1F77F 1F7D5..1F7FF 1F80C..1F80F 1F848..1F84F 1F85A..1F85F 1F888..1F88F
+    1F8AE..1F8FF 1F90C..1F93A 1F93C..1F945 1F947..1FAFF 1FC00..1FFFD""".split()]
+# What joins or modifies emoji: variation selectors, the zero-width joiner, skin tones, regional indicators, tags.
+EMOJI_PARTS = [(0xFE0E, 0xFE0F), (0x200D, 0x200D), (0x1F3FB, 0x1F3FF), (0x1F1E6, 0x1F1FF), (0xE0020, 0xE007F)]
+
+
+def emoji_only(content):
+    """True when boost `content` (HTML) is emoji and whitespace only: each character Extended_Pictographic or a part
+    of an emoji (EMOJI_PARTS), or within a keycap such as 1️⃣; letters, digits, ✓ and punctuation such as ? or !! are
+    not emoji."""
+    text = re.sub(r"\s+", "", html.unescape(re.sub(r"<[^>]+>", "", content or "")))
+    rest = re.sub("[0-9#*]\ufe0f?\u20e3", "", text)
+    return bool(text) and all(any(a <= ord(ch) <= b for a, b in PICTOGRAPHIC + EMOJI_PARTS) for ch in rest)
 
 
 def is_emoji(content, emoji):

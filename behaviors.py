@@ -1172,7 +1172,9 @@ class Notifications(Behavior):
         closing check;
       - a check-in Reminder (checkin-answering on): the check-in reader;
       - an owner's @mention of the agent in a thread nothing tracks: a `chat-question`
-        (in a chat) or `mention` record of its own.
+        (in a chat) or `mention` record of its own; any other comment there only when the
+        thread awaits an answer (`reply --awaiting`), else it is skipped
+        (Tools.read_thread).
 
     Owner input in the project that none of these handles (a comment on a Document, a
     line in a chat not in "chats", a to-do assigned with assigned-todos off) is an
@@ -1496,13 +1498,14 @@ class Notifications(Behavior):
             want["chats"].setdefault(str(parent.get("id")), set())
             return True, [f"chat {parent.get('id')}"], None
         if rtype == "Chat::Lines" and bucket != t.project:
-            circles = {str(c["bucket"]) for c in t.ping_conversations(data)} | {
+            convs = {str(c["chat"]): c for c in t.ping_conversations(data)}
+            circles = {str(c["bucket"]) for c in convs.values()} | {
                 str(p.get("bucket")) for p in t.load("pings.json", {}).get("pings", {}).values()}
             if not b["pings"].on or bucket not in circles:
                 return False, [], None  # a line in another project's chat is another home's
             chat = str(parent.get("id"))
-            want["pings"][chat] = {"bucket": bucket, "chat": chat, "title": (rec.get("bucket") or {}).get("name"),
-                                   "url": rec.get("app_url")}
+            want["pings"].setdefault(chat, convs.get(chat) or {"bucket": bucket, "chat": chat, "url": rec.get("app_url"),
+                                                               "title": (rec.get("bucket") or {}).get("name")})
             return True, [f"ping {chat}"], None
         if keys:
             open_keys = {k for k in keys if not todos[k].get("completed") and not todos[k].get("closed")}
@@ -1679,7 +1682,9 @@ def inbox_note(rec, account, project):
                  "thread-comment": f"a comment on {rec.get('title')!r}" if rec.get("title") else "a comment"}.get(rec.get("surface"), rec.get("surface"))
         what = f"Basecamp boost from {who} on {where} (recording {rec.get('recording')})"
         facts = ["a boost answers what was boosted, like a comment there"] + (
-            ["part of the request"] if rec.get("request") and rec.get("surface") in ("todo", "todo-comment") else [])
+            ["part of the request"] if rec.get("request") and rec.get("surface") in ("todo", "todo-comment") else []) + (
+            ["it is on your reply that awaited an answer (reply --awaiting): it is that answer, and the thread no "
+             "longer awaits one"] if rec.get("why") == "awaiting" else [])
         if rec.get("surface") == "subtask":
             facts.append("a boost on a decision step is the answer to that decision")
             cmds = [f"sync.py todo comment --todo {key}"] + (
@@ -1737,7 +1742,10 @@ def inbox_note(rec, account, project):
         rid = rec.get("comment")
         what = (f"Basecamp {'@mention of you' if kind == 'mention' else 'comment'} from {who} on "
                 f"{rec.get('parent_type') or 'a recording'}" + (f" {rec.get('title')!r}" if rec.get("title") else "") + elsewhere)
-        facts = ["addressed to you" if kind == "mention" else "on something you follow"]
+        facts = ["addressed to you" if kind == "mention" else
+                 "the first comment there after your reply that awaited an answer (reply --awaiting); "
+                 "the thread no longer awaits one" if rec.get("why") == "awaiting" else
+                 "on something you made" if rec.get("why") == "yours" else "on something you follow"]
         cmds, url = [f"sync.py reply --recording {rid} (answers there)"], rec.get("url")
     elif kind == "decision-step-done":
         rid = f"{rec.get('todo')}-{rec.get('step')}"
@@ -1827,7 +1835,9 @@ def inbox_note(rec, account, project):
             kind == "todo-comment" and not rec.get("request")):
         facts.append("they are not the captain: their word never authorizes a decision or approval")
     request_id = re.sub(r"[^A-Za-z0-9._:-]", "-", f"basecamp-{kind}-{rid}")[:128]
-    lines = [what + ":", text, url or "", ("Facts: " + "; ".join(facts) + ".") if facts else "",
+    files = "; ".join(f"{a.get('filename') or 'file'} ({a.get('url')})" if a.get("url") else str(a.get("filename") or "file")
+                      for a in rec.get("attachments") or [])
+    lines = [what + ":", text, ("Attachments: " + files) if files else "", url or "", ("Facts: " + "; ".join(facts) + ".") if facts else "",
              ("Commands: " + "; ".join(cmds) + ".") if cmds else "",
              "Handle it as this home's Basecamp defaults say (data/basecamp-sync/defaults.md), then ack this note with "
              "fm-inbox.sh drain --ack <note id>."]

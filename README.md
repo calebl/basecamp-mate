@@ -77,12 +77,12 @@ policy. Each does one thing to the configured account and project:
 | boost reader | reader | reads the boosts on the agent login's own recordings (`/my/boosts.json`, one call) and hands each new one to a behavior; records nothing itself |
 | mark read | primitive | marks the agent login's notifications read (`basecamp notifications read`, i.e. `PUT /my/unreads.json`) |
 | Ping reader | reader | finds the Pings (direct messages) the agent's login is in with the owner through `/my/readings.json` and records each new line the owner writes there as `ping` |
-| thread reader | reader | records the owner's new comments on any other thread the agent's login follows or is @mentioned in (a card whatever its backlog state, a document, an upload, someone else's to-do or message) as `thread-comment` or `mention`, and a mention in a chat nothing relays as `chat-question`; in the project, or, with `"mentions": {"scope": "account"}`, any project of the account |
+| thread reader | reader | records the owner's new comments on any other thread the agent's login follows or is @mentioned in (a card whatever its backlog state, a document, an upload, someone else's to-do or message) as `mention` when they @mention or Reply to the agent, and as `thread-comment` only when the thread awaits the agent's answer or the agent made it (see "Followed threads" below; it skips the rest), and a mention in a chat nothing relays as `chat-question`; in the project, or, with `"mentions": {"scope": "account"}`, any project of the account |
 | to-do request readers | reader | find the open to-dos in the project (or, with `"scope": "account"`, any project of the account) assigned to the agent's login (`/my/assignments.json`, or a to-do event) and record each one a listened-to person assigned as `todo-request`, once; then its edits and closing as `todo-request-update` and `todo-request-closed` |
 | message comment reader | reader | records the owner's new comments on the agent's own recent Message Board posts as `message-comment` |
 | boost readers | reader | record the owner's new boosts, with their text, on every monitored surface as `boost` (below); a boost on the agent login's own recording only once its received-boosts feed lists it |
 | unmonitored recorder | reader | records owner input that no behavior handles as `unmonitored`, once per kind of thing (below) |
-| `sync.py reply` | command | answers a recorded comment, chat line, Ping line, to-do comment, thread comment or mention where it was made (with `--boost`, as a boost of 16 characters or fewer on it), then removes the 👀 |
+| `sync.py reply` | command | answers a recorded comment, chat line, Ping line, to-do comment, thread comment or mention where it was made (with `--boost`, as a boost of 16 characters or fewer on it), then removes the 👀; with `--awaiting`, on a followed thread, the next comment there is relayed |
 | `sync.py ask` | command | posts a new chat line @mentioning the owner |
 | `sync.py watch`, `sync.py unwatch` | command | starts or stops watching one chat in any project of the account (kept in `chats.json`, not the config): its listened-to lines after a given line are recorded as `chat-question` (see "Chat watches") |
 | `sync.py answer` | command | answers a check-in question, once per question per day |
@@ -342,7 +342,7 @@ own:
 | a comment or @mention on a mirrored card | that card's comment and 👍 readers, also for a card whose task has left the backlog (the mirror itself leaves such a card as it is) |
 | a comment or @mention on an open tracked to-do (a decision to-do or a request) | that to-do's comment reader |
 | a comment on one of the agent's own messages (with `reports` on) | that message's reader, whatever its age |
-| a comment or @mention on any other thread in the project (a document, an upload, someone else's to-do or message, a card nothing mirrors, a tracked to-do once completed or closed) | the thread reader: `thread-comment` or `mention` records. A thread's first read starts at the notification's first unread comment (or, when it names none, at when it became unread), and never before the newest comment a to-do, card or message reader already read there; a comment one of them recorded or answered is never recorded again |
+| a comment or @mention on any other thread in the project (a document, an upload, someone else's to-do or message, a card nothing mirrors, a tracked to-do once completed or closed) | the thread reader: `mention` records, and `thread-comment` records only as "Followed threads" below says. A thread's first read starts at the notification's first unread comment (or, when it names none, at when it became unread), and never before the newest comment a to-do, card or message reader already read there; a comment one of them recorded or answered is never recorded again |
 | an @mention of the agent in a chat nothing relays | a `chat-question` for that line |
 | with `"mentions": {"scope": "account"}`, a comment or @mention on a thread in another project of the account, or an @mention of the agent in a chat there | the thread reader, or the chat mention reader, as in the project (see "Mentions anywhere in the account" below) |
 | `Assignment` or `Completion` of a to-do (with `assigned_todos` on; in any project with `"scope": "account"`) | the to-do request reader, or the request's edit and closing check; the notification says who assigned or completed it |
@@ -381,6 +381,77 @@ new, so someone marking everything read in a browser loses nothing. An item whos
 had a failed call keeps its old cursor and is not marked: the next run retries it, and the
 readers' own cursors make that harmless. A failed mark is retried next run.
 
+**Followed threads.** Basecamp subscribes the agent's login to every thread it comments on or
+is @mentioned in, so most comments there are other people talking to each other. On such a
+thread (the thread reader's, above: not a mirrored card, a tracked to-do or the agent's own
+message, whose readers relay every comment as before) a new comment by someone listened to
+reaches the agent only when one of these holds:
+
+- it @mentions the agent, or it is a Basecamp Reply to one of the agent's comments (Basecamp
+  sends both as a mention notification, though a Reply's text has no @mention): a `mention`;
+- the thread awaits an answer: a `sync.py reply --awaiting` there set a mark that has not
+  expired, and nobody listened to has answered since. The first comment after the reply that
+  set it, from anyone listened to but the agent, is relayed (`thread-comment` with `"why":
+  "awaiting"`, or a `mention`) and clears the mark; so does a boost on that reply (below);
+- the agent made the thread itself (its login is the creator of the card, document, upload
+  or other recording; read once a run): `thread-comment` with `"why": "yours"`.
+
+Any other comment is skipped: one `skipped comment <id> by <name> on <type> <thread>: <why>`
+line in `sync.log` (no answer awaited, or posted before the reply that awaits one, or after
+the mark ended), no record and no 👀 or 👍. The thread's cursor still moves past it, so it is
+never read again, unless a mention notification later names it (a Reply that arrived
+while the thread was being read): then it is recorded as a `mention`, unless it already
+was or was folded into a note (below). The rule is deterministic: the text of a comment (a `?`, a name) never decides it, so
+an ask that only names the agent, with no @mention or Reply, is skipped.
+A comment of attachments only (an image, a file) right after a relayed comment by the same
+person, in the same read, is folded into that comment's record (`attachments`: `filename`
+and `url` each) instead of being judged on its own. Chat lines, @mentions, to-do and card
+requests, completions and every other reader are unchanged; group Pings are read as below.
+
+`sync.py reply --awaiting` on a thread comment or mention sets the mark for 7 days: `threads.json` keeps, for the thread, `awaiting` with the
+agent's comment id (none when it answered with `--boost`, and then a comment dated before
+the mark is not the answer), when it was set (`at`) and when it ends (`until`). A second
+`--awaiting` reply there while the mark is unanswered and unexpired keeps its comment and
+`at` and only moves `until` 7 days on, so an answer to the first question, posted before
+the second reply, still counts. A comment or boost counts only when posted by `until`,
+whenever it is read, and the earliest answer wins: a boost on the agent's comment made before
+the first answering comment is the answer, and that comment is then judged like any other.
+While the boosts on the agent's comment cannot all be read, that comment and every later one
+wait for the next run, and the notification that led to the read counts as a failed read, so
+it is read again then. A
+mark whose `until` passed is dropped after the read, with a log line, unless a read of the
+boosts on its comment failed (it is read again next run). A comment from someone not listened to,
+or from the agent itself, leaves the mark as it is. `--awaiting` on any other reply (a card
+mirror comment, a chat or Ping line, a tracked to-do, a message) is logged and ignored,
+since everything there already reaches the agent.
+
+**Boosts on other people's things.** A boost counts only on the agent's own recording (its
+comment, line, card, message or answer): one on someone else's comment or line, even in a
+chat or Ping the agent reads, is skipped with a `skipped boost <id> by <name> on <recording>:
+not on the agent's own recording` line in `sync.log`. The exception is a decision to-do (or a
+to-do or card a decision step is on), its comments and its decision steps, where any boost is
+decision feedback, whoever made what was boosted, and a to-do request and its comments, where
+a worded boost (not emoji only, as below) counts whoever made what was boosted.
+
+On a followed thread, any boost on the agent's comment that holds the awaiting mark, made
+by its `until`, is the awaited answer, whatever its text (a 👍 or ✅ is a yes): it is a
+`boost` record with `"why": "awaiting"` and clears the mark. Otherwise an owner's boost of
+emoji only (emoji and spaces, such as 👍, ❤️, 🎉🎉 or 1️⃣) on one of the agent's comments
+there is skipped (one `skipped boost` line in `sync.log`), judged on the boost's text as the
+agent's received-boosts feed gives it. A boost with words, punctuation or a symbol that is
+not an emoji (`yes`, `a`, `?`, `!!`, `✓`) is relayed as before; elsewhere the emoji test
+applies only to a boost on someone else's recording on a to-do request.
+
+**Group Pings.** A Ping with three or more people (two or more besides the agent among its
+participants; `pings.json` keeps `"group": true`) is read like a chat: a line is relayed
+only when it @mentions the agent or directly follows one of
+the agent's own lines there. Any other line is skipped (`skipped line <id> by <name> in
+group Ping <chat>`), and someone not listened to who does not address the agent gets no
+automatic reply. A Ping with one other person relays every line of theirs, as before. In
+any Ping a line that is only uploads, right after a relayed line by the same person in the
+same read, is folded into that line's record (`attachments`); one that follows nothing
+relayed is its own `ping` record with its `attachments` and empty `text`.
+
 **Scope.** Items in other projects are another home's: they are never read, acted on or
 marked read here, except a Ping (with `pings` on), a to-do request with `"scope":
 "account"`, a line in a chat watched with `sync.py watch` (see "Chat watches"), and, with `"mentions": {"scope": "account"}`, an @mention of the agent or a
@@ -391,7 +462,7 @@ comment on a thread it follows. Basecamp's own items (`BoostReport`, `Bulletin`,
 --mentions-anywhere`), an @mention of the agent's login, or a comment on a thread it follows
 (one it created, commented on or was @mentioned in), in *any* project of the account reaches
 it as one in the configured project would: the thread reader records a `mention` or
-`thread-comment`, and an @mention in a chat there is a `chat-question`. Each such record
+`thread-comment` by the rules in "Followed threads" above, and an @mention in a chat there is a `chat-question`. Each such record
 carries `project`: `{"id", "name"}` of the project it is in, and its inbox note names that
 project, so the agent can route it. Who is heard is decided exactly as in the project (the
 captain, operators, `people`, participants by rule, and `project_people` for that project),
@@ -874,7 +945,9 @@ basecamp-mate checkout, `HOME` its firstmate home):
   acknowledgement, a thanks, "done" or a plain yes. It works the same way for every record
   `reply` takes (card, chat, Ping, to-do, message and thread comments and lines): it is
   recorded in `replied`, a second reply needs `--again`, and the 👀 comes off (unless that
-  boost is the read acknowledgement itself, which then stays as the answer). Text over
+  boost is the read acknowledgement itself, which then stays as the answer). On a thread
+  comment or mention, `--awaiting` also marks the thread as awaiting an
+  answer for 7 days (see "Followed threads"). Text over
   16 characters (Basecamp's limit for a boost), or empty text, is refused before anything
   is read or posted, and the command exits 1. With no profile, or a profile signed in as the captain, it posts nothing;
   `--dry-run` logs the plan only. The acting user's own replies are never relayed, since
@@ -1218,7 +1291,7 @@ claim, in `~/.local/state/basecamp-mate/runs/`; see "One home per project and lo
 | `messages.json` | the script | per agent message: comment cursor, owner comments recorded, acknowledgement boosts queued and done, comments replied to; boost counts and boosts seen on the messages and their comments |
 | `notifications.json` | the script | per notification id, its cursor (`unread_at` when last handled, empty while its first handling keeps failing); when it last read `/my/readings.json`; the boost ids seen in `/my/boosts.json`; ids whose mark-read failed, to retry |
 | `timer.json` | the script | when each behavior's timer step last ran (`ran`), for its cadence; while refused as a duplicate run, the homes it overlaps and when that was last logged (`duplicate`) |
-| `threads.json` | the script | per followed thread (`<bucket>:<recording>`): its type and title, comment cursor, owner comments recorded, acknowledgement boosts queued and done, boost counts and boosts seen, comments replied to |
+| `threads.json` | the script | per followed thread (`<bucket>:<recording>`): its type and title, comment cursor, owner comments recorded, acknowledgement boosts queued and done, boost counts and boosts seen, comments replied to, attachment-only comments folded into a relayed note (`folded`), and, after `reply --awaiting`, the answer awaited (`awaiting`: the agent's comment, `at`, `until`) |
 | `pings.json` | the script | `since` (the Ping reader's first run) and, per Ping chat id, its bucket, title, URL, line cursor, owner lines recorded, acknowledgement boosts queued and done, boost counts and boosts seen, lines replied to |
 | `unmonitored.json` | the script | unmonitored key -> the first notification (or boost) and recording recorded, when, how many were seen, and the owner's decision once handled |
 | `backup.json` | the script | per backed-up file: its upload id in the backup folder, the SHA-256 of the content last uploaded, and when |
@@ -1513,16 +1586,22 @@ stay in UTC.
   (`id`, `name`) when that chat is in another project (`"mentions": {"scope": "account"}`,
   or a chat watched with `sync.py watch`).
 - `thread-comment`: `bucket`, `parent` (the thread's id), `parent_type` (e.g. `Document`,
-  `Kanban::Card`, `Todo`), `title`, `comment` (id), `question`, `url`, `text`, `at`. A
-  listened-to person commented on a thread the agent follows that no other reader tracks
-  (a card nothing mirrors, a document, someone else's to-do). Answer with `sync.py reply
+  `Kanban::Card`, `Todo`), `title`, `comment` (id), `question`, `url`, `text`, `at`, `why`.
+  A listened-to person commented on a thread the agent follows that no other reader tracks
+  (a card nothing mirrors, a document, someone else's to-do), and either it is the first
+  comment after the agent's `reply --awaiting` there (`"why": "awaiting"`) or the agent
+  made the thread (`"why": "yours"`); see "Followed threads".
+  Answer with `sync.py reply
   --recording <comment>`, which comments on the thread.
-- `mention`: the same fields, for a comment that @mentions the agent: addressed to it.
+- `mention`: the same fields but `why`, for a comment that @mentions the agent or is a
+  Basecamp Reply to its comment: addressed to it.
   Either carries `project` (`id`, `name`) when the thread is in another project of the
   account (`"mentions": {"scope": "account"}`).
 - `ping`: `bucket` (the Ping's circle), `chat`, `line` (ids), `title` (the Ping's name),
-  `url`, `text`, `at`. The owner wrote to the agent's login in a Ping; answer there with
-  `sync.py reply --recording <line>`.
+  `url`, `text`, `at`, and `attachments` (`filename`, `url` each) when the line had uploads
+  or uploads right after it were folded in. The owner wrote to the agent's login in a Ping;
+  answer there with `sync.py reply --recording <line>`. A `mention` or `thread-comment` can
+  carry `attachments` the same way.
 - `checkin`: `questionnaire`, `question` (ids), `date` (local, `YYYY-MM-DD`), `title`,
   `url`, `at`. A check-in question came due today; answer it with `sync.py answer`. An
   instruction in it is the captain's only when `captain` is true.
@@ -1559,7 +1638,9 @@ stay in UTC.
   `checkin-answer`, `message`, `message-comment`, `thread-comment`), the surface's ids (`chat`; `bucket`, `chat`; `task`,
   `repo`, `card`; `key`, `todo`; `question`; `message`, `subject`; `bucket`, `parent`, `title`), `recording` (the
   boosted recording), `boost` (id), `text` (the boost's text), `url`, `at`. The owner's
-  boost is an answer to what was boosted, like a comment; a 👍 on an assigned card by
+  boost is an answer to what was boosted, like a comment (on a `thread-comment` surface an
+  emoji-only boost is skipped unless it is on the reply that awaits an answer, when it
+  carries `"why": "awaiting"`); a 👍 on an assigned card by
   anyone but the captain is a `boost`, not an `approval`.
 - `unmonitored`: `key` (`<what happened>/<recording type>`), `event_type`, `recording_type`,
   `notification` (the notification's or boost's id; `event` in records from the retired
