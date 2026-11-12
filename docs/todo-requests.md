@@ -48,7 +48,11 @@ only inside its card's entry, as one of its `children` of type `"step"` (the car
 listed there whoever it is assigned to); the 5-minute sweep reads it from there, and the
 step's own notifications (`Assignment`, the `Event` of a step added already assigned, and
 `Completion`), which subscribe to the step and link to its card, run the reader within
-about 30 seconds. The step is read at `/buckets/<project>/card_tables/steps/<id>.json`.
+about 30 seconds. The step is read at `/buckets/<project>/card_tables/steps/<id>.json`, and
+its events (`/buckets/<project>/recordings/<id>/events.json`) say when it was assigned to the
+agent and by whom: the latest `assignment_changed` event that adds the agent's login. When
+the sweep finds the step, without a notification naming who assigned it, that event's creator
+did. Someone not listened to who assigns one gets the automatic reply on its card.
 
 A step has no comments of its own, and its card is someone else's, so of the card's
 comments only those that concern the agent are part of the request, as `todo-comment`
@@ -56,12 +60,16 @@ records with `"request": true`, `"type": "step"` and a `why`: one that @mentions
 or is a Basecamp Reply to its comment (`addressed`; a Reply has no @mention in its text, so
 the mention notification that names it decides, even after the sweep skipped it), and the
 first comment from someone listened to after the agent's own comment on the card
-(`awaiting`). Comments already on the card when the step was assigned are never relayed, and
-every other comment is skipped (a `skipped comment` line in `sync.log` and the relay
-ledger). A worded boost on the step, or any boost on one of those comments or the agent's
-own comment there, is a `boost` record of the request. While the card mirror or another
-tracked record (a card request, a decision card) reads that card, its comments are left to
-that reader. `sync.py todo comment --todo request-<id>` comments on the card, `sync.py reply`
+(`awaiting`); a Reply read late, behind a newer comment of the agent's, leaves that comment
+awaiting its answer. Comments made on the card up to the step's assignment (that event's
+time, else the step's making) are never relayed, while one made after it counts even when
+the sweep finds the step later. Every other comment is skipped (a `skipped comment` line in
+`sync.log` and the relay ledger). With several of the agent's steps open on one card, the one
+with the smallest key reads its comments, so each is relayed once, under that key; the next
+goes on from where it stopped. A worded boost on the step, or any boost on one of those comments or the agent's
+own comment there, is a `boost` record of the request. While another reader that is on reads
+that card (the card mirror, for a card made from the backlog; an open card request with
+`assigned_cards` on; a decision card with `todos`), its comments are left to that reader. `sync.py todo comment --todo request-<id>` comments on the card, `sync.py reply`
 answers one of its comments there, `todo show` reads the step, and `sync.py todo complete`
 checks the step off (`basecamp subtasks complete`), leaving the card as it is. Every record
 and outcome goes through the relay ledger, so `sync.py stats` counts step requests like any

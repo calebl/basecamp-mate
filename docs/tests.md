@@ -108,7 +108,9 @@ someone else's or a stranger's step, the account scope and its claim, the card's
 (old ones never, only an @mention, a Reply or the first after the agent's own), `todo
 comment` and `reply` on the card, `todo complete` checking the step off once and counted
 answered by `stats`, an edit, unassignment and reassignment, the owner's completion, a card
-another reader has, the `Assignment`, `Event` and `Completion` notifications (once, marked
+another reader has (and one whose reader is off), the assignment event as the comment
+baseline and the assigner, two steps on one card relaying each comment once, a late Reply
+keeping the wait on a newer comment, a stranger's assignment answered on the card, the `Assignment`, `Event` and `Completion` notifications (once, marked
 read), unmonitored and never read as a to-do or card when off, a decision step's
 completion, and the notes;
 `tests/test_mentions_anywhere.py` covers `"mentions": {"scope": "account"}`: a mention on a

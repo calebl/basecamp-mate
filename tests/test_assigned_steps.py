@@ -69,6 +69,17 @@ def card_note(id, kind, anchor, card=CARD, who=CAPTAIN, bucket=PROJECT):
             "subscription_url": f"https://3.basecampapi.com/1/buckets/{bucket}/recordings/{card}/subscription.json"}
 
 
+def assigned(at, by=CAPTAIN, to=(ACTING,)):
+    """A step's assignment_changed event, as its events.json lists it."""
+    return {"id": 1, "recording_id": STEP, "action": "assignment_changed", "created_at": at, "creator": person(by),
+            "details": {"added_person_ids": list(to), "removed_person_ids": []}}
+
+
+def said(id, at, who=CAPTAIN, content="<p>Merge it</p>"):
+    """A comment on the card, with its own time."""
+    return dict(comment(id, who=who, content=content), created_at=at)
+
+
 MENTION = f'<bc-attachment sgid="sgid-{ACTING}" content-type="application/vnd.basecamp.mention"></bc-attachment>'
 
 
@@ -79,6 +90,7 @@ class StepStub(AssignStub):
     def __init__(self):
         super().__init__()
         self.steps = {}
+        self.events = {}  # step id -> its events (GET /buckets/<project>/recordings/<id>/events.json)
 
     def __call__(self, cmd, **kw):
         if cmd[0] == "basecamp":
@@ -106,6 +118,9 @@ class StepStub(AssignStub):
                         "parent": {"id": p["id"], "title": p["title"], "app_url": p["app_url"]}})
                 data["non_priorities"] += list(cards.values())
                 return ok(data)
+            if core[:2] == ["api", "get"] and core[2].endswith("/events.json"):
+                self.calls.append(core)
+                return ok(self.events.get(core[2].split("/")[4], []))
             if core[:2] == ["api", "get"] and "/card_tables/steps/" in core[2]:
                 self.calls.append(core)
                 sid = core[2].rsplit("/", 1)[1][:-5]
@@ -262,6 +277,44 @@ class Lifecycle(StepBase):
         self.assertTrue(self.sync().reply(1000, "Fixed the first."))
         self.assertEqual(self.stub.made("comments create")[-1][2], str(CARD))
 
+    def test_comments_after_the_assignment_count_even_when_made_before_the_sweep_found_it(self):
+        self.add_step(dict(step(), created_at="2026-11-12T07:00:00Z"))
+        self.stub.events[str(STEP)] = [assigned("2026-11-12T08:00:00Z", by=PARTNER)]
+        self.on_card(said(30, "2026-11-12T07:30:00Z", content=f"<p>{MENTION} before the assignment</p>"),
+                     said(31, "2026-11-12T08:05:00Z", content=f"<p>{MENTION} after it, before the sweep</p>"))
+        self.poll()
+        self.assertEqual([(r["kind"], r.get("comment")) for r in self.pending()],
+                         [("step-request", None), ("todo-comment", 31)])
+        self.assertEqual(self.pending()[0]["author"]["id"], PARTNER)  # its assignment event says who assigned it
+        self.assertEqual(self.request(STEP)["start"], 30)
+
+    def test_with_the_reader_of_its_card_off_the_step_reads_the_card(self):
+        self.cfg(assigned_cards=False, cards=False)
+        self.add_step(step())
+        self.poll()
+        state = self.todos()
+        state[f"request-{CARD}"] = {"todo": CARD, "type": "card", "request": {"captain": True}, "cursor": 0}
+        json.dump(state, open(os.path.join(self.cfgdir, "todos.json"), "w"))
+        json.dump({"engine/t1": {"card": CARD}}, open(os.path.join(self.cfgdir, "map.json"), "w"))
+        self.on_card(comment(1000, content=f"<p>{MENTION} look</p>"))
+        self.sync().read_todo_comments(keys=[f"request-{STEP}"])
+        self.assertEqual([(r["kind"], r.get("comment")) for r in self.pending()][1:], [("todo-comment", 1000)])
+
+    def test_two_steps_on_one_card_relay_each_comment_once_and_hand_over_without_replay(self):
+        self.add_step(step())
+        self.add_step(step(id=902, title="Then deploy it"))
+        self.poll()
+        self.on_card(comment(1000, content=f"<p>{MENTION} look</p>"))
+        self.poll()
+        self.poll()
+        comments = [(r["key"], r["comment"]) for r in self.pending() if r["kind"] == "todo-comment"]
+        self.assertEqual(comments, [(f"request-{STEP}", 1000)])
+        self.assertTrue(self.sync().todo_complete(f"request-{STEP}"))
+        self.on_card(comment(1001, content=f"<p>{MENTION} and the deploy?</p>"))
+        self.poll()
+        comments = [(r["key"], r["comment"]) for r in self.pending() if r["kind"] == "todo-comment"]
+        self.assertEqual(comments, [(f"request-{STEP}", 1000), ("request-902", 1001)])
+
     def test_completion_checks_the_step_off_once_and_is_counted_answered(self):
         self.add_step(step())
         self.poll()
@@ -380,6 +433,25 @@ class Notifications(StepBase):
         self.notify(step_note(10, "Assignment"), card_note(14, "Mention", 21))
         self.notify(step_note(10, "Assignment"), card_note(14, "Mention", 21))
         self.assertEqual([(r["kind"], r.get("comment")) for r in self.pending()], [("step-request", None), ("todo-comment", 21)])
+
+    def test_a_late_reply_does_not_clear_the_wait_on_the_agents_newer_comment(self):
+        self.add_step(step())
+        self.notify(step_note(10, "Assignment"))
+        self.on_card(comment(21, content="<p>Also the tests</p>"), comment(22, who=ACTING, content="<p>Which ones?</p>"))
+        self.sync().read_todo_comments(keys=[f"request-{STEP}"])  # the sweep skips 21 and sees the agent's 22
+        self.notify(step_note(10, "Assignment"), card_note(14, "Mention", 21))
+        self.on_card(comment(23, content="<p>The import ones</p>"))
+        self.sync().read_todo_comments(keys=[f"request-{STEP}"])
+        self.assertEqual([(r.get("comment"), r.get("why")) for r in self.pending()[1:]],
+                         [(21, "addressed"), (23, "awaiting")])
+
+    def test_a_stranger_assigning_a_step_is_answered_on_its_card(self):
+        self.cfg(blocked={})
+        self.poll()
+        self.add_step(dict(step(by=STRANGER), updated_at="2099-01-01T00:00:00Z"))
+        self.notify(step_note(10, "Assignment", who=STRANGER))
+        self.assertEqual(self.pending(), [])
+        self.assertEqual([c[2] for c in self.stub.made("comments create")], [str(CARD)])
 
     def test_off_an_assignment_is_unmonitored_and_never_read_as_a_todo_or_card(self):
         self.cfg(assigned_steps=False, assigned_todos={}, assigned_cards={})

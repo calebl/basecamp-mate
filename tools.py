@@ -149,6 +149,7 @@ class Tools:
         self.assigned_steps = cfg.get("assigned_steps") not in (None, False)
         self.step_scope = (cfg.get("assigned_steps") or {}).get("scope", "project") \
             if isinstance(cfg.get("assigned_steps"), dict) else "project"
+        self.mirror_on = bool(cfg.get("cards", bool(cfg.get("tables"))))  # as behaviors.CardMirror turns it on
         self.message_board = str(cfg["message_board"]) if cfg.get("message_board") is not None else None
         # "timezone": the IANA zone times written for people are shown in; unset, the captain's Basecamp time zone.
         self.timezone = cfg.get("timezone")
@@ -1192,7 +1193,7 @@ class Tools:
                 step = rec.get("type") == "step"
                 thread = self.step_card(rec)
                 try:
-                    comments = [] if step and self.card_read_elsewhere(rec) else \
+                    comments = [] if step and self.card_read_elsewhere(key, rec) else \
                         self.bc("comments", "list", str(thread), project=rec.get("bucket")) or []
                 except RuntimeError as e:
                     self.log(f"todo {key}: {e}")
@@ -1202,11 +1203,19 @@ class Tools:
                 cursor = rec.get("cursor", 0)
                 me = self.acting_id() if step else None
                 due = rec.get("answer_due", False)  # a card step request: the agent commented there last
+                seen = set(rec.get("comments", []))
+                if step:  # another step request on this card read it before (it was the reader then): go on from there
+                    others = [r for k, r in self.card_steps(rec, state) if k != key]
+                    seen |= {x for r in others for x in r.get("comments", [])}
+                    ahead = max(others, key=lambda r: r.get("cursor") or 0, default=None)
+                    if ahead is not None and (ahead.get("cursor") or 0) > cursor:
+                        cursor, due = ahead["cursor"], ahead.get("answer_due", False)
                 for c in sorted(comments, key=lambda c: c.get("id", 0)):
                     cid = c.get("id", 0)
-                    late = (step and cid in mentions and cid > rec.get("start", cursor)
-                            and cid not in rec.get("comments", []))
-                    if cid <= cursor and not late:
+                    # A comment behind the cursor that a mention notification names (a Reply the sweep skipped): read
+                    # now, without touching the wait for an answer, which comments after it already settled.
+                    behind = cid <= cursor
+                    if behind and not (step and cid in mentions and cid > rec.get("start", cursor) and cid not in seen):
                         continue
                     cursor = max(cursor, cid)
                     if step and me is not None and (c.get("creator") or {}).get("id") == me:
@@ -1221,7 +1230,8 @@ class Tools:
                     text = re.sub(r"\s+", " ", text).strip()
                     why = None
                     if step:
-                        why = "addressed" if self.addressed(c.get("content")) or cid in mentions else "awaiting" if due else None
+                        why = ("addressed" if self.addressed(c.get("content")) or cid in mentions else
+                               "awaiting" if due and not behind else None)
                         if why is None:
                             who = (c.get("creator") or {}).get("name") or (c.get("creator") or {}).get("id")
                             if not self.dry:
@@ -1230,7 +1240,8 @@ class Tools:
                                              "todo-comment", cid, "not addressed to the agent", bucket=rec.get("bucket") or self.project,
                                              text=text, url=c.get("app_url"), person=c.get("creator"), key=key)
                             continue
-                        due = False
+                        if not behind:
+                            due = False
                     question = "?" in text
                     rec.setdefault("ack", []).append([cid, self.read_ack(question)])
                     if self.dry:
@@ -1482,13 +1493,42 @@ class Tools:
         """The card whose comments tracked `rec` reads: the card a step request is on; else rec's own to-do or card."""
         return rec.get("card") if rec.get("type") == "step" else rec["todo"]
 
-    def card_read_elsewhere(self, rec):
-        """True when the comments on the card step request `rec` is on are another reader's: the card mirror's (a card
-        made from the backlog) or an open tracked record's on that card itself (a card request, a decision card)."""
+    def card_steps(self, rec, state=None):
+        """The (key, record) of every card step request, open or closed, on the same card (and project) as `rec`."""
         bucket = str(rec.get("bucket") or self.project)
-        return self.mirrored_card(rec.get("card"), bucket) or any(
-            r.get("todo") == rec.get("card") and str(r.get("bucket") or self.project) == bucket
-            and not r.get("completed") and not r.get("closed") for r in self.load("todos.json", {}).values())
+        return [(k, r) for k, r in (self.load("todos.json", {}) if state is None else state).items()
+                if r.get("type") == "step" and r.get("request") and r.get("card") == rec.get("card")
+                and str(r.get("bucket") or self.project) == bucket]
+
+    def card_read_elsewhere(self, key, rec):
+        """True when the comments on the card that card step request `key` (`rec`) is on are another reader's, one that
+        is on and reads them: the card mirror's (a card made from the backlog, with the mirror on), an open tracked
+        record's on that card itself (a card request with assigned_cards on, a decision card with "todos"), or another
+        open step request's on the same card with a smaller key, so each comment there is read and relayed once."""
+        bucket = str(rec.get("bucket") or self.project)
+        state = self.load("todos.json", {})
+        if self.mirror_on and self.mirrored_card(rec.get("card"), bucket):
+            return True
+        for r in state.values():
+            if (r.get("todo") == rec.get("card") and str(r.get("bucket") or self.project) == bucket
+                    and not r.get("completed") and not r.get("closed")
+                    and (self.assigned_cards if r.get("request") else self.todos is not None)):
+                return True
+        return any(k < key and not r.get("completed") and not r.get("closed") for k, r in self.card_steps(rec, state))
+
+    def step_assigned(self, tid, bucket=None, me=None):
+        """When card step `tid` was last assigned to the acting user, and by whom, from its events: (ISO time, creator),
+        or (None, None) when no event says so (or they cannot be read, logged)."""
+        try:
+            events = self.bc("api", "get", f"/buckets/{bucket or self.project}/recordings/{tid}/events.json",
+                             project=bucket) or []
+        except RuntimeError as e:
+            self.log(f"todo request {tid}: its events: {e}")
+            return None, None
+        hit = max((e for e in events if e.get("action") == "assignment_changed"
+                   and me in ((e.get("details") or {}).get("added_person_ids") or [])),
+                  key=lambda e: e.get("created_at") or "", default=None)
+        return (hit.get("created_at"), hit.get("creator")) if hit else (None, None)
 
     def mirrored_card(self, cid, bucket=None):
         """True when card `cid` is one the card mirror made from the backlog (map.json), never a request."""
@@ -1557,8 +1597,10 @@ class Tools:
         with "type": "card"; a card the card mirror made from the backlog is never a request.
         "step": `tid` is a card step (assigned_steps), recorded as a `step-request` with the
         card it is on (`card`: id, title, url) and kept with "type": "step" and that card;
-        the comments already on the card are its own, not the step's, so they are not
-        relayed (the cursor starts at the card's newest comment).
+        the comments made on the card up to the step's assignment to the acting user (its
+        latest `assignment_changed` event adding it; else the step's making) are the card's
+        own, not the step's, so they are not relayed (the cursor starts after them), and with
+        no notification naming who assigned it, that event's creator did.
         """
         me = self.agent()
         key = f"request-{tid}"
@@ -1582,8 +1624,9 @@ class Tools:
         if what == "step" and (card.get("type") not in (None, "Kanban::Card") or not card.get("id")):
             self.log(f"todo request {tid}: a step on a {card.get('type') or 'missing parent'}, not on a card; not a request")
             return False
+        assigned_at, assigner = self.step_assigned(tid, bucket, me) if what == "step" else (None, None)
         prev_key, prev = self.previous_occurrence(tid, todo, bucket)
-        creator = todo.get("creator") or {}
+        creator = (assigner if by is None and assigner else None) or todo.get("creator") or {}
         who = creator if by is None or by == creator.get("id") else {"id": by, "name": None}
         if prev is not None and by is None:
             who = (prev.get("request") or {}).get("author") or who
@@ -1596,16 +1639,18 @@ class Tools:
             # Only a notification names who assigned it (the sweep only guesses: its creator), and a participant admitted
             # by rule is listened to, just not for assignments: neither is a blocked sender to answer.
             if by is not None and not self.hears(who, bucket=bucket):
-                self.block(who, bucket or self.project, tid, tid, todo.get("updated_at"), what="card" if card else "to-do")
+                self.block(who, bucket or self.project, card.get("id") or tid, tid, todo.get("updated_at"),
+                           what={"card": "card", "step": "card step"}.get(what, "to-do"))  # a step's reply goes on its card
             return False
         if self.dry:
             self.log(f"dry todo request {tid}: record and acknowledge with {EYES}")
             return False
         cursor = 0
         if what == "step":
-            try:  # the card's comments so far are its own: the step's start after them
-                cursor = max([c.get("id", 0) for c in self.bc("comments", "list", str(card["id"]), project=bucket) or []],
-                             default=0)
+            boundary = assigned_at or todo.get("created_at")
+            try:  # the card's comments up to the assignment are its own: the step's start after them
+                cursor = max([c.get("id", 0) for c in self.bc("comments", "list", str(card["id"]), project=bucket) or []
+                              if boundary is None or not later(c.get("created_at"), boundary)], default=0)
             except RuntimeError as e:
                 self.log(f"todo request {tid}: the comments on card {card['id']}: {e}")
                 return False
