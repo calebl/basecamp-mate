@@ -1,6 +1,6 @@
 # basecamp-mate
 
-Read these before changing the code:
+Before creating or modifying any code or tests, read all four files:
 
 - `README.md`: what the sync does, its commands, config and tests.
 - `VISION.md`: what the project is for and what it does not decide.
@@ -10,8 +10,10 @@ Read these before changing the code:
 Run the tests with:
 
 ```
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests
 ```
+
+This runs the full suite quietly; `-v` lists every test (README keeps `-v` for people).
 
 ## Rules
 
