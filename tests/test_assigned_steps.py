@@ -386,6 +386,18 @@ class Lifecycle(StepBase):
         self.poll()
         self.assertEqual([(r["kind"], r.get("n")) for r in self.pending()][-1], ("step-request", 2))
 
+    def test_a_tracked_step_not_found_closes_it_once_and_it_is_not_read_again(self):
+        self.add_step(step())
+        self.poll()
+        del self.stub.steps[str(STEP)]  # deleted, or out of this login's reach
+        self.poll()
+        fetched = self.fetched()
+        self.poll()
+        self.assertEqual([(r["kind"], r.get("reason")) for r in self.pending()],
+                         [("step-request", None), ("step-request-closed", "not_found")])
+        self.assertEqual(self.pending()[-1]["card"]["id"], CARD)
+        self.assertEqual(self.fetched(), fetched)
+
     def test_the_owner_checking_it_off_closes_it(self):
         self.add_step(step())
         self.poll()

@@ -57,6 +57,8 @@ WHY = {"mention": "addressed", "chat-question": "chat", "ping": "ping", "comment
 WHEN = ("ask", "due", "before")
 # The automatic reply to someone the sync does not listen to who addresses the agent ("blocked": {} in the config).
 BLOCKED_REPLY = "Sorry, I can't act on this: I only take requests from the people I work for. Please ask one of them to pass it on."
+# Logged once when a request's to-do, card or step refetch answers not_found: final for that record, never retried.
+NOT_FOUND = "not found (deleted, or out of this login's reach)"
 
 
 class BasecampError(RuntimeError):
@@ -1624,9 +1626,12 @@ class Tools:
         try:
             todo = self.todo(tid, bucket, what)
         except RuntimeError as e:
-            self.log(f"todo request {tid}: {e}")
-            if what == "step" and getattr(e, "code", None) == "not_found":
-                self.errors = errors  # about that step only (deleted, or out of reach): nothing to retry
+            if getattr(e, "code", None) != "not_found":
+                self.log(f"todo request {tid}: {e}")
+                return False
+            # About that to-do, card or step only (deleted, or out of reach): not a request, and nothing to retry.
+            self.errors = errors
+            self.log(f"todo request {tid}: {what} {NOT_FOUND}; not a request")
             return False
         if (todo.get("completed") or todo.get("status") not in (None, "active")
                 or me not in [a.get("id") for a in todo.get("assignees") or []]):
@@ -1723,10 +1728,12 @@ class Tools:
     def refresh_todo_request(self, key, by=None):
         """Record what changed on open to-do request `key` since it was last read: an edit, or its closing.
 
-        Completed (by anyone), trashed or archived, or no longer assigned to the acting
-        user: a `todo-request-closed` record (`reason` completed, trashed, archived or
-        unassigned, and who completed it when Basecamp says), and the request stops
-        being read; completed also marks it completed, so `todo complete` is not needed.
+        Completed (by anyone), trashed or archived, no longer assigned to the acting
+        user, or no longer found (deleted, or out of its reach): a `todo-request-closed` record
+        (`reason` completed, trashed, archived, unassigned or not_found, and who completed it
+        when Basecamp says), and the request stops being read; completed also marks it
+        completed, so `todo complete` is not needed. Any other failed refetch (network, auth,
+        a server error) is left to retry.
         Its name or description changed, or (for one tracked with its schedule) its due date
         or repetition rule: a `todo-request-update` record with the new text and schedule.
         `by` is who did it, when an event says; otherwise Basecamp does not say who edited it. A dry run records nothing. Returns the record kind, or None.
@@ -1741,12 +1748,19 @@ class Tools:
         try:
             todo = self.todo(rec["todo"], rec.get("bucket"), rec.get("type") or "todo")
         except RuntimeError as e:
-            self.log(f"todo request {key}: {e}")
-            if rec.get("type") == "step" and getattr(e, "code", None) == "not_found":
-                self.errors = errors  # about that step only: its notification is not retried every run
-            return None
+            if getattr(e, "code", None) != "not_found":
+                self.log(f"todo request {key}: {e}")
+                return None
+            # About that to-do, card or step only (deleted, or out of reach): the request closes once, and neither it
+            # nor its notification is read again every run.
+            self.errors = errors
+            self.log(f"todo request {key}: {rec.get('type') or 'todo'} {rec['todo']} {NOT_FOUND}; closing the request")
+            todo, by = None, None
         who = {"id": by, "name": None} if by is not None else None
-        if todo.get("completed"):
+        if todo is None:
+            todo = {}  # what it last was stands: its title, link and schedule are the request's own
+            reason = "not_found"
+        elif todo.get("completed"):
             reason = "completed"
             who = (todo.get("completion") or {}).get("creator") or who
         elif todo.get("status") not in (None, "active"):
@@ -1776,7 +1790,8 @@ class Tools:
             out = {"kind": kind, "key": key, "todo": rec["todo"], "n": rec.get("requests", 1),
                    "title": todo.get("content") or rec.get("title"), "url": todo.get("app_url") or rec.get("url"),
                    "at": (todo.get("completion") or {}).get("created_at") or todo.get("updated_at"),
-                   "project": request_project(rec), **step_fields(rec), **todo_schedule(todo),
+                   "project": request_project(rec), **step_fields(rec),
+                   **({k: rec.get(k) for k in ("due_on", "repeats")} if reason == "not_found" else todo_schedule(todo)),
                    **({} if reason else self.timing(todo)), **authored}
             if reason:
                 out["reason"] = reason

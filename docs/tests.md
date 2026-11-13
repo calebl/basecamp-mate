@@ -93,7 +93,9 @@ restore marks read and written under the CLI's locks, an emptied file not bringi
 another profile already restored once, a lost file-store login restored without
 `BASECAMP_NO_KEYRING`, a keyring login renewed without the guard or a false FAILED line, no renewal far from expiry, and one FAILED line per cause;
 `tests/test_assigned_todos.py` covers to-do requests with a stubbed `/my/assignments.json`:
-the sweep, who assigned it, comments, boosts, edits and closing, reassignment, the agent
+the sweep, who assigned it, comments, boosts, edits and closing, a to-do not found (a
+request closed once as `not_found`, an assignment's notification marked read, never retried,
+while any other failed read is retried), reassignment, the agent
 completing it, the `Assignment` and `Completion` notifications, and their notes, scheduled
 and repeating to-dos (`due_on` and `repeats` on the records, a moved due date or changed rule
 as an update, Basecamp's next occurrence recorded once as a request that `follows` the
@@ -101,7 +103,8 @@ completed one, a reused to-do, `todo show`), plus the account-wide
 scope (a request in another project carrying its project, its comments, boosts, replies,
 edits and closing in that project) and the unchanged project default;
 `tests/test_assigned_cards.py` also covers a card listed only for the agent's step never being
-fetched nor counted against `limit`; `tests/test_assigned_steps.py` covers card step requests with fixtures shaped like Basecamp's
+fetched nor counted against `limit`, and a card not found (its notification handled once, its
+request closed as `not_found`); `tests/test_assigned_steps.py` covers card step requests with fixtures shaped like Basecamp's
 (a step nested in its card's `/my/assignments.json` entry, the step record, its notifications
 subscribed to the step): discovery once and acknowledged, the card itself not a request,
 someone else's or a stranger's step, the account scope and its claim, the card's comments

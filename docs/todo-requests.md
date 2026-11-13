@@ -9,8 +9,13 @@ listened to arrive as `todo-comment` records and their boosts as `boost` records
 with `"request": true` and the to-do's `title`; an edit to its name or description arrives as
 `todo-request-update` with the new text (and a moved due date or changed repetition rule, with
 the new schedule); and its closing as `todo-request-closed`, with a
-`reason`: `completed` (by anyone; who, when Basecamp says), `trashed`, `archived` or
-`unassigned` (no longer assigned to the agent). A closed request is no longer read. The
+`reason`: `completed` (by anyone; who, when Basecamp says), `trashed`, `archived`,
+`unassigned` (no longer assigned to the agent) or `not_found` (Basecamp answers not found:
+deleted, or moved out of the login's reach). A closed request is no longer read. A
+not-found answer is final for that one to-do, card or step and is logged once: a new
+assignment whose to-do is already not found is not a request, and its notification is
+marked read rather than retried every run. Any other failed read (network, sign-in, a
+Basecamp server error) is retried on the next run. The
 agent answers with `sync.py reply --recording <comment>` or `sync.py todo comment --todo
 request-<id>`, and closes the request itself with `sync.py todo complete --todo
 request-<id>` when the work is done; those to-do commands work on a request with or without
@@ -42,7 +47,7 @@ a `Kanban::Step`) a listened-to person assigns to the agent's login is a request
 `step-request` record (key `request-<step id>`, tracked in `todos.json` with `"type":
 "step"` and the `card` it is on), acknowledged with a 👀 on the step, then
 `step-request-update` (its text or due date changed) and `step-request-closed` (`reason`
-`completed`, `unassigned` or `trashed`). Every record of it carries `card`: the `id`,
+`completed`, `unassigned`, `trashed` or `not_found`). Every record of it carries `card`: the `id`,
 `title` and `url` of the card the step is on. Basecamp lists a step in `/my/assignments.json`
 only inside its card's entry, as one of its `children` of type `"step"` (the card itself is
 listed there whoever it is assigned to); the 5-minute sweep reads it from there, and the
