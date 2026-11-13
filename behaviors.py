@@ -581,7 +581,7 @@ class AssignedCards(AssignedTodos):
 class AssignedSteps(AssignedTodos):
     """Card steps (a card's checklist items, Kanban::Step) the listened-to people assign to the agent's login, as
     requests: recorded once as a `step-request` with the card it is on, acknowledged with 👀 on the step and tracked in
-    todos.json ("type": "step", with its "card"), so its edits and closing (completed, unassigned, trashed) arrive as
+    todos.json ("type": "step", with its "card"), so its edits and closing (completed, unassigned, trashed, not_found) arrive as
     `step-request-update` and `step-request-closed`. The card is someone else's: of its comments, only those that
     concern the agent arrive, as `todo-comment` records of the request (an @mention or Reply of the agent, or the first
     comment after the agent's own there; see Tools.read_todo_comments). The agent comments on the card with
@@ -1807,7 +1807,8 @@ def inbox_note(rec, account, project):
         else:
             reason = rec.get("reason")
             what = (f"Basecamp {noun} request {rec.get('title')!r} ({key}){elsewhere} "
-                    + {"completed": f"completed{by}", "unassigned": f"no longer assigned to you{by}"}.get(reason, f"{reason}{by}"))
+                    + {"completed": f"completed{by}", "unassigned": f"no longer assigned to you{by}",
+                       "not_found": "no longer found (deleted, or out of your login's reach)"}.get(reason, f"{reason}{by}"))
             facts = ["the request is closed and no longer tracked; there is nothing to complete"]
             if reason == "completed" and rec.get("repeats"):
                 facts.append("it repeats, so Basecamp makes the next occurrence, which arrives as a new request")

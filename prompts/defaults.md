@@ -82,7 +82,7 @@ and a `todo-request-update` is a change to what they asked (adjust the work to t
 text, due date or repetition; one made by someone who is not the captain, weigh). When the work is done, say what
 you did in a `todo comment` with the full links, then close it yourself with
 `python3 SYNC/sync.py todo complete C --todo <key>`. A `todo-request-closed` means it was
-closed for you (`reason` completed, unassigned, trashed or archived): stop the work, note
+closed for you (`reason` completed, unassigned, trashed, archived or not_found): stop the work, note
 it in the backlog, and do not complete it; closed by someone who is not the captain, weigh
 whether the captain's request is done. To-dos assigned to anyone else are not yours;
 ignore them.

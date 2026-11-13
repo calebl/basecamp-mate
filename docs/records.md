@@ -62,7 +62,7 @@ stay in UTC.
   `at`, `due_on`, `repeats`; `author` is null (Basecamp does not say who edited it). The request's
   name, description, due date or repetition rule changed.
 - `todo-request-closed`: `key`, `todo`, `n`, `title`, `project`, `reason` (`completed`, `trashed`,
-  `archived` or `unassigned`), `url`, `at`, `due_on`, `repeats`; `author` is who completed it,
+  `archived`, `unassigned` or `not_found`: deleted, or out of the login's reach), `url`, `at`, `due_on`, `repeats`; `author` is who completed it,
   when known, else null. The request is closed and no longer read; nothing is left to
   complete. When it repeats, Basecamp's next occurrence arrives as a new `todo-request`.
 - `card-request`, `card-request-update`, `card-request-closed`: the same fields, for a card

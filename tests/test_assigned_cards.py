@@ -54,7 +54,11 @@ class CardStub(AssignStub):
                 return ok(data)
             if core[:2] == ["api", "get"] and "/card_tables/cards/" in core[2]:
                 self.calls.append(core)
-                return ok(self.cards[core[2].rsplit("/", 1)[1][:-5]])
+                cid = core[2].rsplit("/", 1)[1][:-5]
+                if cid not in self.cards:  # deleted, or out of this login's reach
+                    return SimpleNamespace(stdout=json.dumps({"ok": False, "code": "not_found", "error": "Resource not found"}),
+                                           stderr="", returncode=1)
+                return ok(self.cards[cid])
             if core[:2] == ["cards", "done"]:
                 self.calls.append(core)
                 self.cards[core[2]]["completed"] = True
@@ -175,6 +179,20 @@ class Notifications(CardBase):
         self.notify(note(10, "Event", thread=42, path="cards"), note(11, thread=42, anchor=5, path="cards"),
                     note(12, "Event", thread=42, path="cards"))
         self.assertEqual([r["kind"] for r in self.pending()], ["card-request", "todo-comment", "card-request-closed"])
+
+    def test_a_card_not_found_is_handled_once_and_its_request_closes(self):
+        self.notify(note(10, "Event", thread=41, path="cards"))  # no such card: deleted, or out of reach
+        self.assertEqual(self.stub.marked, [["10"]])
+        self.notify(note(10, "Event", thread=41, path="cards"))
+        self.assertEqual(self.stub.paths().count(f"/buckets/{PROJECT}/card_tables/cards/41.json"), 1)
+        self.add_card(card(42))
+        self.notify(note(11, "Event", thread=42, path="cards"))
+        del self.stub.cards["42"]
+        self.notify(note(11, "Event", thread=42, path="cards"), note(12, "Event", thread=42, path="cards"))
+        self.assertEqual([(r["kind"], r.get("reason")) for r in self.pending() if r["kind"] != "unmonitored"],
+                         [("card-request", None), ("card-request-closed", "not_found")])
+        self.assertEqual(self.stub.marked, [["10"], ["11"], ["12"]])
+        self.assertNotIn("retrying next run", self.log())
 
     def test_an_event_on_a_card_not_assigned_to_the_agent_stays_unmonitored(self):
         self.add_card(card(42, to=(CAPTAIN,)))

@@ -163,7 +163,7 @@ wants, else ask the captain with a decision to-do. Its later comments and boosts
 answer with `sync.py reply --recording <comment id>` or post progress with
 `sync.py todo comment --todo <key>`), an edit as `todo-request-update` (adjust to the new
 text), and its closing by someone else as `todo-request-closed` (`reason` completed,
-unassigned, trashed or archived: stop, note it in the backlog, nothing to complete). When the
+unassigned, trashed, archived or not_found: stop, note it in the backlog, nothing to complete). When the
 work is done, comment what was done with full links, then
 `sync.py todo complete --todo <key>` (the key is `request-<to-do id>`). To-dos assigned to
 anyone else are ignored.
@@ -210,7 +210,7 @@ default; the same `limit` and `scope` as `assigned_todos`): a card step (one of 
 checklist items) a listened-to person assigns to this home's login is a request handled
 like a to-do request. It arrives once as a `step-request` (key `request-<step id>`) with
 the `card` it is on (`id`, `title`, `url`), its edits and closing as
-`step-request-update` and `step-request-closed` (`reason` completed, unassigned, trashed).
+`step-request-update` and `step-request-closed` (`reason` completed, unassigned, trashed, not_found).
 Only the step is yours: the card is someone else's, so of its comments only those for you
 arrive, as `todo-comment` records with `request: true` and `type: "step"`: one that
 @mentions or Replies to you (`why` `addressed`) and the first after your own comment there

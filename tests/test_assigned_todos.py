@@ -31,12 +31,20 @@ class AssignStub(NotifStub):
     def __init__(self):
         super().__init__()
         self.on = []  # (call, its -p project)
+        self.fail = {}  # to-do id -> the error code its refetch fails with ("not_found": deleted, or out of reach)
 
     def __call__(self, cmd, **kw):
         if cmd[0] == "basecamp":
             args = cmd[3:-3]
             core = args[2:] if args[:1] == ["-P"] else args
             self.on.append((core, cmd[-2]))
+            tid = core[2].rsplit("/", 1)[1][:-5] if core[:2] == ["api", "get"] and "/todos/" in core[2] else None
+            if tid in self.fail:
+                self.calls.append(core)
+                code = self.fail[tid]
+                return SimpleNamespace(stdout=json.dumps({"ok": False, "code": code, "error": {
+                    "not_found": "Resource not found", "api_error": "Internal server error"}.get(code, code)}),
+                    stderr="", returncode=1)
             if core[:3] == ["api", "get", "/my/assignments.json"]:
                 self.calls.append(core)
                 mine = [{"id": t["id"], "type": "todo", "content": t["content"], "completed": False,
@@ -171,6 +179,39 @@ class Sweep(AssignBase):
         self.assertEqual((again["kind"], again["n"], again["reopened"]), ("todo-request", 2, True))
         self.assertEqual(self.stub.posted(), [("42", EYES)])  # the 👀 is already there
 
+    def test_a_request_whose_todo_is_not_found_closes_once_and_is_not_read_again(self):
+        self.add(todo(42))
+        self.poll()
+        self.stub.fail["42"] = "not_found"  # deleted, or moved out of this login's reach: no longer listed either
+        del self.stub.todo_records["42"]
+        self.poll()
+        closed = self.pending()[-1]
+        self.assertEqual((closed["kind"], closed["reason"], closed["title"], closed["author"]),
+                         ("todo-request-closed", "not_found", "Rotate the API keys", None))
+        self.assertEqual(self.request()["closed"], "not_found")
+        self.assertNotIn("completed", self.request())
+        fetched = self.stub.fetched(42)
+        self.poll()
+        self.assertEqual((len(self.pending()), self.stub.fetched(42)), (2, fetched))
+        self.assertEqual(self.log().count("not found (deleted, or out of this login's reach)"), 1)
+        self.assertNotIn("FAILED", self.log())
+        self.assertFalse(self.sync().todo_complete("request-42"))
+
+    def test_another_error_on_a_request_leaves_it_open_and_read_again(self):
+        self.add(todo(42))
+        self.poll()
+        self.stub.fail["42"] = "api_error"
+        self.poll()
+        fetched = self.stub.fetched(42)
+        self.poll()
+        self.assertEqual([r["kind"] for r in self.pending()], ["todo-request"])
+        self.assertNotIn("closed", self.request())
+        self.assertGreater(self.stub.fetched(42), fetched)
+        del self.stub.fail["42"]
+        self.edit(42, completed=True)
+        self.poll()
+        self.assertEqual(self.pending()[-1]["reason"], "completed")
+
     def test_the_agent_completes_it_when_the_work_is_done_even_without_decision_todos(self):
         self.cfg(drop=("todos",))
         self.add(todo(42))
@@ -261,6 +302,35 @@ class Notifications(AssignBase):
         self.add(todo(42))
         self.notify(note(10, "Assignment", thread=42, title="Assigned you: Rotate the API keys"))
         self.assertEqual([(r["kind"], r["key"]) for r in self.pending()], [("unmonitored", "todo.assignment_changed/Todo")])
+
+    def test_an_assignment_of_a_todo_not_found_is_handled_once_not_retried_every_run(self):
+        self.stub.fail["42"] = "not_found"  # deleted, or moved out of reach, after the assignment
+        self.notify(note(10, "Assignment", thread=42))
+        self.assertEqual((self.pending(), self.stub.marked), ([], [["10"]]))
+        self.notify(note(10, "Assignment", thread=42))
+        self.assertEqual(self.stub.fetched(42), 1)
+        self.assertNotIn("retrying next run", self.log())
+
+    def test_an_assignment_whose_todo_fails_otherwise_is_retried_next_run(self):
+        self.stub.fail["42"] = "api_error"
+        self.notify(note(10, "Assignment", thread=42))
+        self.assertEqual((self.pending(), self.stub.marked), ([], []))
+        self.assertIn("retrying next run", self.log())
+        del self.stub.fail["42"]
+        self.add(todo(42))
+        self.notify(note(10, "Assignment", thread=42))
+        self.assertEqual([r["kind"] for r in self.pending()], ["todo-request"])
+        self.assertEqual(self.stub.marked, [["10"]])
+
+    def test_a_request_not_found_on_its_next_notification_closes_and_is_marked_read(self):
+        self.add(todo(42))
+        self.notify(note(10, "Assignment", thread=42))
+        self.stub.fail["42"] = "not_found"
+        self.notify(note(10, "Assignment", thread=42), note(12, "Completion", thread=42))
+        self.assertEqual([(r["kind"], r.get("reason")) for r in self.pending()],
+                         [("todo-request", None), ("todo-request-closed", "not_found")])
+        self.assertEqual(self.stub.marked, [["10"], ["12"]])
+        self.assertIn("no longer found", self.stub.notes[-1][1])
 
     def test_project_scope_leaves_other_projects_assignments_alone(self):
         self.add(todo(42, bucket=OTHER))
