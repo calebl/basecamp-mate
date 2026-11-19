@@ -2853,6 +2853,7 @@ class Tools:
             state = self.load("todos.json", {})
             state[key] = {"todo": tid, "title": todo.get("content"), "url": todo.get("app_url"), "cursor": cursor,
                           "created": todo.get("created_at"),  # no boost state: the first read seeds it
+                          "adopted": True,  # not made by todo create: decision_autocomplete never completes it
                           **({"bucket": int(bucket)} if bucket != str(self.project) else {})}
             if todo.get("completed"):
                 state[key]["completed"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

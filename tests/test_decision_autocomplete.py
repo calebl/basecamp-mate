@@ -201,6 +201,27 @@ class Autocomplete(Base):
         self.run_step()
         self.assertEqual((self.stub.calls, self.stub.curls), ([], []))
 
+    def test_an_adopted_todo_is_never_touched(self):
+        self.track("marked", 103, description=body(task="marked"), adopted=True)
+        self.track("legacy", 104, description=body(task="legacy"), created="2026-11-01T10:00:00.123Z")  # before the marker
+        self.run_step()
+        self.assertEqual((self.stub.calls, self.stub.curls), ([], []))
+
+    def test_todo_track_marks_the_record_adopted(self):
+        self.stub.todos[105] = {"id": 105, "content": "Made by hand", "created_at": "2026-11-01T10:00:00.123Z"}
+        self.sync().todo_track("by-hand", 105)
+        self.assertIs(self.load()["by-hand"]["adopted"], True)
+
+    def test_a_todo_with_an_unanswered_subtask_is_untouched_until_all_are_answered(self):
+        self.track(subtasks=[{"text": "A?", "done": "2026-11-19T01:00:00Z", "id": 1}, {"text": "B?", "done": None, "id": 2}])
+        self.run_step()
+        self.assertEqual((self.stub.calls, self.stub.curls), ([], []))
+        state = self.load()
+        state["pick-db"]["subtasks"][1]["done"] = "2026-11-19T02:00:00Z"
+        self.side("todos.json", state)
+        self.run_step()
+        self.assertTrue(self.load()["pick-db"]["completed"])
+
     def test_a_failed_completion_is_retried_without_a_second_comment(self):
         self.track()
         self.stub.fail_complete = True

@@ -189,8 +189,10 @@
   profile or a profile signed in as the owner, and `--dry-run` only logs.
 - Decision autocomplete: with `"decision_autocomplete": {"source": "<mate base URL>"}`
   (and `todos`) set, every 5 minutes the run looks at each open to-do (or card) that
-  `todo create` made and `todos.json` tracks, never a request or a to-do `decide` only put
-  a decision on. It reads each one's body from Basecamp once and keeps its one decision
+  `todo create` made and `todos.json` tracks, never a request, a to-do `decide` only put
+  a decision on, or one adopted with `todo track` (marked `adopted`; one adopted earlier
+  keeps Basecamp's own `created_at`, which `todo create`'s whole-second UTC stamp never
+  matches), and never while one of its subtasks is unanswered. It reads each one's body from Basecamp once and keeps its one decision
   link, `…/#/decision/<home>/<task>`, as `decision` in `todos.json`; a to-do with no link
   (or links to two decisions) is never touched. When any to-do has a link, it reads
   `GET <source>/api/decisions` with `curl`, read-only. A decision whose home mate read

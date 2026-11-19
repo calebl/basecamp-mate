@@ -21,6 +21,7 @@ from tools import AUTHORITY, THREADS, history, item_recording, now_iso, parse_re
 
 COLUMNS = ("Triage", "Not now", "Figuring it out", "In progress", "Ready for QA", "Done")
 SLOW, SWEEP, DAY = 300, 3600, 86400  # seconds: the card mirror's, releases' and check-ins' cadence; the hourly repair sweep's; the backup's
+CREATED_HERE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")  # todos.json "created" as todo create stamps it
 
 
 class Behavior:
@@ -548,10 +549,13 @@ class DecisionAutocomplete(Behavior):
 
     @staticmethod
     def candidate(rec):
-        """A decision to-do (or card) the agent created and that is still open here: never a request or a to-do the
-        agent only put a decision on."""
-        return not (rec.get("completed") or rec.get("closed") or rec.get("request") or rec.get("on")
-                    or rec.get("decision_settled") or rec.get("type") not in (None, "card"))
+        """A decision to-do (or card) `todo create` made and that is still open here, with no subtask left unanswered:
+        never a request, a to-do the agent only put a decision on, or one adopted with `todo track` ("adopted"; one
+        adopted before that marker keeps Basecamp's own created_at, never todo create's whole-second UTC stamp)."""
+        return not (rec.get("completed") or rec.get("closed") or rec.get("request") or rec.get("on") or rec.get("adopted")
+                    or rec.get("decision_settled") or rec.get("type") not in (None, "card")
+                    or not CREATED_HERE.fullmatch(str(rec.get("created") or ""))
+                    or any(not q.get("done") for q in rec.get("subtasks") or []))
 
     def note(self, problem):
         """Log `problem` once while it lasts, and when it clears (a dry run only prints)."""
