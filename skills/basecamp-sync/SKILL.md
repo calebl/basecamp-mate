@@ -144,10 +144,24 @@ each as it is answered with `sync.py todo subtask --todo <key> --number <n>`, an
 completes once all are done. Their comment comes back as a `todo-comment` record, and their
 boost on the to-do or on any comment under it (yours included) as a `boost` record. A decision: act
 on it (relaying first if this is not the main firstmate's home), then
-`sync.py todo complete --todo <key>`. Feedback that is not a decision: act on it and
-answer with `sync.py reply --recording <comment id>`; the to-do stays open. Complete a
-to-do settled another way (the captain merged the PR themselves). Adopt one made by hand with
-`sync.py todo track --key <key> --todo <id>`.
+`sync.py todo complete --todo <key>`, which completes the to-do and reads it back. A decision
+to-do made outside `todo create` (by hand, or in another project) is adopted first with
+`sync.py todo track --key <key> --todo <id> --project <bucket>`, then completed with
+`sync.py todo complete --todo <id>`. When `decide` already put a step on it, `todo track`
+makes that record (under the key `decide` gave it) your own decision to-do, but only when
+your login created the to-do; on anyone else's, only the steps are ever completed. Never
+complete one with the `basecamp` CLI.
+`todo complete` refuses your own to-do while Basecamp lists one of its subtasks open (one
+the captain added included) and names that subtask by its title and Basecamp id: finish it
+with `todo subtask` when it is yours, else ask the captain. These commands do not retry a
+failed completion: fix the cause and run the command again until it exits 0. Complete a
+decision to-do once you have acted on the answer, not when it arrives. `todo complete` and
+`todo subtask` exit 1 with a FAILED line while Basecamp still shows the to-do open (for a
+decision `decide` put on a to-do or card, `todo complete` completes and reads back only its
+decision steps, and that to-do or card stays open): it is not done, so never report it done.
+Feedback that is not a decision: act on it and answer with
+`sync.py reply --recording <comment id>`; the to-do stays open. Complete a to-do settled
+another way (the captain merged the PR themselves).
 
 ## To-do requests
 

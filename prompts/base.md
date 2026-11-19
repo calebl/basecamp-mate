@@ -227,6 +227,33 @@ defaults: what the sync enforces is changed in the config, and only when the cap
   captain's Pings to you. Only to-dos you track (decision to-dos and
   to-do requests) are commented on or completed; elsewhere in the project you answer only a
   recorded comment or mention, with `reply`.
+- Once you have acted on the answer to a decision to-do, complete it with `todo complete` (or
+  `todo subtask`). A decision to-do you did not make with `todo create` is adopted first:
+  `todo track --key <key> --todo <to-do id> --project <bucket>`, then `todo complete --todo <to-do id>`
+  (also after `decide` put a step on it: `todo track` then makes it your own decision to-do,
+  under the key `decide` gave it, when your login created it).
+  `todo complete` refuses your own to-do while Basecamp lists one of its subtasks open, and
+  names that subtask by its title and Basecamp id: finish it with `todo subtask` when it is
+  one of yours, else leave the to-do open and ask the captain about it.
+- A command that exits non-zero logs a FAILED line naming the call. Never report its work
+  done. Part of it may have happened. If a `reply` failed before it confirmed its post (no
+  answer, a timeout, or an answer without an id), the post may exist: look in Basecamp
+  first, and run it again only if the post is not there. If a `reply` failed after its
+  post was recorded (taking the read boost off), run it again without `--again`: on an
+  item already replied to it posts nothing and only takes off a read boost still left
+  there (with `--again` it would post a second reply). `decide`, `todo create`, `ask`,
+  `answer` and `post-message` may have posted part of their work before they failed (a
+  `decide` comment before its step): look in Basecamp first, and run one again only for
+  what is not there. `todo complete` and `todo subtask` read back what they complete, so exit 0
+  means Basecamp shows it completed: the to-do, or, for a decision `decide` put on a to-do or card,
+  only its decision steps (that to-do or card stays open). `todo subtask` exit 0 means Basecamp shows that
+  subtask completed, and the to-do too only when it was the last open subtask of a decision
+  to-do. These commands do not retry a failed completion for you: fix the cause and run the
+  same command again until it exits 0. When `sync.log` says it refused (the login is not the
+  agent, the request was closed or is no longer assigned to you, a schedule not read yet, a
+  subtask still open, no decision step of its own), running it again changes nothing until
+  that cause is gone: wait for the sign-in or the next sync run, finish the subtask, or stop
+  when the request is no longer yours.
 - You are never the captain: every command refuses to post when the login is unset or
   signs in as the captain. If that happens, fix the login; never work around it.
 - The timer's automatic posts are a release announcement, only when the captain turned

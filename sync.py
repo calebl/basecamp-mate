@@ -343,6 +343,13 @@ def command(a, what, call, runner, guard=False):
     return 0
 
 
+def completed(s, what, done):
+    """The outcome of a completion command: raise (so it exits 1 with a FAILED line) unless `done`, Basecamp read back
+    showing it completed; a dry run, which completes nothing, passes."""
+    if not done and not s.dry:
+        raise RuntimeError(f"{what}: not completed in Basecamp (sync.log says why)")
+
+
 def todo_cli(argv, runner):
     sub = argv[:1][0] if argv else None
     descs = {"create": "Create a to-do assigned to the owner and track it under a key.",
@@ -385,8 +392,8 @@ def todo_cli(argv, runner):
                                                a.project, card),
              "track": lambda s: s.todo_track(a.key, a.todo, a.project),
              "comment": lambda s: s.todo_comment(a.todo, read(a.body_file)),
-             "complete": lambda s: s.todo_complete(a.todo),
-             "subtask": lambda s: s.todo_subtask(a.todo, a.number),
+             "complete": lambda s: completed(s, f"todo complete {a.todo}", s.todo_complete(a.todo)),
+             "subtask": lambda s: completed(s, f"todo subtask {a.todo} {a.number}", s.todo_subtask(a.todo, a.number)),
              "show": lambda s: s.todo_show(a.todo)}
     return command(a, f"todo {sub}", calls[sub], runner, guard=sub != "show")
 
