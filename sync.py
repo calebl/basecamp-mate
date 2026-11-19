@@ -144,6 +144,10 @@ class Sync(Tools):
                             if isinstance(self.cfg["listen"], dict) and self.cfg["listen"].get("unmonitored") is False else "")
                          + "; re-run init (or basecamp-mate setup) to remove the listener service")
                 timer["listen_noted"] = True
+            if "decision_autocomplete" in self.cfg and not timer.get("decision_autocomplete_noted"):
+                self.log('"decision_autocomplete" in the config is ignored: basecamp-mate no longer completes decision '
+                         "to-dos from the decisions app; remove the key")
+                timer["decision_autocomplete_noted"] = True
             now = datetime.now(timezone.utc)
             for b in self.behaviors.values():
                 if not b.timer or (not b.on and b is not self.card_mirror):
