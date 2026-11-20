@@ -72,6 +72,10 @@ class BasecampError(RuntimeError):
         self.code, self.error = code, error or ""
 
 
+class TaskGone(RuntimeError):
+    """`tasks-axi show` answered NOT_FOUND: the task is no longer in the backlog."""
+
+
 class WrongLogin(RuntimeError):
     """Nothing may run as this login: it is not the agent's (Tools.wrong_login)."""
 
@@ -372,13 +376,24 @@ class Tools:
             env.pop("TASKS_AXI_FILE", None)
         r = self.run(["tasks-axi", *args], capture_output=True, text=True, timeout=120, cwd=root, env=env)
         if r.returncode != 0:
-            raise RuntimeError(f"tasks-axi {' '.join(args)}: {(r.stdout + r.stderr)[:300]}")
+            out = r.stdout + r.stderr
+            if args[:1] == ("show",) and re.search(r"^code: NOT_FOUND$", out, re.M):
+                raise TaskGone(f"tasks-axi {' '.join(args)}: {out[:300]}")
+            raise RuntimeError(f"tasks-axi {' '.join(args)}: {out[:300]}")
         return r.stdout
 
     def read_backlog(self):
         rows = self.tasks_axi("list", "--limit", "100000").splitlines()
         ids = [ln.strip().split(",", 1)[0] for ln in rows if ln.startswith("  ") and "," in ln]
-        return [task_item(parse_show(self.tasks_axi("show", i, "--full"))) for i in ids]
+        items = []
+        for i in ids:
+            try:
+                items.append(task_item(parse_show(self.tasks_axi("show", i, "--full"))))
+            except TaskGone:
+                # The task left the backlog between the listing and this show (done-history retention pruned it):
+                # the same as a task the listing never had.
+                continue
+        return items
 
     def meta_pr(self, task):
         path = os.path.join(self.state, f"{task}.meta")
