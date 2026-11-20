@@ -548,6 +548,29 @@ class TasksAxi(unittest.TestCase):
         self.assertEqual(it["blocked_by"], ["ta-a", "ta-b"])
         self.assertEqual((it["hold"], it["hold_kind"], it["until"]), ("Pick one", "captain", None))
 
+    def backlog(self, show_fail):
+        """read_backlog over a stubbed tasks-axi listing ta-a and ta-b, where `show ta-b` fails with `show_fail`."""
+        def run(cmd, **kw):
+            if cmd[1] == "list":
+                return SimpleNamespace(returncode=0, stdout="tasks[2]:\n  ta-a,x\n  ta-b,y\n", stderr="")
+            if cmd[2] == "ta-b":
+                return SimpleNamespace(returncode=1, stdout=show_fail, stderr="")
+            return SimpleNamespace(returncode=0, stdout="task:\n  id: ta-a\n  title: \"A\"\n  state: queued\n", stderr="")
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home)
+        os.makedirs(os.path.join(home, "data"))
+        t = sync.Tools.__new__(sync.Tools)
+        t.data, t.run = os.path.join(home, "data"), run
+        return t.read_backlog()
+
+    def test_task_pruned_between_list_and_show_is_skipped(self):
+        gone = 'Error: "Task \\"ta-b\\" not found in this backlog"\ncode: NOT_FOUND\nhelp[1]: Run `tasks-axi list`\n'
+        self.assertEqual([it["id"] for it in self.backlog(gone)], ["ta-a"])
+
+    def test_other_show_error_still_fails(self):
+        with self.assertRaises(RuntimeError):
+            self.backlog("Error: backlog unreadable\ncode: IO_ERROR\n")
+
 
 if __name__ == "__main__":
     unittest.main()
